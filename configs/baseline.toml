@@ -1,0 +1,30 @@
+[competition]
+# The competition folder name. Both /kaggle/input/<slug> and
+# /kaggle/input/competitions/<slug> are supported.
+input_slug = "rsna-knee-abnormality-detection"
+
+[paths]
+input_root = "/kaggle/input"
+working_root = "/kaggle/working"
+output_dir = "/kaggle/working/outputs"
+
+[run]
+mode = "train-infer"
+seed = 42
+
+[data]
+image_size = 160
+slices_per_plane = 3
+
+[training]
+epochs = 3
+batch_size = 4
+num_workers = 2
+learning_rate = 0.001
+weight_decay = 0.0001
+validation_fraction = 0.2
+# Set to a positive value for a quicker diagnostic run; 0 uses every labeled study.
+max_train_studies = 0
+
+[model]
+name = "small-multiview-cnn"

@@ -1,0 +1,27 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Kaggle API credentials must never enter the repository.
+kaggle.json
+.env
+.env.*
+
+# Generated upload payload and downloaded run artifacts.
+.kaggle-build/
+outputs/
+
+# Local experiment artifacts and data are intentionally excluded.
+data/
+checkpoints/
+artifacts/
+*.dcm
+*.dicom
+*.nii
+*.nii.gz
+
+.DS_Store
+.idea/
+.vscode/

@@ -15,6 +15,8 @@ seed = 42
 [data]
 image_size = 160
 slices_per_plane = 3
+slice_band_start = 0.20
+slice_band_end = 0.80
 
 [training]
 epochs = 3

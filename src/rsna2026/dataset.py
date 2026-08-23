@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,8 +14,11 @@ import torch
 from torch.nn import functional
 from torch.utils.data import Dataset
 
+from rsna2026.slice_selection import central_band_indices, sample_ordered_paths
+
 
 PLANES = ("sagittal", "coronal", "axial")
+ORDERING_WORKERS = 16
 
 
 @dataclass(frozen=True)
@@ -24,23 +27,20 @@ class StudyRecord:
 
     study_uid: str
     image_paths: tuple[Path | None, ...]
+    selections: tuple["SeriesSelection", ...] = ()
 
 
-def _stable_sample(paths: Sequence[Path], count: int, key: str) -> list[Path]:
-    """Choose reproducible files without reading every DICOM header."""
-    if not paths:
-        return []
-    ordered = sorted(paths)
-    if len(ordered) <= count:
-        chosen = list(ordered)
-    else:
-        digest = hashlib.sha256(key.encode("utf-8")).digest()
-        offset = int.from_bytes(digest[:4], "little") % len(ordered)
-        indices = np.linspace(0, len(ordered) - 1, count, dtype=int)
-        chosen = [ordered[(int(index) + offset) % len(ordered)] for index in indices]
-    while len(chosen) < count:
-        chosen.append(chosen[-1])
-    return chosen
+@dataclass(frozen=True)
+class SeriesSelection:
+    """Auditable slice selection metadata for one anatomical plane."""
+
+    plane: str
+    series_uid: str | None
+    ordering_method: str
+    total_slices: int
+    selected_indices: tuple[int, ...]
+    selected_relative_positions: tuple[float, ...]
+    selected_paths: tuple[str, ...]
 
 
 def build_study_records(
@@ -48,8 +48,13 @@ def build_study_records(
     image_root: Path,
     study_uids: Sequence[str],
     slices_per_plane: int,
+    slice_band_start: float,
+    slice_band_end: float,
 ) -> list[StudyRecord]:
-    """Select the largest available series in each anatomical plane."""
+    """Select and spatially sample the largest series in each plane."""
+    central_band_indices(
+        0, slices_per_plane, slice_band_start, slice_band_end
+    )
     required = {"StudyInstanceUID", "SeriesInstanceUID", "Anatomical_Plane"}
     missing = required.difference(series_table.columns)
     if missing:
@@ -71,16 +76,63 @@ def build_study_records(
         if paths and (previous is None or len(paths) > previous[0]):
             candidates[study_uid][plane] = (len(paths), series_dir)
 
+    series_directories = sorted(
+        {
+            entry[1]
+            for planes in candidates.values()
+            for entry in planes.values()
+        }
+    )
+
+    def sample_series(series_dir: Path):
+        paths = list(series_dir.glob("*.dcm"))
+        return paths, sample_ordered_paths(
+            paths,
+            slices_per_plane,
+            slice_band_start,
+            slice_band_end,
+        )
+
+    with ThreadPoolExecutor(max_workers=ORDERING_WORKERS) as pool:
+        sampled_series = dict(
+            zip(series_directories, pool.map(sample_series, series_directories))
+        )
+
     records = []
     for uid in study_uids:
         study_uid = str(uid)
         selected: list[Path | None] = []
+        selections = []
         for plane in PLANES:
             entry = candidates.get(study_uid, {}).get(plane)
-            paths = list(entry[1].glob("*.dcm")) if entry is not None else []
-            sampled = _stable_sample(paths, slices_per_plane, f"{study_uid}:{plane}")
+            if entry is None:
+                paths = []
+                sampled, method, indices, relative_positions = (
+                    [],
+                    "missing",
+                    (),
+                    (),
+                )
+            else:
+                paths, sample = sampled_series[entry[1]]
+                sampled, method, indices, relative_positions = sample
             selected.extend(sampled or [None] * slices_per_plane)
-        records.append(StudyRecord(study_uid, tuple(selected)))
+            series_uid = entry[1].name if entry is not None else None
+            selections.append(
+                SeriesSelection(
+                    plane=plane,
+                    series_uid=series_uid,
+                    ordering_method=method,
+                    total_slices=len(paths),
+                    selected_indices=indices,
+                    selected_relative_positions=relative_positions,
+                    selected_paths=tuple(
+                        f"{study_uid}/{series_uid}/{path.name}"
+                        for path in sampled
+                    ),
+                )
+            )
+        records.append(StudyRecord(study_uid, tuple(selected), tuple(selections)))
     return records
 
 

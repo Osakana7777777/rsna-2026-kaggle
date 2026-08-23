@@ -15,6 +15,7 @@ required_files=(
   "src/rsna2026/dataset.py"
   "src/rsna2026/model.py"
   "src/rsna2026/public_labels.py"
+  "src/rsna2026/slice_selection.py"
   "src/rsna2026/train.py"
   "scripts/prepare.sh"
   "scripts/build_launcher.py"
@@ -23,6 +24,7 @@ required_files=(
   "scripts/output.sh"
   "scripts/wait.sh"
   "tests/test_public_labels.py"
+  "tests/test_slice_selection.py"
   "submissions/README.md"
   "submissions/TEMPLATE.md"
 )

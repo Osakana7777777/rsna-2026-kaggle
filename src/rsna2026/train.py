@@ -6,7 +6,9 @@ import argparse
 import json
 import math
 import random
+from collections import Counter
 from collections.abc import Sequence
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -366,6 +368,41 @@ def write_submission(
     submission.to_csv(path, index=False)
 
 
+def slice_selection_report(
+    records_by_split: dict[str, Sequence[StudyRecord]],
+    slice_band_start: float,
+    slice_band_end: float,
+) -> dict[str, object]:
+    """Create an auditable record of every selected series and slice."""
+    report: dict[str, object] = {
+        "slice_band": [slice_band_start, slice_band_end],
+        "splits": {},
+    }
+    split_reports: dict[str, object] = {}
+    for split, records in records_by_split.items():
+        methods = Counter(
+            selection.ordering_method
+            for record in records
+            for selection in record.selections
+        )
+        entries = [
+            {
+                "study_uid": record.study_uid,
+                "series": [asdict(selection) for selection in record.selections],
+            }
+            for record in records
+        ]
+        summary = {
+            "studies": len(records),
+            "series_by_ordering_method": dict(sorted(methods.items())),
+            "missing_planes": methods.get("missing", 0),
+        }
+        split_reports[split] = {"summary": summary, "studies": entries}
+        print(f"{split} slice selection: {summary}", flush=True)
+    report["splits"] = split_reports
+    return report
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     config = load_config(args.config)
@@ -448,21 +485,45 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     image_size = int(config["data"]["image_size"])
     slices_per_plane = int(config["data"]["slices_per_plane"])
+    slice_band_start = float(config["data"]["slice_band_start"])
+    slice_band_end = float(config["data"]["slice_band_end"])
     training_records = build_study_records(
         train_series,
         input_path / "train_series",
         training_table["StudyInstanceUID"].astype(str).tolist(),
         slices_per_plane,
+        slice_band_start,
+        slice_band_end,
     )
     validation_records = build_study_records(
         train_series,
         input_path / "train_series",
         validation_table["StudyInstanceUID"].astype(str).tolist(),
         slices_per_plane,
+        slice_band_start,
+        slice_band_end,
     )
     test_uids = test_table["StudyInstanceUID"].astype(str).tolist()
     test_records = build_study_records(
-        test_series, input_path / "test_series", test_uids, slices_per_plane
+        test_series,
+        input_path / "test_series",
+        test_uids,
+        slices_per_plane,
+        slice_band_start,
+        slice_band_end,
+    )
+    selection_report = slice_selection_report(
+        {
+            "training": training_records,
+            "validation": validation_records,
+            "test": test_records,
+        },
+        slice_band_start,
+        slice_band_end,
+    )
+    (output_dir / "slice-selection.json").write_text(
+        json.dumps(selection_report, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
     )
 
     batch_size = int(config["training"]["batch_size"])
@@ -561,6 +622,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "validation_studies": len(validation_records),
         "test_studies": len(test_records),
         "targets": TARGETS,
+        "slice_selection": {
+            "slice_band": selection_report["slice_band"],
+            "artifact": "slice-selection.json",
+            "splits": {
+                split: values["summary"]
+                for split, values in selection_report["splits"].items()
+            },
+        },
         "label_source_validation": label_source_validation,
         "history": history,
         **provenance,

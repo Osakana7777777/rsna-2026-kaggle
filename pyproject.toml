@@ -5,6 +5,9 @@ description = "Kaggle-GPU workflow for RSNA 2026 experiments"
 requires-python = ">=3.10"
 dependencies = []
 
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

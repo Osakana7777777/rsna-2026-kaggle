@@ -11,7 +11,9 @@ kaggle.json
 
 # Generated upload payload and downloaded run artifacts.
 .kaggle-build/
+.kaggle-label-build/
 outputs/
+label-outputs/
 
 # Local experiment artifacts and data are intentionally excluded.
 data/

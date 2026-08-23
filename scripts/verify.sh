@@ -10,9 +10,11 @@ required_files=(
   "kaggle/kernel-metadata.json"
   "kaggle/launcher.py"
   "src/rsna2026/config.py"
+  "src/rsna2026/constants.py"
   "src/rsna2026/data.py"
   "src/rsna2026/dataset.py"
   "src/rsna2026/model.py"
+  "src/rsna2026/public_labels.py"
   "src/rsna2026/train.py"
   "scripts/prepare.sh"
   "scripts/build_launcher.py"
@@ -20,6 +22,7 @@ required_files=(
   "scripts/status.sh"
   "scripts/output.sh"
   "scripts/wait.sh"
+  "tests/test_public_labels.py"
   "submissions/README.md"
   "submissions/TEMPLATE.md"
 )
@@ -43,7 +46,7 @@ if command -v uv >/dev/null 2>&1; then
   fi
   "${PROJECT_ROOT}/.venv/bin/python" -m compileall -q \
     "${PROJECT_ROOT}/src" "${PROJECT_ROOT}/kaggle/launcher.py" \
-    "${PROJECT_ROOT}/scripts/build_launcher.py"
+    "${PROJECT_ROOT}/scripts/build_launcher.py" "${PROJECT_ROOT}/tests"
   "${PROJECT_ROOT}/.venv/bin/python" -c \
     'import json, pathlib, tomllib; root = pathlib.Path(__import__("sys").argv[1]); json.loads((root / "kaggle/kernel-metadata.json").read_text()); tomllib.loads((root / "configs/baseline.toml").read_text())' \
     "${PROJECT_ROOT}"

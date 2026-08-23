@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
 
 import numpy as np
 import pandas as pd
 import pydicom
 import torch
-import torch.nn.functional as functional
+from torch.nn import functional
 from torch.utils.data import Dataset
 
 
@@ -112,7 +112,9 @@ def read_dicom(path: Path, image_size: int) -> torch.Tensor:
     return tensor.squeeze(0)
 
 
-class KneeStudyDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
+class KneeStudyDataset(
+    Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]
+):
     """Load a fixed-size bag of MRI slices for each study."""
 
     def __init__(
@@ -120,17 +122,27 @@ class KneeStudyDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor]])
         records: Sequence[StudyRecord],
         image_size: int,
         labels: np.ndarray | None = None,
+        label_weights: np.ndarray | None = None,
         augment: bool = False,
     ) -> None:
         self.records = list(records)
         self.image_size = image_size
         self.labels = labels
+        self.label_weights = label_weights
         self.augment = augment
+        if (labels is None) != (label_weights is None):
+            raise ValueError("Labels and label weights must be supplied together")
+        if labels is not None and len(labels) != len(self.records):
+            raise ValueError("Label count does not match study records")
+        if label_weights is not None and label_weights.shape != labels.shape:
+            raise ValueError("Label weights must have the same shape as labels")
 
     def __len__(self) -> int:
         return len(self.records)
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(
+        self, index: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         images = []
         present = []
         for path in self.records[index].image_paths:
@@ -154,4 +166,9 @@ class KneeStudyDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor]])
             if self.labels is not None
             else torch.empty(0)
         )
-        return torch.stack(images), torch.tensor(present), label
+        label_weight = (
+            torch.from_numpy(self.label_weights[index]).float()
+            if self.label_weights is not None
+            else torch.empty(0)
+        )
+        return torch.stack(images), torch.tensor(present), label, label_weight

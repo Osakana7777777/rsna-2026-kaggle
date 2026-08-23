@@ -8,7 +8,9 @@
   "enable_gpu": true,
   "enable_internet": false,
   "machine_shape": "NvidiaTeslaT4",
-  "dataset_sources": [],
+  "dataset_sources": [
+    "stevenleehans/rsna-knee-llm-report-labels"
+  ],
   "competition_sources": [
     "rsna-knee-abnormality-detection"
   ],

@@ -26,5 +26,16 @@ validation_fraction = 0.2
 # Set to a positive value for a quicker diagnostic run; 0 uses every labeled study.
 max_train_studies = 0
 
+[pseudo_labels]
+enabled = true
+dataset = "stevenleehans/rsna-knee-llm-report-labels"
+file_name = "llm_labels_v4_blend.csv"
+source_path = "/kaggle/input/rsna-knee-llm-report-labels/llm_labels_v4_blend.csv"
+sha256 = "eb4c2b29e7e84adbb4b5ccee825ca20ade6a43dbe295f13be442d549e4f5dca4"
+expected_rows = 4407
+max_studies = 1500
+expected_validation_studies = 58
+minimum_source_macro_auc = 0.88
+
 [model]
 name = "small-multiview-cnn"

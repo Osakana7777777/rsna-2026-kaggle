@@ -79,20 +79,19 @@ Kaggle starts it automatically after a successful push.
 `output.sh` downloads only notebook outputs, such as logs, summaries, checkpoints,
 or `submission.csv`; it does not download the competition input.
 
-The baseline reads labeled studies from `train.csv`, selects sagittal, coronal,
+The experiment reads public report-derived soft labels, selects sagittal, coronal,
 and axial MRI series, and trains a compact multi-view convolutional network for
-the twelve findings. Missing labels are excluded from the loss. A deterministic
-study-level holdout reports macro AUC, and the best epoch is used to predict the
-test studies. The run writes `submission.csv`, `best-model.pt`,
-`run-summary.json`, and `run.log` below `/kaggle/working/outputs`.
+the twelve findings. The 58 fully annotated studies are validation-only. Label
+confidence weights exclude undecided cells from the loss, and the best validation
+epoch is used to predict the test studies. The run writes `submission.csv`,
+`best-model.pt`, `label-source-validation.json`, `run-summary.json`, and `run.log`
+below `/kaggle/working/outputs`.
 For code-competition submission, `submission.csv` is also written at
 `/kaggle/working/submission.csv`, the exact location required by Kaggle.
 
 The model uses three slices per anatomical plane by default. These and the image
-size, epoch count, batch size, learning rate, and validation fraction are set in
-`configs/baseline.toml`. Set `training.max_train_studies` to a positive number
-for a quicker diagnostic run; zero uses every study with at least one provided
-target.
+size, epoch count, batch size, learning rate, and public-label selection are set
+in `configs/baseline.toml`.
 
 The Kaggle image supplies PyTorch, pandas, NumPy, and pydicom. Internet access
 remains disabled during the run, and the baseline does not require downloaded
@@ -120,6 +119,23 @@ For one-command execution after configuration:
 ```bash
 ./scripts/push.sh && ./scripts/wait.sh && ./scripts/output.sh
 ```
+
+## 実験0002: 公開LLM混合ラベル
+
+提出ノートブックは公開データセット
+`stevenleehans/rsna-knee-llm-report-labels` の
+`llm_labels_v4_blend.csv` を入力として参照します。ファイルのSHA-256、4,407行、
+十二所見の列、識別子集合、欠損、値域を学習前に検証し、公開データセットの更新へ
+自動追従しません。
+
+正式ラベル58件はすべて検証専用です。同じ正規化報告文を持つ検査を候補から外し、
+残りから乱数種42で1,500件を選びます。公開確率 `p` を二値化せず教師とし、
+`2 × |p - 0.5|` をセル単位の損失重みにします。したがって、0.5は損失へ寄与しません。
+
+実行時には `label-source-validation.json` へ公開ラベルと正式58件の項目別AUCを保存し、
+平均AUCが0.88未満の場合は画像学習を開始しません。`run-summary.json` には入力ハッシュ、
+抽出検査のハッシュ、項目別教師統計、各世代の検証AUCを記録します。提出環境の
+インターネットは無効のままです。
 
 To change polling frequency, set `KAGGLE_POLL_SECONDS`, for example:
 

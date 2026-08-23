@@ -33,7 +33,7 @@ file_name = "llm_labels_v4_blend.csv"
 source_path = "/kaggle/input/rsna-knee-llm-report-labels/llm_labels_v4_blend.csv"
 sha256 = "eb4c2b29e7e84adbb4b5ccee825ca20ade6a43dbe295f13be442d549e4f5dca4"
 expected_rows = 4407
-max_studies = 1500
+max_studies = 4345
 expected_validation_studies = 58
 minimum_source_macro_auc = 0.88
 

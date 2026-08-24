@@ -43,6 +43,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "cells": [
                 {
                     "cell_type": "code",
+                    "id": "rsna2026-launcher",
                     "execution_count": None,
                     "metadata": {},
                     "outputs": [],

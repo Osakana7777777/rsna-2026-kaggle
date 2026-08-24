@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 import random
+import time
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import asdict
@@ -14,6 +15,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+from torch import nn
 from torch.nn import functional
 from torch.utils.data import DataLoader
 
@@ -21,7 +23,7 @@ from rsna2026.config import load_config
 from rsna2026.constants import TARGETS
 from rsna2026.data import competition_input
 from rsna2026.dataset import KneeStudyDataset, StudyRecord, build_study_records
-from rsna2026.model import KneeAbnormalityModel
+from rsna2026.model import build_dinov2_model
 from rsna2026.public_labels import (
     confidence_weight,
     load_public_label_table,
@@ -292,9 +294,11 @@ def positive_weights(
 
 
 def train_epoch(
-    model: KneeAbnormalityModel,
+    model: nn.Module,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    scaler: torch.amp.GradScaler,
     device: torch.device,
     target_weights: torch.Tensor,
 ) -> float:
@@ -316,8 +320,10 @@ def train_epoch(
                 logits, targets, reduction="none", pos_weight=target_weights
             )
             loss = (losses * weights).sum() / weights.sum().clamp_min(1.0)
-        loss.backward()
-        optimizer.step()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.step()
         total_loss += float(loss.detach().cpu())
         total_batches += 1
     return total_loss / max(total_batches, 1)
@@ -325,16 +331,19 @@ def train_epoch(
 
 @torch.no_grad()
 def predict(
-    model: KneeAbnormalityModel, loader: DataLoader, device: torch.device
+    model: nn.Module, loader: DataLoader, device: torch.device
 ) -> tuple[np.ndarray, np.ndarray | None]:
     model.eval()
     predictions = []
     labels = []
     for images, present, batch_labels, _ in loader:
-        logits = model(
-            images.to(device, non_blocking=True),
-            present.to(device, non_blocking=True),
-        )
+        with torch.autocast(
+            device_type=device.type, enabled=device.type == "cuda"
+        ):
+            logits = model(
+                images.to(device, non_blocking=True),
+                present.to(device, non_blocking=True),
+            )
         predictions.append(torch.sigmoid(logits).cpu().numpy())
         if batch_labels.numel():
             labels.append(batch_labels.numpy())
@@ -404,6 +413,7 @@ def slice_selection_report(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    started_at = time.monotonic()
     args = parse_args(argv)
     config = load_config(args.config)
     seed = int(config["run"]["seed"])
@@ -565,19 +575,79 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"validation={len(validation_records)}",
         flush=True,
     )
-    model = KneeAbnormalityModel(len(TARGETS)).to(device)
+    model_config = config["model"]
+    if str(model_config["name"]) != "dinov2-small":
+        raise ValueError(f"Unsupported model: {model_config['name']}")
+    if image_size % 14:
+        raise ValueError("DINOv2 image size must be divisible by its patch size 14")
+    model, model_source = build_dinov2_model(
+        input_root=config["paths"]["input_root"],
+        variant=str(model_config["variant"]),
+        num_targets=len(TARGETS),
+        unfreeze_last=int(model_config["unfreeze_last"]),
+        dropout=float(model_config["dropout"]),
+    )
+    model = model.to(device)
+    total_parameters = sum(parameter.numel() for parameter in model.parameters())
+    trainable_parameters = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+    print(
+        f"Loaded {model_config['name']} from {model_source}; "
+        f"parameters={total_parameters}, trainable={trainable_parameters}",
+        flush=True,
+    )
+    backbone_learning_rate = float(
+        config["training"]["backbone_learning_rate"]
+    )
+    head_learning_rate = float(config["training"]["head_learning_rate"])
     optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(config["training"]["learning_rate"]),
+        [
+            {
+                "params": [
+                    parameter
+                    for parameter in model.backbone.parameters()
+                    if parameter.requires_grad
+                ],
+                "lr": backbone_learning_rate,
+            },
+            {
+                "params": model.head.parameters(),
+                "lr": head_learning_rate,
+            },
+        ],
         weight_decay=float(config["training"]["weight_decay"]),
     )
+    epochs = int(config["training"]["epochs"])
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=[backbone_learning_rate, head_learning_rate],
+        epochs=epochs,
+        steps_per_epoch=len(training_loader),
+        pct_start=float(config["training"]["one_cycle_warmup_fraction"]),
+    )
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     target_weights = positive_weights(training_labels, training_weights).to(device)
+    max_runtime_seconds = float(
+        config["training"]["max_runtime_hours"]
+    ) * 3600.0
 
     best_score = -math.inf
     best_state: dict[str, torch.Tensor] | None = None
     history = []
-    for epoch in range(int(config["training"]["epochs"])):
-        loss = train_epoch(model, training_loader, optimizer, device, target_weights)
+    time_limit_reached = False
+    for epoch in range(epochs):
+        loss = train_epoch(
+            model,
+            training_loader,
+            optimizer,
+            scheduler,
+            scaler,
+            device,
+            target_weights,
+        )
         validation_predictions, validation_labels = predict(
             model, validation_loader, device
         )
@@ -604,6 +674,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 name: value.detach().cpu().clone()
                 for name, value in model.state_dict().items()
             }
+        if time.monotonic() - started_at >= max_runtime_seconds:
+            time_limit_reached = True
+            print(
+                f"Runtime limit reached after epoch {epoch + 1}; "
+                "using the best completed epoch",
+                flush=True,
+            )
+            break
 
     if best_state is None:
         raise RuntimeError("Training did not produce a model state")
@@ -614,6 +692,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     write_submission(
         sample_submission, test_uids, test_predictions, output_dir / "submission.csv"
     )
+    elapsed_seconds = time.monotonic() - started_at
     summary = {
         "status": "train-infer-complete",
         "device": str(device),
@@ -622,6 +701,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         "validation_studies": len(validation_records),
         "test_studies": len(test_records),
         "targets": TARGETS,
+        "elapsed_seconds": elapsed_seconds,
+        "completed_epochs": len(history),
+        "time_limit_reached": time_limit_reached,
+        "model": {
+            "name": str(model_config["name"]),
+            "variant": str(model_config["variant"]),
+            "source": str(model_source),
+            "total_parameters": total_parameters,
+            "trainable_parameters": trainable_parameters,
+            "unfreeze_last": int(model_config["unfreeze_last"]),
+            "image_size": image_size,
+            "pooling": str(model_config["pooling"]),
+            "grayscale_to_rgb": "channel-repeat",
+            "backbone_learning_rate": backbone_learning_rate,
+            "head_learning_rate": head_learning_rate,
+            "weight_decay": float(config["training"]["weight_decay"]),
+            "scheduler": "one-cycle",
+            "one_cycle_warmup_fraction": float(
+                config["training"]["one_cycle_warmup_fraction"]
+            ),
+        },
         "slice_selection": {
             "slice_band": selection_report["slice_band"],
             "artifact": "slice-selection.json",

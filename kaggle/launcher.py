@@ -48,6 +48,10 @@ class Tee:
         for stream in self.streams:
             stream.flush()
 
+    def isatty(self) -> bool:
+        """Report a non-interactive stream for libraries that format console output."""
+        return False
+
 
 if __name__ == "__main__":
     output_dir = Path("/kaggle/working/outputs")

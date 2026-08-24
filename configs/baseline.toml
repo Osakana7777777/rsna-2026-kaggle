@@ -13,17 +13,20 @@ mode = "train-infer"
 seed = 42
 
 [data]
-image_size = 160
+image_size = 224
 slices_per_plane = 3
 slice_band_start = 0.20
 slice_band_end = 0.80
 
 [training]
-epochs = 3
+epochs = 10
 batch_size = 4
 num_workers = 2
-learning_rate = 0.001
-weight_decay = 0.0001
+backbone_learning_rate = 0.000008
+head_learning_rate = 0.001
+weight_decay = 0.02
+one_cycle_warmup_fraction = 0.15
+max_runtime_hours = 8.0
 validation_fraction = 0.2
 # Set to a positive value for a quicker diagnostic run; 0 uses every labeled study.
 max_train_studies = 0
@@ -40,4 +43,8 @@ expected_validation_studies = 58
 minimum_source_macro_auc = 0.88
 
 [model]
-name = "small-multiview-cnn"
+name = "dinov2-small"
+variant = "small"
+unfreeze_last = 6
+pooling = "cls-patch-mean-view-mean"
+dropout = 0.25

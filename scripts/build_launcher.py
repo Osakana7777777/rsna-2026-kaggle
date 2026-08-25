@@ -9,12 +9,15 @@ from typing import Sequence
 
 
 EMBEDDED_FILES_MARKER = "EMBEDDED_FILES: dict[str, str] = {}"
+RUN_MODE_MARKER = 'RUN_MODE = "__RUN_MODE__"'
+RUN_MODES = ("train", "inference")
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--project-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--mode", choices=RUN_MODES, required=True)
     return parser.parse_args(argv)
 
 
@@ -35,9 +38,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if launcher.count(EMBEDDED_FILES_MARKER) != 1:
         raise ValueError("Launcher must contain exactly one embedded-files marker")
+    if launcher.count(RUN_MODE_MARKER) != 1:
+        raise ValueError("Launcher must contain exactly one run-mode marker")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     generated_source = launcher.replace(EMBEDDED_FILES_MARKER, replacement)
+    generated_source = generated_source.replace(
+        RUN_MODE_MARKER, f'RUN_MODE = "{args.mode}"'
+    )
     if args.output.suffix == ".ipynb":
         notebook = {
             "cells": [

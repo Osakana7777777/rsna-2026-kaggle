@@ -4,7 +4,7 @@ This repository contains code for Kaggle's [RSNA Knee Abnormality Detection](htt
 
 ## Project Structure & Module Organization
 
-Core code lives in `src/rsna2026/`: `config.py` loads settings, `data.py` validates Kaggle mounts, and `train.py` is the experiment entry point. Put settings in `configs/`; `baseline.toml` is the default. `kaggle/launcher.py` starts the packaged job, while `kernel-metadata.json` controls its environment. Shell workflows belong in `scripts/`. Generated `.kaggle-build/`, `outputs/`, `.venv/`, and competition data must remain untracked.
+Core code lives in `src/rsna2026/`: `config.py` loads settings, `data.py` validates Kaggle mounts, and `train.py` dispatches separate training and inference modes. Put settings in `configs/`; `baseline.toml` is the default. `kaggle/launcher.py` starts both packaged jobs. `train-kernel-metadata.json` defines the training notebook, while `kernel-metadata.json` defines the inference/submission notebook and mounts the training output through `kernel_sources`. Shell workflows belong in `scripts/`. Generated `.kaggle-build/`, `outputs/`, `.venv/`, and competition data must remain untracked.
 
 ## Build, Test, and Development Commands
 
@@ -13,11 +13,14 @@ Use `uv` for every Python environment; do not create environments with `venv`, C
 ```bash
 uv venv .venv                 # create the local Python environment
 ./scripts/verify.sh            # validate files, shell/Python syntax, config, and data policy
-./scripts/prepare.sh           # assemble the Kaggle upload payload
-./scripts/push.sh              # prepare, upload, and launch a private Kaggle run
-./scripts/status.sh            # inspect the latest remote run
-./scripts/wait.sh              # poll until the run finishes
-./scripts/output.sh            # retrieve /kaggle/working artifacts
+./scripts/prepare.sh train      # assemble the training payload
+./scripts/push.sh train         # train and publish the checkpoint first
+./scripts/wait.sh train         # wait for training to finish
+./scripts/output.sh train       # retrieve training artifacts
+./scripts/prepare.sh submission # assemble inference-only payload
+./scripts/push.sh submission    # launch inference after successful training
+./scripts/wait.sh submission    # wait for inference to finish
+./scripts/output.sh submission  # retrieve submission artifacts
 ```
 
 Configure all `YOUR_...` placeholders before pushing. Run remote jobs only after `kaggle whoami` succeeds and competition rules are accepted.
@@ -28,7 +31,7 @@ Target Python 3.10 or newer. Follow PEP 8 with four-space indentation, type anno
 
 ## Testing Guidelines
 
-No dedicated test suite or coverage threshold exists yet. Add tests under `tests/` as `test_<module>.py`; prefer `pytest` if a suite is introduced, and add it through `uv`. Cover path validation, configuration parsing, and output generation without downloading or reading medical images. Before every change submission, run `./scripts/verify.sh`. For workflow changes, also inspect the payload produced by `./scripts/prepare.sh`.
+No coverage threshold exists yet. Add tests under `tests/` as `test_<module>.py` and run them through `uv`. Cover path validation, configuration parsing, and output generation without downloading or reading medical images. Before every change submission, run `./scripts/verify.sh`. For workflow changes, inspect both payloads produced by `./scripts/prepare.sh train` and `./scripts/prepare.sh submission`.
 
 ## Commit & Pull Request Guidelines
 

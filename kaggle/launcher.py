@@ -11,6 +11,7 @@ from typing import TextIO
 
 
 EMBEDDED_FILES: dict[str, str] = {}
+RUN_MODE = "__RUN_MODE__"
 
 
 def prepare_payload() -> Path:
@@ -61,7 +62,12 @@ if __name__ == "__main__":
             with contextlib.redirect_stderr(Tee(sys.stderr, log_file)):
                 try:
                     exit_code = main(
-                        ["--config", str(PAYLOAD_ROOT / "configs" / "baseline.toml")]
+                        [
+                            "--config",
+                            str(PAYLOAD_ROOT / "configs" / "baseline.toml"),
+                            "--mode",
+                            RUN_MODE,
+                        ]
                     )
                     submission = output_dir / "submission.csv"
                     competition_submission = Path("/kaggle/working/submission.csv")

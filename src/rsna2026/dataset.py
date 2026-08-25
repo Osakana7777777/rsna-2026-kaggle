@@ -14,10 +14,16 @@ import torch
 from torch.nn import functional
 from torch.utils.data import Dataset
 
+from rsna2026.acquisition import (
+    CLASSIFICATION_METHOD,
+    AcquisitionClass,
+    choose_largest_series,
+    read_acquisition_header,
+    resolve_slots,
+)
 from rsna2026.slice_selection import central_band_indices, sample_ordered_paths
 
 
-PLANES = ("sagittal", "coronal", "axial")
 ORDERING_WORKERS = 16
 
 
@@ -28,14 +34,38 @@ class StudyRecord:
     study_uid: str
     image_paths: tuple[Path | None, ...]
     selections: tuple["SeriesSelection", ...] = ()
+    classifications: tuple["SeriesClassification", ...] = ()
+
+
+@dataclass(frozen=True)
+class SeriesClassification:
+    """Auditable acquisition classification for one candidate series."""
+
+    series_uid: str
+    plane: str
+    total_slices: int
+    weighting: str
+    fluid_sensitive: bool
+    fat_suppressed: bool
+    weighting_source: str
+    fat_suppression_source: str
+    representative_path: str
+    matching_slots: tuple[str, ...]
 
 
 @dataclass(frozen=True)
 class SeriesSelection:
-    """Auditable slice selection metadata for one anatomical plane."""
+    """Auditable slice selection metadata for one acquisition slot."""
 
+    slot: str
     plane: str
     series_uid: str | None
+    weighting: str | None
+    fluid_sensitive: bool | None
+    fat_suppressed: bool | None
+    weighting_source: str
+    fat_suppression_source: str
+    representative_path: str | None
     ordering_method: str
     total_slices: int
     selected_indices: tuple[int, ...]
@@ -43,44 +73,142 @@ class SeriesSelection:
     selected_paths: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class _SeriesCandidate:
+    study_uid: str
+    series_uid: str
+    plane: str
+    series_dir: Path
+    paths: tuple[Path, ...]
+    acquisition: AcquisitionClass
+    representative_path: Path
+    matching_slots: tuple[str, ...]
+
+
 def build_study_records(
     series_table: pd.DataFrame,
     image_root: Path,
     study_uids: Sequence[str],
-    slices_per_plane: int,
+    slices_per_slot: int,
     slice_band_start: float,
     slice_band_end: float,
+    slot_names: Sequence[str],
+    classification_method: str,
 ) -> list[StudyRecord]:
-    """Select and spatially sample the largest series in each plane."""
+    """Classify series, fill fixed acquisition slots, and sample each stack."""
     central_band_indices(
-        0, slices_per_plane, slice_band_start, slice_band_end
+        0, slices_per_slot, slice_band_start, slice_band_end
     )
+    if classification_method != CLASSIFICATION_METHOD:
+        raise ValueError(
+            f"Unsupported series classification method: {classification_method}"
+        )
+    slots = resolve_slots(slot_names)
     required = {"StudyInstanceUID", "SeriesInstanceUID", "Anatomical_Plane"}
     missing = required.difference(series_table.columns)
     if missing:
         raise ValueError(f"Series table is missing columns: {sorted(missing)}")
 
     wanted = {str(uid) for uid in study_uids}
-    candidates: dict[str, dict[str, tuple[int, Path]]] = {}
+    series_inputs: dict[tuple[str, str], tuple[str, Path, tuple[Path, ...]]] = {}
     for row in series_table.itertuples(index=False):
         study_uid = str(row.StudyInstanceUID)
         if study_uid not in wanted:
             continue
         plane = str(row.Anatomical_Plane).strip().lower()
-        if plane not in PLANES:
+        if plane not in {slot.plane for slot in slots}:
             continue
         series_uid = str(row.SeriesInstanceUID)
         series_dir = image_root / study_uid / series_uid
-        paths = list(series_dir.glob("*.dcm")) if series_dir.is_dir() else []
-        previous = candidates.setdefault(study_uid, {}).get(plane)
-        if paths and (previous is None or len(paths) > previous[0]):
-            candidates[study_uid][plane] = (len(paths), series_dir)
+        paths = (
+            tuple(sorted(series_dir.glob("*.dcm")))
+            if series_dir.is_dir()
+            else ()
+        )
+        if paths:
+            series_inputs[(study_uid, series_uid)] = (plane, series_dir, paths)
+
+    def classify_series(
+        item: tuple[tuple[str, str], tuple[str, Path, tuple[Path, ...]]]
+    ) -> _SeriesCandidate:
+        (study_uid, series_uid), (plane, series_dir, paths) = item
+        representative = paths[len(paths) // 2]
+        try:
+            acquisition = read_acquisition_header(representative)
+        except Exception as error:
+            acquisition = AcquisitionClass(
+                weighting="unknown",
+                fluid_sensitive=False,
+                fat_suppressed=False,
+                weighting_source=f"read-error:{type(error).__name__}",
+                fat_suppression_source=f"read-error:{type(error).__name__}",
+            )
+        matching = tuple(
+            slot.name for slot in slots if slot.matches(plane, acquisition)
+        )
+        return _SeriesCandidate(
+            study_uid=study_uid,
+            series_uid=series_uid,
+            plane=plane,
+            series_dir=series_dir,
+            paths=paths,
+            acquisition=acquisition,
+            representative_path=representative,
+            matching_slots=matching,
+        )
+
+    ordered_inputs = sorted(series_inputs.items())
+    with ThreadPoolExecutor(max_workers=ORDERING_WORKERS) as pool:
+        classified = list(pool.map(classify_series, ordered_inputs))
+
+    candidates: dict[str, dict[str, list[_SeriesCandidate]]] = {}
+    classifications: dict[str, list[SeriesClassification]] = {}
+    for candidate in classified:
+        relative_header = (
+            f"{candidate.study_uid}/{candidate.series_uid}/"
+            f"{candidate.representative_path.name}"
+        )
+        classifications.setdefault(candidate.study_uid, []).append(
+            SeriesClassification(
+                series_uid=candidate.series_uid,
+                plane=candidate.plane,
+                total_slices=len(candidate.paths),
+                weighting=candidate.acquisition.weighting,
+                fluid_sensitive=candidate.acquisition.fluid_sensitive,
+                fat_suppressed=candidate.acquisition.fat_suppressed,
+                weighting_source=candidate.acquisition.weighting_source,
+                fat_suppression_source=(
+                    candidate.acquisition.fat_suppression_source
+                ),
+                representative_path=relative_header,
+                matching_slots=candidate.matching_slots,
+            )
+        )
+        for slot_name in candidate.matching_slots:
+            candidates.setdefault(candidate.study_uid, {}).setdefault(
+                slot_name, []
+            ).append(candidate)
+
+    chosen: dict[str, dict[str, _SeriesCandidate]] = {}
+    for study_uid, slots_for_study in candidates.items():
+        for slot_name, slot_candidates in slots_for_study.items():
+            selected_uid = choose_largest_series(
+                [
+                    (candidate.series_uid, len(candidate.paths))
+                    for candidate in slot_candidates
+                ]
+            )
+            chosen.setdefault(study_uid, {})[slot_name] = next(
+                candidate
+                for candidate in slot_candidates
+                if candidate.series_uid == selected_uid
+            )
 
     series_directories = sorted(
         {
-            entry[1]
-            for planes in candidates.values()
-            for entry in planes.values()
+            candidate.series_dir
+            for slots_for_study in chosen.values()
+            for candidate in slots_for_study.values()
         }
     )
 
@@ -88,7 +216,7 @@ def build_study_records(
         paths = list(series_dir.glob("*.dcm"))
         return paths, sample_ordered_paths(
             paths,
-            slices_per_plane,
+            slices_per_slot,
             slice_band_start,
             slice_band_end,
         )
@@ -103,9 +231,9 @@ def build_study_records(
         study_uid = str(uid)
         selected: list[Path | None] = []
         selections = []
-        for plane in PLANES:
-            entry = candidates.get(study_uid, {}).get(plane)
-            if entry is None:
+        for slot in slots:
+            candidate = chosen.get(study_uid, {}).get(slot.name)
+            if candidate is None:
                 paths = []
                 sampled, method, indices, relative_positions = (
                     [],
@@ -114,14 +242,37 @@ def build_study_records(
                     (),
                 )
             else:
-                paths, sample = sampled_series[entry[1]]
+                paths, sample = sampled_series[candidate.series_dir]
                 sampled, method, indices, relative_positions = sample
-            selected.extend(sampled or [None] * slices_per_plane)
-            series_uid = entry[1].name if entry is not None else None
+            selected.extend(sampled or [None] * slices_per_slot)
+            series_uid = candidate.series_uid if candidate is not None else None
+            acquisition = candidate.acquisition if candidate is not None else None
             selections.append(
                 SeriesSelection(
-                    plane=plane,
+                    slot=slot.name,
+                    plane=slot.plane,
                     series_uid=series_uid,
+                    weighting=(acquisition.weighting if acquisition else None),
+                    fluid_sensitive=(
+                        acquisition.fluid_sensitive if acquisition else None
+                    ),
+                    fat_suppressed=(
+                        acquisition.fat_suppressed if acquisition else None
+                    ),
+                    weighting_source=(
+                        acquisition.weighting_source if acquisition else "missing"
+                    ),
+                    fat_suppression_source=(
+                        acquisition.fat_suppression_source
+                        if acquisition
+                        else "missing"
+                    ),
+                    representative_path=(
+                        f"{study_uid}/{series_uid}/"
+                        f"{candidate.representative_path.name}"
+                        if candidate is not None
+                        else None
+                    ),
                     ordering_method=method,
                     total_slices=len(paths),
                     selected_indices=indices,
@@ -132,7 +283,19 @@ def build_study_records(
                     ),
                 )
             )
-        records.append(StudyRecord(study_uid, tuple(selected), tuple(selections)))
+        records.append(
+            StudyRecord(
+                study_uid,
+                tuple(selected),
+                tuple(selections),
+                tuple(
+                    sorted(
+                        classifications.get(study_uid, []),
+                        key=lambda item: item.series_uid,
+                    )
+                ),
+            )
+        )
     return records
 
 

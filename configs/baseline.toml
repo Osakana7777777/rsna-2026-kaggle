@@ -9,14 +9,22 @@ working_root = "/kaggle/working"
 output_dir = "/kaggle/working/outputs"
 
 [run]
-mode = "train-infer"
 seed = 42
 
 [data]
 image_size = 224
-slices_per_plane = 3
+slices_per_slot = 3
 slice_band_start = 0.20
 slice_band_end = 0.80
+series_classification = "dicom-header-v1"
+slots = [
+  "sagittal-fluid-fs",
+  "coronal-fluid-fs",
+  "axial-fluid-fs",
+  "sagittal-fluid-nofs",
+  "coronal-t1",
+  "sagittal-t1",
+]
 
 [training]
 epochs = 10
@@ -46,5 +54,12 @@ minimum_source_macro_auc = 0.88
 name = "dinov2-small"
 variant = "small"
 unfreeze_last = 6
-pooling = "cls-patch-mean-view-mean"
+pooling = "cls-patch-mean-slot-mean"
+aggregation = "target-attention"
+attention_hidden_size = 256
 dropout = 0.25
+
+[inference]
+# Training-notebook outputs are mounted below /kaggle/input using the notebook slug.
+checkpoint_path = "/kaggle/input/rsna-2026-training/outputs/best-model.pt"
+checkpoint_manifest_path = "/kaggle/input/rsna-2026-training/outputs/checkpoint-manifest.json"

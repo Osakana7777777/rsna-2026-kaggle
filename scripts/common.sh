@@ -3,9 +3,25 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-METADATA_FILE="${PROJECT_ROOT}/kaggle/kernel-metadata.json"
-BUILD_DIR="${PROJECT_ROOT}/.kaggle-build"
-OUTPUT_DIR="${PROJECT_ROOT}/outputs"
+RUN_KIND="${1:-submission}"
+case "${RUN_KIND}" in
+  train)
+    METADATA_FILE="${PROJECT_ROOT}/kaggle/train-kernel-metadata.json"
+    BUILD_DIR="${PROJECT_ROOT}/.kaggle-build/train"
+    OUTPUT_DIR="${PROJECT_ROOT}/outputs/train"
+    RUN_MODE="train"
+    ;;
+  submission)
+    METADATA_FILE="${PROJECT_ROOT}/kaggle/kernel-metadata.json"
+    BUILD_DIR="${PROJECT_ROOT}/.kaggle-build/submission"
+    OUTPUT_DIR="${PROJECT_ROOT}/outputs/submission"
+    RUN_MODE="inference"
+    ;;
+  *)
+    echo "Usage: $0 [train|submission]" >&2
+    exit 2
+    ;;
+esac
 
 require_command() {
   if ! command -v "$1" >/dev/null 2>&1; then

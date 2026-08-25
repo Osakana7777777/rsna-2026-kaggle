@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 
@@ -11,6 +12,69 @@ from torch import nn
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+class TargetAttentionHead(nn.Module):
+    """Use a separate masked slot distribution for every target."""
+
+    def __init__(
+        self,
+        feature_size: int,
+        num_slots: int,
+        num_targets: int,
+        hidden_size: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        if num_slots <= 0 or num_targets <= 0 or hidden_size <= 0:
+            raise ValueError("Slot, target, and attention sizes must be positive")
+        self.projection = nn.Sequential(
+            nn.LayerNorm(feature_size),
+            nn.Linear(feature_size, hidden_size),
+            nn.GELU(),
+        )
+        self.slot_embedding = nn.Parameter(
+            torch.randn(num_slots, hidden_size) * 0.02
+        )
+        self.target_query = nn.Parameter(
+            torch.randn(num_targets, hidden_size) * 0.02
+        )
+        self.output_weight = nn.Parameter(
+            torch.randn(num_targets, hidden_size) * 0.02
+        )
+        self.output_bias = nn.Parameter(torch.zeros(num_targets))
+        self.dropout = nn.Dropout(dropout)
+        self.hidden_size = hidden_size
+        self.num_slots = num_slots
+        self.num_targets = num_targets
+
+    def attention_weights(
+        self, hidden: torch.Tensor, slot_present: torch.Tensor
+    ) -> torch.Tensor:
+        """Return target-by-slot weights, with absent slots exactly zero."""
+        scores = torch.einsum(
+            "bsh,th->bts", hidden, self.target_query
+        ) / math.sqrt(self.hidden_size)
+        mask = slot_present.to(dtype=torch.bool).unsqueeze(1)
+        weights = torch.softmax(scores.masked_fill(~mask, -1e4), dim=-1)
+        weights = weights * mask.to(weights.dtype)
+        return weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+    def forward(
+        self, slot_features: torch.Tensor, slot_present: torch.Tensor
+    ) -> torch.Tensor:
+        if slot_features.shape[1] != self.num_slots:
+            raise ValueError(
+                f"Expected {self.num_slots} slots, received "
+                f"{slot_features.shape[1]}"
+            )
+        hidden = self.projection(slot_features) + self.slot_embedding.unsqueeze(0)
+        attention = self.attention_weights(hidden, slot_present)
+        context = self.dropout(torch.einsum("bts,bsh->bth", attention, hidden))
+        return (
+            (context * self.output_weight.unsqueeze(0)).sum(dim=-1)
+            + self.output_bias
+        )
 
 
 def find_dinov2_source(input_root: str | Path, variant: str) -> Path:
@@ -40,7 +104,7 @@ def find_dinov2_source(input_root: str | Path, variant: str) -> Path:
 
 
 class KneeAbnormalityModel(nn.Module):
-    """Encode individual grayscale slices with DINOv2 and mean-pool views."""
+    """Encode slices, pool within acquisition slots, and attend by target."""
 
     def __init__(
         self,
@@ -48,10 +112,15 @@ class KneeAbnormalityModel(nn.Module):
         num_targets: int,
         unfreeze_last: int,
         dropout: float,
+        num_slots: int,
+        slices_per_slot: int,
+        attention_hidden_size: int,
     ) -> None:
         super().__init__()
         if unfreeze_last <= 0:
             raise ValueError("At least one DINOv2 encoder block must be trainable")
+        if slices_per_slot <= 0:
+            raise ValueError("Slices per slot must be positive")
         self.backbone = backbone
         layers = self._encoder_layers()
         if unfreeze_last > len(layers):
@@ -71,13 +140,17 @@ class KneeAbnormalityModel(nn.Module):
 
         hidden_size = int(self.backbone.config.hidden_size)
         feature_size = hidden_size * 2
-        self.head = nn.Sequential(
-            nn.LayerNorm(feature_size),
-            nn.Dropout(dropout),
-            nn.Linear(feature_size, num_targets),
+        self.head = TargetAttentionHead(
+            feature_size=feature_size,
+            num_slots=num_slots,
+            num_targets=num_targets,
+            hidden_size=attention_hidden_size,
+            dropout=dropout,
         )
         self.unfreeze_last = unfreeze_last
         self.feature_size = feature_size
+        self.num_slots = num_slots
+        self.slices_per_slot = slices_per_slot
         self.register_buffer(
             "image_mean", torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1)
         )
@@ -96,17 +169,47 @@ class KneeAbnormalityModel(nn.Module):
         batch_size, num_views, channels, height, width = images.shape
         if channels != 1:
             raise ValueError(f"Expected one grayscale channel, received {channels}")
-        pixels = images.reshape(batch_size * num_views, 1, height, width)
-        pixels = pixels.expand(-1, 3, -1, -1)
+        expected_views = self.num_slots * self.slices_per_slot
+        if num_views != expected_views:
+            raise ValueError(
+                f"Expected {expected_views} views, received {num_views}"
+            )
+        if present.shape != (batch_size, num_views):
+            raise ValueError(
+                f"Expected presence shape {(batch_size, num_views)}, "
+                f"received {tuple(present.shape)}"
+            )
+        flat_present = present.reshape(-1).to(dtype=torch.bool)
+        flat_images = images.reshape(batch_size * num_views, 1, height, width)
+        pixels = flat_images[flat_present].expand(-1, 3, -1, -1)
         pixels = (pixels - self.image_mean) / self.image_std
-        tokens = self.backbone(pixel_values=pixels).last_hidden_state
-        if tokens.shape[1] < 2:
-            raise ValueError("DINOv2 output did not contain patch tokens")
-        features = torch.cat((tokens[:, 0], tokens[:, 1:].mean(dim=1)), dim=1)
-        features = features.reshape(batch_size, num_views, self.feature_size)
-        weights = present.to(features.dtype).unsqueeze(-1)
-        pooled = (features * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
-        return self.head(pooled)
+        if pixels.shape[0]:
+            tokens = self.backbone(pixel_values=pixels).last_hidden_state
+            if tokens.shape[1] < 2:
+                raise ValueError("DINOv2 output did not contain patch tokens")
+            encoded = torch.cat(
+                (tokens[:, 0], tokens[:, 1:].mean(dim=1)), dim=1
+            )
+            features = encoded.new_zeros(
+                (batch_size * num_views, self.feature_size)
+            )
+            features[flat_present] = encoded
+        else:
+            features = images.new_zeros(
+                (batch_size * num_views, self.feature_size)
+            )
+        features = features.reshape(
+            batch_size, self.num_slots, self.slices_per_slot, self.feature_size
+        )
+        slice_present = present.reshape(
+            batch_size, self.num_slots, self.slices_per_slot
+        )
+        slice_weights = slice_present.to(features.dtype).unsqueeze(-1)
+        slot_features = (features * slice_weights).sum(dim=2) / (
+            slice_weights.sum(dim=2).clamp_min(1.0)
+        )
+        slot_present = slice_present.any(dim=2)
+        return self.head(slot_features, slot_present)
 
 
 def build_dinov2_model(
@@ -115,6 +218,9 @@ def build_dinov2_model(
     num_targets: int,
     unfreeze_last: int,
     dropout: float,
+    num_slots: int,
+    slices_per_slot: int,
+    attention_hidden_size: int,
 ) -> tuple[KneeAbnormalityModel, Path]:
     """Load a mounted DINOv2 model without any network access."""
     from transformers import AutoModel
@@ -126,5 +232,8 @@ def build_dinov2_model(
         num_targets=num_targets,
         unfreeze_last=unfreeze_last,
         dropout=dropout,
+        num_slots=num_slots,
+        slices_per_slot=slices_per_slot,
+        attention_hidden_size=attention_hidden_size,
     )
     return model, source

@@ -8,13 +8,13 @@
   "enable_gpu": true,
   "enable_internet": false,
   "machine_shape": "NvidiaTeslaT4",
-  "dataset_sources": [
-    "stevenleehans/rsna-knee-llm-report-labels"
-  ],
+  "dataset_sources": [],
   "competition_sources": [
     "rsna-knee-abnormality-detection"
   ],
-  "kernel_sources": [],
+  "kernel_sources": [
+    "osakanateishoku/rsna-2026-training"
+  ],
   "model_sources": [
     "metaresearch/dinov2/PyTorch/small/1"
   ]

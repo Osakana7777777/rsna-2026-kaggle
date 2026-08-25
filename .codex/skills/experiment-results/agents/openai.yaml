@@ -1,0 +1,7 @@
+interface:
+  display_name: "実験結果作成"
+  short_description: "Kaggle実験の結果記録と正式提出文書を作成・更新する"
+  default_prompt: "$experiment-results を使い、今回のKaggle実験の正式提出記録を作成してください。"
+
+policy:
+  allow_implicit_invocation: true

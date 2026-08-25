@@ -19,6 +19,12 @@ from torch import nn
 from torch.nn import functional
 from torch.utils.data import DataLoader
 
+from rsna2026.acquisition import CLASSIFICATION_METHOD, SLOT_NAMES
+from rsna2026.checkpoint import (
+    load_and_verify_manifest,
+    resolve_input_file,
+    write_checkpoint_manifest,
+)
 from rsna2026.config import load_config
 from rsna2026.constants import TARGETS
 from rsna2026.data import competition_input
@@ -37,6 +43,9 @@ from rsna2026.public_labels import (
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run an RSNA 2026 experiment")
     parser.add_argument("--config", required=True, help="Path to a TOML config")
+    parser.add_argument(
+        "--mode", choices=("train", "inference"), required=True
+    )
     return parser.parse_args(argv)
 
 
@@ -379,11 +388,15 @@ def write_submission(
 
 def slice_selection_report(
     records_by_split: dict[str, Sequence[StudyRecord]],
+    slices_per_slot: int,
     slice_band_start: float,
     slice_band_end: float,
 ) -> dict[str, object]:
     """Create an auditable record of every selected series and slice."""
     report: dict[str, object] = {
+        "series_classification": CLASSIFICATION_METHOD,
+        "slots": list(SLOT_NAMES),
+        "slices_per_slot": slices_per_slot,
         "slice_band": [slice_band_start, slice_band_end],
         "splits": {},
     }
@@ -394,22 +407,239 @@ def slice_selection_report(
             for record in records
             for selection in record.selections
         )
+        selected_slots = Counter(
+            selection.slot
+            for record in records
+            for selection in record.selections
+            if selection.series_uid is not None
+        )
+        weighting_sources = Counter(
+            classification.weighting_source
+            for record in records
+            for classification in record.classifications
+        )
+        fat_suppression_sources = Counter(
+            classification.fat_suppression_source
+            for record in records
+            for classification in record.classifications
+        )
+        unassigned_series = sum(
+            not classification.matching_slots
+            for record in records
+            for classification in record.classifications
+        )
         entries = [
             {
                 "study_uid": record.study_uid,
                 "series": [asdict(selection) for selection in record.selections],
+                "series_classifications": [
+                    asdict(classification)
+                    for classification in record.classifications
+                ],
             }
             for record in records
         ]
         summary = {
             "studies": len(records),
             "series_by_ordering_method": dict(sorted(methods.items())),
-            "missing_planes": methods.get("missing", 0),
+            "selected_series_by_slot": {
+                slot: selected_slots.get(slot, 0) for slot in SLOT_NAMES
+            },
+            "missing_slots_by_slot": {
+                slot: len(records) - selected_slots.get(slot, 0)
+                for slot in SLOT_NAMES
+            },
+            "classified_series": sum(
+                len(record.classifications) for record in records
+            ),
+            "unassigned_series": unassigned_series,
+            "weighting_sources": dict(sorted(weighting_sources.items())),
+            "fat_suppression_sources": dict(
+                sorted(fat_suppression_sources.items())
+            ),
         }
         split_reports[split] = {"summary": summary, "studies": entries}
         print(f"{split} slice selection: {summary}", flush=True)
     report["splits"] = split_reports
     return report
+
+
+def model_artifact_metadata(config: dict[str, object]) -> dict[str, object]:
+    """Return architecture fields that must match across both notebook stages."""
+    model_config = config["model"]
+    data_config = config["data"]
+    return {
+        "name": str(model_config["name"]),  # type: ignore[index]
+        "variant": str(model_config["variant"]),  # type: ignore[index]
+        "num_targets": len(TARGETS),
+        "targets": list(TARGETS),
+        "unfreeze_last": int(model_config["unfreeze_last"]),  # type: ignore[index]
+        "dropout": float(model_config["dropout"]),  # type: ignore[index]
+        "pooling": str(model_config["pooling"]),  # type: ignore[index]
+        "aggregation": str(model_config["aggregation"]),  # type: ignore[index]
+        "attention_hidden_size": int(  # type: ignore[index]
+            model_config["attention_hidden_size"]
+        ),
+        "image_size": int(data_config["image_size"]),  # type: ignore[index]
+        "slices_per_slot": int(data_config["slices_per_slot"]),  # type: ignore[index]
+        "series_classification": str(  # type: ignore[index]
+            data_config["series_classification"]
+        ),
+        "slots": list(data_config["slots"]),  # type: ignore[index]
+    }
+
+
+def build_configured_model(
+    config: dict[str, object], device: torch.device
+) -> tuple[nn.Module, Path, int, int]:
+    """Build the configured architecture from the mounted base model."""
+    model_config = config["model"]
+    data_config = config["data"]
+    image_size = int(data_config["image_size"])  # type: ignore[index]
+    if str(model_config["name"]) != "dinov2-small":  # type: ignore[index]
+        model_name = model_config["name"]  # type: ignore[index]
+        raise ValueError(f"Unsupported model: {model_name}")
+    if image_size % 14:
+        raise ValueError("DINOv2 image size must be divisible by its patch size 14")
+    if str(model_config["aggregation"]) != "target-attention":  # type: ignore[index]
+        raise ValueError("Only target-attention aggregation is supported")
+    slot_names = tuple(str(name) for name in data_config["slots"])  # type: ignore[index]
+    if slot_names != SLOT_NAMES:
+        raise ValueError(f"Configured slots must be {list(SLOT_NAMES)}")
+    model, model_source = build_dinov2_model(
+        input_root=config["paths"]["input_root"],  # type: ignore[index]
+        variant=str(model_config["variant"]),  # type: ignore[index]
+        num_targets=len(TARGETS),
+        unfreeze_last=int(model_config["unfreeze_last"]),  # type: ignore[index]
+        dropout=float(model_config["dropout"]),  # type: ignore[index]
+        num_slots=len(slot_names),
+        slices_per_slot=int(data_config["slices_per_slot"]),  # type: ignore[index]
+        attention_hidden_size=int(  # type: ignore[index]
+            model_config["attention_hidden_size"]
+        ),
+    )
+    model = model.to(device)
+    total_parameters = sum(parameter.numel() for parameter in model.parameters())
+    trainable_parameters = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+    print(
+        f"Loaded {model_config['name']} from {model_source}; "  # type: ignore[index]
+        f"parameters={total_parameters}, trainable={trainable_parameters}",
+        flush=True,
+    )
+    return model, model_source, total_parameters, trainable_parameters
+
+
+def write_json(path: Path, value: object, allow_nan: bool = False) -> None:
+    """Write one consistently formatted JSON artifact."""
+    path.write_text(
+        json.dumps(value, indent=2, allow_nan=allow_nan) + "\n",
+        encoding="utf-8",
+    )
+
+
+def run_inference(
+    config: dict[str, object], output_dir: Path, started_at: float
+) -> int:
+    """Load a trained checkpoint and infer competition test studies only."""
+    input_root = config["paths"]["input_root"]  # type: ignore[index]
+    input_path = competition_input(
+        input_root, config["competition"]["input_slug"]  # type: ignore[index]
+    )
+    test_table = pd.read_csv(input_path / "test.csv")
+    test_series = pd.read_csv(input_path / "test_series.csv")
+    sample_submission = pd.read_csv(input_path / "sample_submission.csv")
+    data_config = config["data"]
+    image_size = int(data_config["image_size"])  # type: ignore[index]
+    slices_per_slot = int(data_config["slices_per_slot"])  # type: ignore[index]
+    slice_band_start = float(data_config["slice_band_start"])  # type: ignore[index]
+    slice_band_end = float(data_config["slice_band_end"])  # type: ignore[index]
+    slot_names = list(data_config["slots"])  # type: ignore[index]
+    classification_method = str(  # type: ignore[index]
+        data_config["series_classification"]
+    )
+    test_uids = test_table["StudyInstanceUID"].astype(str).tolist()
+    test_records = build_study_records(
+        test_series,
+        input_path / "test_series",
+        test_uids,
+        slices_per_slot,
+        slice_band_start,
+        slice_band_end,
+        slot_names,
+        classification_method,
+    )
+    selection_report = slice_selection_report(
+        {"test": test_records},
+        slices_per_slot,
+        slice_band_start,
+        slice_band_end,
+    )
+    write_json(output_dir / "slice-selection.json", selection_report)
+    test_loader = make_loader(
+        test_records,
+        image_size,
+        None,
+        None,
+        int(config["training"]["batch_size"]),  # type: ignore[index]
+        int(config["training"]["num_workers"]),  # type: ignore[index]
+        False,
+        False,
+    )
+
+    inference_config = config["inference"]
+    checkpoint_path = resolve_input_file(
+        inference_config["checkpoint_path"], input_root  # type: ignore[index]
+    )
+    manifest_path = resolve_input_file(
+        inference_config["checkpoint_manifest_path"], input_root  # type: ignore[index]
+    )
+    manifest = load_and_verify_manifest(checkpoint_path, manifest_path)
+    expected_model = model_artifact_metadata(config)
+    if manifest.get("model") != expected_model:
+        raise ValueError(
+            "Checkpoint model metadata does not match the inference configuration"
+        )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, model_source, total_parameters, trainable_parameters = (
+        build_configured_model(config, device)
+    )
+    state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    model.load_state_dict(state_dict)
+    predictions, _ = predict(model, test_loader, device)
+    submission_path = output_dir / "submission.csv"
+    write_submission(sample_submission, test_uids, predictions, submission_path)
+    summary = {
+        "status": "inference-complete",
+        "device": str(device),
+        "test_studies": len(test_records),
+        "targets": TARGETS,
+        "elapsed_seconds": time.monotonic() - started_at,
+        "checkpoint_source": str(checkpoint_path),
+        "checkpoint_manifest_source": str(manifest_path),
+        "checkpoint": manifest,
+        "model": {
+            **expected_model,
+            "source": str(model_source),
+            "total_parameters": total_parameters,
+            "trainable_parameters": trainable_parameters,
+        },
+        "slice_selection": {
+            "slice_band": selection_report["slice_band"],
+            "artifact": "slice-selection.json",
+            "splits": {
+                split: values["summary"]
+                for split, values in selection_report["splits"].items()
+            },
+        },
+    }
+    write_json(output_dir / "run-summary.json", summary)
+    print(f"Wrote {submission_path}", flush=True)
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -419,17 +649,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     seed = int(config["run"]["seed"])
     seed_everything(seed)
 
-    input_path = competition_input(
-        config["paths"]["input_root"], config["competition"]["input_slug"]
-    )
     output_dir = Path(config["paths"]["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.mode == "inference":
+        return run_inference(config, output_dir, started_at)
+
+    input_path = competition_input(
+        config["paths"]["input_root"], config["competition"]["input_slug"]
+    )
     train_table = pd.read_csv(input_path / "train.csv")
-    test_table = pd.read_csv(input_path / "test.csv")
     train_series = pd.read_csv(input_path / "train_series.csv")
-    test_series = pd.read_csv(input_path / "test_series.csv")
-    sample_submission = pd.read_csv(input_path / "sample_submission.csv")
 
     missing_targets = [
         target for target in TARGETS if target not in train_table.columns
@@ -438,10 +668,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError(f"Training table is missing targets: {missing_targets}")
     if "Report" not in train_table.columns:
         raise ValueError("Training table is missing Report")
-
-    benchmark = sample_submission.copy()
-    benchmark[TARGETS] = 0.5
-    benchmark.to_csv(output_dir / "submission.csv", index=False)
 
     pseudo_enabled = bool(config.get("pseudo_labels", {}).get("enabled", False))
     provenance: dict[str, object] = {}
@@ -494,40 +720,37 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     image_size = int(config["data"]["image_size"])
-    slices_per_plane = int(config["data"]["slices_per_plane"])
+    slices_per_slot = int(config["data"]["slices_per_slot"])
     slice_band_start = float(config["data"]["slice_band_start"])
     slice_band_end = float(config["data"]["slice_band_end"])
+    slot_names = list(config["data"]["slots"])
+    classification_method = str(config["data"]["series_classification"])
     training_records = build_study_records(
         train_series,
         input_path / "train_series",
         training_table["StudyInstanceUID"].astype(str).tolist(),
-        slices_per_plane,
+        slices_per_slot,
         slice_band_start,
         slice_band_end,
+        slot_names,
+        classification_method,
     )
     validation_records = build_study_records(
         train_series,
         input_path / "train_series",
         validation_table["StudyInstanceUID"].astype(str).tolist(),
-        slices_per_plane,
+        slices_per_slot,
         slice_band_start,
         slice_band_end,
-    )
-    test_uids = test_table["StudyInstanceUID"].astype(str).tolist()
-    test_records = build_study_records(
-        test_series,
-        input_path / "test_series",
-        test_uids,
-        slices_per_plane,
-        slice_band_start,
-        slice_band_end,
+        slot_names,
+        classification_method,
     )
     selection_report = slice_selection_report(
         {
             "training": training_records,
             "validation": validation_records,
-            "test": test_records,
         },
+        slices_per_slot,
         slice_band_start,
         slice_band_end,
     )
@@ -558,46 +781,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         False,
         False,
     )
-    test_loader = make_loader(
-        test_records,
-        image_size,
-        None,
-        None,
-        batch_size,
-        num_workers,
-        False,
-        False,
-    )
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(
         f"Training on {device}; train={len(training_records)}, "
         f"validation={len(validation_records)}",
         flush=True,
     )
-    model_config = config["model"]
-    if str(model_config["name"]) != "dinov2-small":
-        raise ValueError(f"Unsupported model: {model_config['name']}")
-    if image_size % 14:
-        raise ValueError("DINOv2 image size must be divisible by its patch size 14")
-    model, model_source = build_dinov2_model(
-        input_root=config["paths"]["input_root"],
-        variant=str(model_config["variant"]),
-        num_targets=len(TARGETS),
-        unfreeze_last=int(model_config["unfreeze_last"]),
-        dropout=float(model_config["dropout"]),
-    )
-    model = model.to(device)
-    total_parameters = sum(parameter.numel() for parameter in model.parameters())
-    trainable_parameters = sum(
-        parameter.numel()
-        for parameter in model.parameters()
-        if parameter.requires_grad
-    )
-    print(
-        f"Loaded {model_config['name']} from {model_source}; "
-        f"parameters={total_parameters}, trainable={trainable_parameters}",
-        flush=True,
+    model, model_source, total_parameters, trainable_parameters = (
+        build_configured_model(config, device)
     )
     backbone_learning_rate = float(
         config["training"]["backbone_learning_rate"]
@@ -635,6 +826,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     ) * 3600.0
 
     best_score = -math.inf
+    best_epoch = 0
     best_state: dict[str, torch.Tensor] | None = None
     history = []
     time_limit_reached = False
@@ -670,6 +862,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         selection_score = auc if math.isfinite(auc) else -loss
         if best_state is None or selection_score > best_score:
             best_score = selection_score
+            best_epoch = epoch + 1
             best_state = {
                 name: value.detach().cpu().clone()
                 for name, value in model.state_dict().items()
@@ -685,35 +878,41 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if best_state is None:
         raise RuntimeError("Training did not produce a model state")
-    model.load_state_dict(best_state)
-    torch.save(best_state, output_dir / "best-model.pt")
-
-    test_predictions, _ = predict(model, test_loader, device)
-    write_submission(
-        sample_submission, test_uids, test_predictions, output_dir / "submission.csv"
+    checkpoint_path = output_dir / "best-model.pt"
+    torch.save(best_state, checkpoint_path)
+    artifact_metadata = model_artifact_metadata(config)
+    manifest = write_checkpoint_manifest(
+        checkpoint_path,
+        output_dir / "checkpoint-manifest.json",
+        {
+            "model": artifact_metadata,
+            "best_epoch": best_epoch,
+            "best_validation_score": best_score,
+            "training_studies": len(training_records),
+            "validation_studies": len(validation_records),
+        },
     )
     elapsed_seconds = time.monotonic() - started_at
     summary = {
-        "status": "train-infer-complete",
+        "status": "training-complete",
         "device": str(device),
         "pseudo_labels_enabled": pseudo_enabled,
         "training_studies": len(training_records),
         "validation_studies": len(validation_records),
-        "test_studies": len(test_records),
         "targets": TARGETS,
         "elapsed_seconds": elapsed_seconds,
         "completed_epochs": len(history),
+        "best_epoch": best_epoch,
         "time_limit_reached": time_limit_reached,
+        "checkpoint": manifest,
         "model": {
-            "name": str(model_config["name"]),
-            "variant": str(model_config["variant"]),
+            **artifact_metadata,
             "source": str(model_source),
             "total_parameters": total_parameters,
             "trainable_parameters": trainable_parameters,
-            "unfreeze_last": int(model_config["unfreeze_last"]),
-            "image_size": image_size,
-            "pooling": str(model_config["pooling"]),
             "grayscale_to_rgb": "channel-repeat",
+            "slot_pooling": "masked-slice-mean",
+            "slot_aggregation": "per-target-masked-attention",
             "backbone_learning_rate": backbone_learning_rate,
             "head_learning_rate": head_learning_rate,
             "weight_decay": float(config["training"]["weight_decay"]),
@@ -734,10 +933,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "history": history,
         **provenance,
     }
-    (output_dir / "run-summary.json").write_text(
-        json.dumps(summary, indent=2, allow_nan=True) + "\n", encoding="utf-8"
-    )
-    print(f"Wrote {output_dir / 'submission.csv'}", flush=True)
+    write_json(output_dir / "run-summary.json", summary, allow_nan=True)
+    print(f"Wrote reusable checkpoint {checkpoint_path}", flush=True)
     return 0
 
 

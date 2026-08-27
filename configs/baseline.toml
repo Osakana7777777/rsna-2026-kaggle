@@ -14,6 +14,9 @@ seed = 42
 [data]
 image_size = 224
 slices_per_slot = 3
+# Reuse decoded, windowed, and resized slices across epochs. This ephemeral path
+# is not included in the training notebook outputs.
+dicom_cache_dir = "/tmp/rsna2026-dicom-cache"
 slice_band_start = 0.20
 slice_band_end = 0.80
 series_classification = "dicom-header-v1"
@@ -53,8 +56,9 @@ minimum_source_macro_auc = 0.88
 [model]
 name = "dinov2-small"
 variant = "small"
+input_representation = "2.5d-slice-channels"
 unfreeze_last = 6
-pooling = "cls-patch-mean-slot-mean"
+pooling = "cls-patch-mean"
 aggregation = "target-attention"
 attention_hidden_size = 256
 dropout = 0.25

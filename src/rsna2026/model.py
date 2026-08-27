@@ -104,7 +104,7 @@ def find_dinov2_source(input_root: str | Path, variant: str) -> Path:
 
 
 class KneeAbnormalityModel(nn.Module):
-    """Encode slices, pool within acquisition slots, and attend by target."""
+    """Encode three-slice 2.5D slots and attend to them by target."""
 
     def __init__(
         self,
@@ -121,6 +121,8 @@ class KneeAbnormalityModel(nn.Module):
             raise ValueError("At least one DINOv2 encoder block must be trainable")
         if slices_per_slot <= 0:
             raise ValueError("Slices per slot must be positive")
+        if slices_per_slot != 3:
+            raise ValueError("2.5D input requires exactly three slices per slot")
         self.backbone = backbone
         layers = self._encoder_layers()
         if unfreeze_last > len(layers):
@@ -179,10 +181,17 @@ class KneeAbnormalityModel(nn.Module):
                 f"Expected presence shape {(batch_size, num_views)}, "
                 f"received {tuple(present.shape)}"
             )
-        flat_present = present.reshape(-1).to(dtype=torch.bool)
-        flat_images = images.reshape(batch_size * num_views, 1, height, width)
-        pixels = flat_images[flat_present].expand(-1, 3, -1, -1)
+        slice_present = present.reshape(
+            batch_size, self.num_slots, self.slices_per_slot
+        ).to(dtype=torch.bool)
+        slot_present = slice_present.any(dim=2)
+        slot_images = images.reshape(
+            batch_size, self.num_slots, self.slices_per_slot, height, width
+        )
+        pixels = slot_images[slot_present]
         pixels = (pixels - self.image_mean) / self.image_std
+        channel_present = slice_present[slot_present].to(pixels.dtype)
+        pixels = pixels * channel_present.view(-1, 3, 1, 1)
         if pixels.shape[0]:
             tokens = self.backbone(pixel_values=pixels).last_hidden_state
             if tokens.shape[1] < 2:
@@ -191,24 +200,16 @@ class KneeAbnormalityModel(nn.Module):
                 (tokens[:, 0], tokens[:, 1:].mean(dim=1)), dim=1
             )
             features = encoded.new_zeros(
-                (batch_size * num_views, self.feature_size)
+                (batch_size * self.num_slots, self.feature_size)
             )
-            features[flat_present] = encoded
+            features[slot_present.reshape(-1)] = encoded
         else:
             features = images.new_zeros(
-                (batch_size * num_views, self.feature_size)
+                (batch_size * self.num_slots, self.feature_size)
             )
-        features = features.reshape(
-            batch_size, self.num_slots, self.slices_per_slot, self.feature_size
+        slot_features = features.reshape(
+            batch_size, self.num_slots, self.feature_size
         )
-        slice_present = present.reshape(
-            batch_size, self.num_slots, self.slices_per_slot
-        )
-        slice_weights = slice_present.to(features.dtype).unsqueeze(-1)
-        slot_features = (features * slice_weights).sum(dim=2) / (
-            slice_weights.sum(dim=2).clamp_min(1.0)
-        )
-        slot_present = slice_present.any(dim=2)
         return self.head(slot_features, slot_present)
 
 

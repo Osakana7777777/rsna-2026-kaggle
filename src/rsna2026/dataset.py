@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import os
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -25,6 +27,7 @@ from rsna2026.slice_selection import central_band_indices, sample_ordered_paths
 
 
 ORDERING_WORKERS = 16
+PREPROCESSING_VERSION = "dicom-window-v1"
 
 
 @dataclass(frozen=True)
@@ -339,12 +342,16 @@ class KneeStudyDataset(
         labels: np.ndarray | None = None,
         label_weights: np.ndarray | None = None,
         augment: bool = False,
+        cache_dir: str | Path | None = None,
     ) -> None:
         self.records = list(records)
         self.image_size = image_size
         self.labels = labels
         self.label_weights = label_weights
         self.augment = augment
+        self.cache_dir = Path(cache_dir) if cache_dir else None
+        if self.cache_dir is not None:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
         if (labels is None) != (label_weights is None):
             raise ValueError("Labels and label weights must be supplied together")
         if labels is not None and len(labels) != len(self.records):
@@ -358,23 +365,10 @@ class KneeStudyDataset(
     def __getitem__(
         self, index: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        images = []
-        present = []
-        for path in self.records[index].image_paths:
-            try:
-                image = read_dicom(path, self.image_size) if path is not None else None
-            except Exception as error:
-                print(f"Warning: failed to decode {path}: {error}", flush=True)
-                image = None
-            if image is None:
-                image = torch.zeros((1, self.image_size, self.image_size))
-                present.append(False)
-            else:
-                if self.augment:
-                    scale = 0.9 + 0.2 * torch.rand(())
-                    image = (image * scale).clamp(0.0, 1.0)
-                present.append(True)
-            images.append(image.float())
+        images, present = self._load_images(self.records[index])
+        if self.augment:
+            scales = 0.9 + 0.2 * torch.rand((len(images), 1, 1, 1))
+            images = (images * scales).clamp(0.0, 1.0)
 
         label = (
             torch.from_numpy(self.labels[index]).float()
@@ -386,4 +380,88 @@ class KneeStudyDataset(
             if self.label_weights is not None
             else torch.empty(0)
         )
-        return torch.stack(images), torch.tensor(present), label, label_weight
+        return images, present, label, label_weight
+
+    def _load_images(self, record: StudyRecord) -> tuple[torch.Tensor, torch.Tensor]:
+        """Load one study, reusing an ephemeral preprocessed cache when enabled."""
+        cache_path = self._cache_path(record)
+        if cache_path is not None and cache_path.is_file():
+            try:
+                with np.load(cache_path, allow_pickle=False) as cached:
+                    present = torch.from_numpy(cached["present"].astype(np.bool_))
+                    present_images = torch.from_numpy(
+                        np.asarray(cached["images"], dtype=np.float32)
+                    )
+                image_shape = (
+                    1,
+                    self.image_size,
+                    self.image_size,
+                )
+                if tuple(present.shape) != (
+                    len(record.image_paths),
+                ) or tuple(present_images.shape) != (
+                    int(present.sum()),
+                    *image_shape,
+                ):
+                    raise ValueError("cached tensor shape does not match the study")
+                images = torch.zeros((len(present), *image_shape))
+                images[present] = present_images
+                return images, present
+            except (OSError, ValueError, KeyError) as error:
+                print(f"Warning: ignoring invalid DICOM cache {cache_path}: {error}")
+
+        images = []
+        present = []
+        for path in record.image_paths:
+            try:
+                image = read_dicom(path, self.image_size) if path is not None else None
+            except Exception as error:
+                print(f"Warning: failed to decode {path}: {error}", flush=True)
+                image = None
+            if image is None:
+                image = torch.zeros((1, self.image_size, self.image_size))
+                present.append(False)
+            else:
+                present.append(True)
+            images.append(image.float())
+        image_tensor = torch.stack(images)
+        present_tensor = torch.tensor(present)
+        if cache_path is not None:
+            self._write_cache(cache_path, image_tensor, present_tensor)
+        return image_tensor, present_tensor
+
+    def _cache_path(self, record: StudyRecord) -> Path | None:
+        if self.cache_dir is None:
+            return None
+        identity = "\n".join(
+            [
+                PREPROCESSING_VERSION,
+                str(self.image_size),
+                *(
+                    str(path) if path is not None else "<missing>"
+                    for path in record.image_paths
+                ),
+            ]
+        )
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+        return self.cache_dir / f"{digest}.npz"
+
+    @staticmethod
+    def _write_cache(
+        cache_path: Path, images: torch.Tensor, present: torch.Tensor
+    ) -> None:
+        """Atomically save preprocessed images without publishing medical data."""
+        temporary = cache_path.with_name(
+            f".{cache_path.name}.{os.getpid()}.temporary"
+        )
+        try:
+            with temporary.open("wb") as file:
+                np.savez(
+                    file,
+                    images=images[present].numpy(),
+                    present=present.numpy().astype(np.bool_),
+                )
+            os.replace(temporary, cache_path)
+        except OSError as error:
+            temporary.unlink(missing_ok=True)
+            print(f"Warning: could not write DICOM cache {cache_path}: {error}")

@@ -28,7 +28,12 @@ from rsna2026.checkpoint import (
 from rsna2026.config import load_config
 from rsna2026.constants import TARGETS
 from rsna2026.data import competition_input
-from rsna2026.dataset import KneeStudyDataset, StudyRecord, build_study_records
+from rsna2026.dataset import (
+    PREPROCESSING_VERSION,
+    KneeStudyDataset,
+    StudyRecord,
+    build_study_records,
+)
 from rsna2026.model import build_dinov2_model
 from rsna2026.public_labels import (
     confidence_weight,
@@ -274,9 +279,10 @@ def make_loader(
     num_workers: int,
     shuffle: bool,
     augment: bool,
+    cache_dir: str | Path | None,
 ) -> DataLoader:
     dataset = KneeStudyDataset(
-        records, image_size, labels, label_weights, augment
+        records, image_size, labels, label_weights, augment, cache_dir
     )
     return DataLoader(
         dataset,
@@ -482,6 +488,9 @@ def model_artifact_metadata(config: dict[str, object]) -> dict[str, object]:
         ),
         "image_size": int(data_config["image_size"]),  # type: ignore[index]
         "slices_per_slot": int(data_config["slices_per_slot"]),  # type: ignore[index]
+        "input_representation": str(  # type: ignore[index]
+            model_config["input_representation"]
+        ),
         "series_classification": str(  # type: ignore[index]
             data_config["series_classification"]
         ),
@@ -503,6 +512,11 @@ def build_configured_model(
         raise ValueError("DINOv2 image size must be divisible by its patch size 14")
     if str(model_config["aggregation"]) != "target-attention":  # type: ignore[index]
         raise ValueError("Only target-attention aggregation is supported")
+    input_representation = str(
+        model_config["input_representation"]  # type: ignore[index]
+    )
+    if input_representation != "2.5d-slice-channels":
+        raise ValueError("Only 2.5D slice-channel input is supported")
     slot_names = tuple(str(name) for name in data_config["slots"])  # type: ignore[index]
     if slot_names != SLOT_NAMES:
         raise ValueError(f"Configured slots must be {list(SLOT_NAMES)}")
@@ -588,6 +602,7 @@ def run_inference(
         int(config["training"]["num_workers"]),  # type: ignore[index]
         False,
         False,
+        data_config.get("dicom_cache_dir"),  # type: ignore[union-attr]
     )
 
     inference_config = config["inference"]
@@ -635,6 +650,12 @@ def run_inference(
                 split: values["summary"]
                 for split, values in selection_report["splits"].items()
             },
+        },
+        "dicom_cache": {
+            "enabled": bool(data_config.get("dicom_cache_dir")),
+            "directory": data_config.get("dicom_cache_dir"),
+            "storage_dtype": "float32",
+            "preprocessing_version": PREPROCESSING_VERSION,
         },
     }
     write_json(output_dir / "run-summary.json", summary)
@@ -761,6 +782,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     batch_size = int(config["training"]["batch_size"])
     num_workers = int(config["training"]["num_workers"])
+    dicom_cache_dir = config["data"].get("dicom_cache_dir")
     training_loader = make_loader(
         training_records,
         image_size,
@@ -770,6 +792,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         num_workers,
         True,
         True,
+        dicom_cache_dir,
     )
     validation_loader = make_loader(
         validation_records,
@@ -780,6 +803,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         num_workers,
         False,
         False,
+        dicom_cache_dir,
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(
@@ -910,8 +934,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "source": str(model_source),
             "total_parameters": total_parameters,
             "trainable_parameters": trainable_parameters,
-            "grayscale_to_rgb": "channel-repeat",
-            "slot_pooling": "masked-slice-mean",
+            "grayscale_to_rgb": "three-ordered-slices-as-channels",
+            "slot_pooling": "none-2.5d-encoding",
             "slot_aggregation": "per-target-masked-attention",
             "backbone_learning_rate": backbone_learning_rate,
             "head_learning_rate": head_learning_rate,
@@ -928,6 +952,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 split: values["summary"]
                 for split, values in selection_report["splits"].items()
             },
+        },
+        "dicom_cache": {
+            "enabled": bool(dicom_cache_dir),
+            "directory": dicom_cache_dir,
+            "storage_dtype": "float32",
+            "preprocessing_version": PREPROCESSING_VERSION,
         },
         "label_source_validation": label_source_validation,
         "history": history,

@@ -316,11 +316,27 @@ def train_epoch(
     scaler: torch.amp.GradScaler,
     device: torch.device,
     target_weights: torch.Tensor,
+    num_slots: int,
+    sampled_slices_per_slot: int,
+    window_size: int,
+    training_window_stride: int,
 ) -> float:
     model.train()
     total_loss = 0.0
     total_batches = 0
+    starts = slice_window_starts(
+        sampled_slices_per_slot, window_size, training_window_stride
+    )
     for images, present, labels, label_weights in loader:
+        start = starts[int(torch.randint(len(starts), (1,)).item())]
+        images, present = select_slice_window(
+            images,
+            present,
+            num_slots,
+            sampled_slices_per_slot,
+            window_size,
+            start,
+        )
         images = images.to(device, non_blocking=True)
         present = present.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
@@ -346,20 +362,48 @@ def train_epoch(
 
 @torch.no_grad()
 def predict(
-    model: nn.Module, loader: DataLoader, device: torch.device
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    num_slots: int,
+    sampled_slices_per_slot: int,
+    window_size: int,
+    inference_window_stride: int,
 ) -> tuple[np.ndarray, np.ndarray | None]:
+    """Average per-window probabilities over an ordered slice stack."""
     model.eval()
     predictions = []
     labels = []
+    starts = slice_window_starts(
+        sampled_slices_per_slot, window_size, inference_window_stride
+    )
     for images, present, batch_labels, _ in loader:
-        with torch.autocast(
-            device_type=device.type, enabled=device.type == "cuda"
-        ):
-            logits = model(
-                images.to(device, non_blocking=True),
-                present.to(device, non_blocking=True),
+        probability_sum = None
+        for start in starts:
+            window_images, window_present = select_slice_window(
+                images,
+                present,
+                num_slots,
+                sampled_slices_per_slot,
+                window_size,
+                start,
             )
-        predictions.append(torch.sigmoid(logits).cpu().numpy())
+            with torch.autocast(
+                device_type=device.type, enabled=device.type == "cuda"
+            ):
+                logits = model(
+                    window_images.to(device, non_blocking=True),
+                    window_present.to(device, non_blocking=True),
+                )
+            probabilities = torch.sigmoid(logits.float())
+            probability_sum = (
+                probabilities
+                if probability_sum is None
+                else probability_sum + probabilities
+            )
+        if probability_sum is None:
+            raise RuntimeError("No inference slice windows were generated")
+        predictions.append((probability_sum / len(starts)).cpu().numpy())
         if batch_labels.numel():
             labels.append(batch_labels.numpy())
     prediction_array = (
@@ -369,6 +413,64 @@ def predict(
     )
     label_array = np.concatenate(labels) if labels else None
     return prediction_array, label_array
+
+
+def slice_window_starts(
+    sampled_slices_per_slot: int, window_size: int, stride: int
+) -> tuple[int, ...]:
+    """Return valid starts for fixed-width ordered slice windows."""
+    if sampled_slices_per_slot <= 0:
+        raise ValueError("Sampled slices per slot must be positive")
+    if window_size <= 0 or window_size > sampled_slices_per_slot:
+        raise ValueError("Window size must be within the sampled slice count")
+    if stride <= 0:
+        raise ValueError("Window stride must be positive")
+    return tuple(
+        range(0, sampled_slices_per_slot - window_size + 1, stride)
+    )
+
+
+def select_slice_window(
+    images: torch.Tensor,
+    present: torch.Tensor,
+    num_slots: int,
+    sampled_slices_per_slot: int,
+    window_size: int,
+    start: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract the same consecutive slice window from every acquisition slot."""
+    if images.ndim != 5:
+        raise ValueError(f"Expected five-dimensional images, received {images.shape}")
+    batch_size, num_views, channels, height, width = images.shape
+    expected_views = num_slots * sampled_slices_per_slot
+    if num_views != expected_views:
+        raise ValueError(
+            f"Expected {expected_views} sampled views, received {num_views}"
+        )
+    if present.shape != (batch_size, num_views):
+        raise ValueError(
+            f"Expected presence shape {(batch_size, num_views)}, "
+            f"received {tuple(present.shape)}"
+        )
+    if start < 0 or start + window_size > sampled_slices_per_slot:
+        raise ValueError("Slice window lies outside the sampled stack")
+    window_images = images.reshape(
+        batch_size,
+        num_slots,
+        sampled_slices_per_slot,
+        channels,
+        height,
+        width,
+    )[:, :, start : start + window_size]
+    window_present = present.reshape(
+        batch_size, num_slots, sampled_slices_per_slot
+    )[:, :, start : start + window_size]
+    return (
+        window_images.reshape(
+            batch_size, num_slots * window_size, channels, height, width
+        ),
+        window_present.reshape(batch_size, num_slots * window_size),
+    )
 
 
 def write_submission(
@@ -394,7 +496,7 @@ def write_submission(
 
 def slice_selection_report(
     records_by_split: dict[str, Sequence[StudyRecord]],
-    slices_per_slot: int,
+    sampled_slices_per_slot: int,
     slice_band_start: float,
     slice_band_end: float,
 ) -> dict[str, object]:
@@ -402,7 +504,7 @@ def slice_selection_report(
     report: dict[str, object] = {
         "series_classification": CLASSIFICATION_METHOD,
         "slots": list(SLOT_NAMES),
-        "slices_per_slot": slices_per_slot,
+        "sampled_slices_per_slot": sampled_slices_per_slot,
         "slice_band": [slice_band_start, slice_band_end],
         "splits": {},
     }
@@ -487,7 +589,19 @@ def model_artifact_metadata(config: dict[str, object]) -> dict[str, object]:
             model_config["attention_hidden_size"]
         ),
         "image_size": int(data_config["image_size"]),  # type: ignore[index]
-        "slices_per_slot": int(data_config["slices_per_slot"]),  # type: ignore[index]
+        "sampled_slices_per_slot": int(  # type: ignore[index]
+            data_config["sampled_slices_per_slot"]
+        ),
+        "window_size": int(data_config["window_size"]),  # type: ignore[index]
+        "training_window_stride": int(  # type: ignore[index]
+            data_config["training_window_stride"]
+        ),
+        "inference_window_stride": int(  # type: ignore[index]
+            data_config["inference_window_stride"]
+        ),
+        "inference_window_pooling": str(  # type: ignore[index]
+            data_config["inference_window_pooling"]
+        ),
         "input_representation": str(  # type: ignore[index]
             model_config["input_representation"]
         ),
@@ -517,7 +631,29 @@ def build_configured_model(
     )
     if input_representation != "2.5d-slice-channels":
         raise ValueError("Only 2.5D slice-channel input is supported")
-    slot_names = tuple(str(name) for name in data_config["slots"])  # type: ignore[index]
+    sampled_slices_per_slot = int(  # type: ignore[index]
+        data_config["sampled_slices_per_slot"]
+    )
+    window_size = int(data_config["window_size"])  # type: ignore[index]
+    training_window_stride = int(  # type: ignore[index]
+        data_config["training_window_stride"]
+    )
+    inference_window_stride = int(  # type: ignore[index]
+        data_config["inference_window_stride"]
+    )
+    slice_window_starts(
+        sampled_slices_per_slot, window_size, training_window_stride
+    )
+    slice_window_starts(
+        sampled_slices_per_slot, window_size, inference_window_stride
+    )
+    inference_window_pooling = str(  # type: ignore[index]
+        data_config["inference_window_pooling"]
+    )
+    if inference_window_pooling != "probability-mean":
+        raise ValueError("Only probability-mean inference pooling is supported")
+    configured_slots = data_config["slots"]  # type: ignore[index]
+    slot_names = tuple(str(name) for name in configured_slots)
     if slot_names != SLOT_NAMES:
         raise ValueError(f"Configured slots must be {list(SLOT_NAMES)}")
     model, model_source = build_dinov2_model(
@@ -527,7 +663,7 @@ def build_configured_model(
         unfreeze_last=int(model_config["unfreeze_last"]),  # type: ignore[index]
         dropout=float(model_config["dropout"]),  # type: ignore[index]
         num_slots=len(slot_names),
-        slices_per_slot=int(data_config["slices_per_slot"]),  # type: ignore[index]
+        slices_per_slot=window_size,
         attention_hidden_size=int(  # type: ignore[index]
             model_config["attention_hidden_size"]
         ),
@@ -568,7 +704,13 @@ def run_inference(
     sample_submission = pd.read_csv(input_path / "sample_submission.csv")
     data_config = config["data"]
     image_size = int(data_config["image_size"])  # type: ignore[index]
-    slices_per_slot = int(data_config["slices_per_slot"])  # type: ignore[index]
+    sampled_slices_per_slot = int(  # type: ignore[index]
+        data_config["sampled_slices_per_slot"]
+    )
+    window_size = int(data_config["window_size"])  # type: ignore[index]
+    inference_window_stride = int(  # type: ignore[index]
+        data_config["inference_window_stride"]
+    )
     slice_band_start = float(data_config["slice_band_start"])  # type: ignore[index]
     slice_band_end = float(data_config["slice_band_end"])  # type: ignore[index]
     slot_names = list(data_config["slots"])  # type: ignore[index]
@@ -580,7 +722,7 @@ def run_inference(
         test_series,
         input_path / "test_series",
         test_uids,
-        slices_per_slot,
+        sampled_slices_per_slot,
         slice_band_start,
         slice_band_end,
         slot_names,
@@ -588,7 +730,7 @@ def run_inference(
     )
     selection_report = slice_selection_report(
         {"test": test_records},
-        slices_per_slot,
+        sampled_slices_per_slot,
         slice_band_start,
         slice_band_end,
     )
@@ -625,7 +767,15 @@ def run_inference(
     )
     state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     model.load_state_dict(state_dict)
-    predictions, _ = predict(model, test_loader, device)
+    predictions, _ = predict(
+        model,
+        test_loader,
+        device,
+        len(slot_names),
+        sampled_slices_per_slot,
+        window_size,
+        inference_window_stride,
+    )
     submission_path = output_dir / "submission.csv"
     write_submission(sample_submission, test_uids, predictions, submission_path)
     summary = {
@@ -654,7 +804,7 @@ def run_inference(
         "dicom_cache": {
             "enabled": bool(data_config.get("dicom_cache_dir")),
             "directory": data_config.get("dicom_cache_dir"),
-            "storage_dtype": "float32",
+            "storage_dtype": "uint8",
             "preprocessing_version": PREPROCESSING_VERSION,
         },
     }
@@ -741,7 +891,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     image_size = int(config["data"]["image_size"])
-    slices_per_slot = int(config["data"]["slices_per_slot"])
+    sampled_slices_per_slot = int(
+        config["data"]["sampled_slices_per_slot"]
+    )
+    window_size = int(config["data"]["window_size"])
+    training_window_stride = int(
+        config["data"]["training_window_stride"]
+    )
+    inference_window_stride = int(
+        config["data"]["inference_window_stride"]
+    )
     slice_band_start = float(config["data"]["slice_band_start"])
     slice_band_end = float(config["data"]["slice_band_end"])
     slot_names = list(config["data"]["slots"])
@@ -750,7 +909,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         train_series,
         input_path / "train_series",
         training_table["StudyInstanceUID"].astype(str).tolist(),
-        slices_per_slot,
+        sampled_slices_per_slot,
         slice_band_start,
         slice_band_end,
         slot_names,
@@ -760,7 +919,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         train_series,
         input_path / "train_series",
         validation_table["StudyInstanceUID"].astype(str).tolist(),
-        slices_per_slot,
+        sampled_slices_per_slot,
         slice_band_start,
         slice_band_end,
         slot_names,
@@ -771,7 +930,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "training": training_records,
             "validation": validation_records,
         },
-        slices_per_slot,
+        sampled_slices_per_slot,
         slice_band_start,
         slice_band_end,
     )
@@ -863,9 +1022,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             scaler,
             device,
             target_weights,
+            len(slot_names),
+            sampled_slices_per_slot,
+            window_size,
+            training_window_stride,
         )
         validation_predictions, validation_labels = predict(
-            model, validation_loader, device
+            model,
+            validation_loader,
+            device,
+            len(slot_names),
+            sampled_slices_per_slot,
+            window_size,
+            inference_window_stride,
         )
         if validation_labels is None:
             raise RuntimeError("Validation labels are unavailable")
@@ -956,7 +1125,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "dicom_cache": {
             "enabled": bool(dicom_cache_dir),
             "directory": dicom_cache_dir,
-            "storage_dtype": "float32",
+            "storage_dtype": "uint8",
             "preprocessing_version": PREPROCESSING_VERSION,
         },
         "label_source_validation": label_source_validation,

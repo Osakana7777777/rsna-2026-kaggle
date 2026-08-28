@@ -31,6 +31,7 @@ required_files=(
   "tests/test_acquisition.py"
   "tests/test_model.py"
   "tests/test_slice_selection.py"
+  "tests/test_slice_windows.py"
   "submissions/README.md"
   "submissions/TEMPLATE.md"
 )

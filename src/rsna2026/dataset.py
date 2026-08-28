@@ -27,7 +27,7 @@ from rsna2026.slice_selection import central_band_indices, sample_ordered_paths
 
 
 ORDERING_WORKERS = 16
-PREPROCESSING_VERSION = "dicom-window-v1"
+PREPROCESSING_VERSION = "dicom-window-uint8-v2"
 
 
 @dataclass(frozen=True)
@@ -92,7 +92,7 @@ def build_study_records(
     series_table: pd.DataFrame,
     image_root: Path,
     study_uids: Sequence[str],
-    slices_per_slot: int,
+    sampled_slices_per_slot: int,
     slice_band_start: float,
     slice_band_end: float,
     slot_names: Sequence[str],
@@ -100,7 +100,7 @@ def build_study_records(
 ) -> list[StudyRecord]:
     """Classify series, fill fixed acquisition slots, and sample each stack."""
     central_band_indices(
-        0, slices_per_slot, slice_band_start, slice_band_end
+        0, sampled_slices_per_slot, slice_band_start, slice_band_end
     )
     if classification_method != CLASSIFICATION_METHOD:
         raise ValueError(
@@ -219,7 +219,7 @@ def build_study_records(
         paths = list(series_dir.glob("*.dcm"))
         return paths, sample_ordered_paths(
             paths,
-            slices_per_slot,
+            sampled_slices_per_slot,
             slice_band_start,
             slice_band_end,
         )
@@ -247,7 +247,7 @@ def build_study_records(
             else:
                 paths, sample = sampled_series[candidate.series_dir]
                 sampled, method, indices, relative_positions = sample
-            selected.extend(sampled or [None] * slices_per_slot)
+            selected.extend(sampled or [None] * sampled_slices_per_slot)
             series_uid = candidate.series_uid if candidate is not None else None
             acquisition = candidate.acquisition if candidate is not None else None
             selections.append(
@@ -391,7 +391,7 @@ class KneeStudyDataset(
                     present = torch.from_numpy(cached["present"].astype(np.bool_))
                     present_images = torch.from_numpy(
                         np.asarray(cached["images"], dtype=np.float32)
-                    )
+                    ).div_(255.0)
                 image_shape = (
                     1,
                     self.image_size,
@@ -458,7 +458,7 @@ class KneeStudyDataset(
             with temporary.open("wb") as file:
                 np.savez(
                     file,
-                    images=images[present].numpy(),
+                    images=(images[present].mul(255.0).round().byte().numpy()),
                     present=present.numpy().astype(np.bool_),
                 )
             os.replace(temporary, cache_path)

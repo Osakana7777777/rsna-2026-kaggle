@@ -102,11 +102,13 @@ Both stages embed the same source and configuration, but their generated run
 modes are fixed to `train` and `inference`. A configuration edit cannot make the
 submission notebook enter the training path.
 
-The model classifies series into six plane-and-acquisition slots, stacks three ordered
-slices from each available slot into the three input channels, and combines the six
-2.5D features with target-specific masked attention. Decoded, windowed, and resized
-DICOM tensors are cached under the ephemeral directory configured by
-`dicom_cache_dir`, so later epochs do not repeat DICOM preprocessing.
+The model classifies series into six plane-and-acquisition slots and samples twelve
+ordered slices from the central 20--80% of each available series. Training draws one
+of four non-overlapping three-slice windows as the three input channels. Validation
+and inference average probabilities over all ten overlapping windows. The resulting
+six 2.5D features are combined with target-specific masked attention. Decoded,
+windowed, and resized DICOM tensors are cached under the ephemeral directory
+configured by `dicom_cache_dir`, so later epochs do not repeat DICOM preprocessing.
 The slot order, image size, epoch count, batch size, learning rate, and public-label
 selection are set in `configs/baseline.toml`.
 

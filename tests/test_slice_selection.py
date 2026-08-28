@@ -127,6 +127,20 @@ def test_rejects_nonpositive_slice_count() -> None:
         central_band_indices(10, 0, 0.20, 0.80)
 
 
+@pytest.mark.parametrize(
+    ("length", "expected"),
+    [
+        (20, (4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)),
+        (12, tuple(range(12))),
+        (3, (0, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2)),
+        (1, (0,) * 12),
+        (0, ()),
+    ],
+)
+def test_selects_twelve_slices_from_the_central_band(length, expected) -> None:
+    assert central_band_indices(length, 12, 0.20, 0.80) == expected
+
+
 def test_sampling_reports_method_indices_and_relative_positions() -> None:
     paths = [Path(f"{index:02d}.dcm") for index in reversed(range(10))]
 

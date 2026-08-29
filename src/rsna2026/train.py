@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import random
@@ -21,12 +22,19 @@ from torch.utils.data import DataLoader
 
 from rsna2026.acquisition import CLASSIFICATION_METHOD, SLOT_NAMES
 from rsna2026.checkpoint import (
-    load_and_verify_manifest,
+    file_sha256,
     resolve_input_file,
     write_checkpoint_manifest,
 )
 from rsna2026.config import load_config
 from rsna2026.constants import TARGETS
+from rsna2026.cross_validation import (
+    bootstrap_macro_auc_interval,
+    create_inner_roles,
+    create_outer_folds,
+    dataframe_sha256,
+    weighted_binary_cross_entropy,
+)
 from rsna2026.data import competition_input
 from rsna2026.dataset import (
     PREPROCESSING_VERSION,
@@ -35,6 +43,11 @@ from rsna2026.dataset import (
     build_study_records,
 )
 from rsna2026.model import build_dinov2_model
+from rsna2026.ensemble import (
+    ENSEMBLE_FORMAT_VERSION,
+    load_ensemble_manifest,
+    percentile_rank_mean,
+)
 from rsna2026.public_labels import (
     confidence_weight,
     load_public_label_table,
@@ -691,6 +704,487 @@ def write_json(path: Path, value: object, allow_nan: bool = False) -> None:
     )
 
 
+def supervision_arrays(
+    table: pd.DataFrame,
+    public_rows: dict[str, tuple[float, ...]],
+    gold_loss_weight: float,
+    use_gold: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build aligned targets and cell weights for one CV role."""
+    labels = []
+    weights = []
+    for row in table.to_dict(orient="records"):
+        uid = str(row["StudyInstanceUID"])
+        is_gold = all(pd.notna(row[target]) for target in TARGETS)
+        if use_gold and is_gold:
+            labels.append([float(row[target]) for target in TARGETS])
+            weights.append([gold_loss_weight] * len(TARGETS))
+        else:
+            values = [float(value) for value in public_rows[uid]]
+            labels.append(values)
+            weights.append([confidence_weight(value) for value in values])
+    return np.asarray(labels, dtype=np.float32), np.asarray(weights, dtype=np.float32)
+
+
+def _records_for(
+    table: pd.DataFrame, records_by_uid: dict[str, StudyRecord]
+) -> list[StudyRecord]:
+    return [records_by_uid[str(uid)] for uid in table["StudyInstanceUID"]]
+
+
+def train_cv_fold(
+    config: dict[str, object],
+    fold: int,
+    started_at: float,
+    output_dir: Path,
+    table_by_uid: pd.DataFrame,
+    roles: pd.DataFrame,
+    public_rows: dict[str, tuple[float, ...]],
+    records_by_uid: dict[str, StudyRecord],
+    device: torch.device,
+) -> tuple[dict[str, object], pd.DataFrame, bool]:
+    """Train one outer fold using only its weak inner validation for selection."""
+    run_seed = int(config["run"]["seed"]) + fold  # type: ignore[index]
+    seed_everything(run_seed)
+    cv_config = config["cross_validation"]
+    training_config = config["training"]
+    data_config = config["data"]
+    if not isinstance(cv_config, dict):
+        raise TypeError("cross_validation configuration must be a table")
+    gold_loss_weight = float(cv_config["gold_loss_weight"])
+
+    indexed_roles = roles.set_index("StudyInstanceUID")
+    train_uids = indexed_roles.index[indexed_roles["role"] == "training"]
+    inner_uids = indexed_roles.index[indexed_roles["role"] == "inner-validation"]
+    outer_uids = indexed_roles.index[
+        (indexed_roles["role"] == "outer-holdout") & indexed_roles["is_gold"]
+    ]
+    train_table = table_by_uid.loc[list(train_uids)].reset_index(drop=True)
+    inner_table = table_by_uid.loc[list(inner_uids)].reset_index(drop=True)
+    outer_table = table_by_uid.loc[list(outer_uids)].reset_index(drop=True)
+    train_labels, train_weights = supervision_arrays(
+        train_table, public_rows, gold_loss_weight, True
+    )
+    inner_labels, inner_weights = supervision_arrays(
+        inner_table, public_rows, gold_loss_weight, False
+    )
+    outer_labels = outer_table[TARGETS].to_numpy(dtype=np.float32)
+    outer_weights = np.ones_like(outer_labels, dtype=np.float32)
+
+    image_size = int(data_config["image_size"])
+    sampled_slices_per_slot = int(data_config["sampled_slices_per_slot"])
+    window_size = int(data_config["window_size"])
+    training_window_stride = int(data_config["training_window_stride"])
+    selection_window_stride = int(cv_config["selection_window_stride"])
+    inference_window_stride = int(data_config["inference_window_stride"])
+    slot_names = list(data_config["slots"])
+    batch_size = int(training_config["batch_size"])
+    num_workers = int(training_config["num_workers"])
+    cache_dir = data_config.get("dicom_cache_dir")
+    training_loader = make_loader(
+        _records_for(train_table, records_by_uid),
+        image_size,
+        train_labels,
+        train_weights,
+        batch_size,
+        num_workers,
+        True,
+        True,
+        cache_dir,
+    )
+    inner_loader = make_loader(
+        _records_for(inner_table, records_by_uid),
+        image_size,
+        inner_labels,
+        inner_weights,
+        batch_size,
+        num_workers,
+        False,
+        False,
+        cache_dir,
+    )
+    outer_loader = make_loader(
+        _records_for(outer_table, records_by_uid),
+        image_size,
+        outer_labels,
+        outer_weights,
+        batch_size,
+        num_workers,
+        False,
+        False,
+        cache_dir,
+    )
+    print(
+        f"Fold {fold}: train={len(train_table)}, inner={len(inner_table)}, "
+        f"outer_gold={len(outer_table)}",
+        flush=True,
+    )
+    model, model_source, total_parameters, trainable_parameters = (
+        build_configured_model(config, device)
+    )
+    backbone_learning_rate = float(training_config["backbone_learning_rate"])
+    head_learning_rate = float(training_config["head_learning_rate"])
+    optimizer = torch.optim.AdamW(
+        [
+            {
+                "params": [
+                    parameter
+                    for parameter in model.backbone.parameters()
+                    if parameter.requires_grad
+                ],
+                "lr": backbone_learning_rate,
+            },
+            {"params": model.head.parameters(), "lr": head_learning_rate},
+        ],
+        weight_decay=float(training_config["weight_decay"]),
+    )
+    epochs = int(training_config["epochs"])
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=[backbone_learning_rate, head_learning_rate],
+        epochs=epochs,
+        steps_per_epoch=len(training_loader),
+        pct_start=float(training_config["one_cycle_warmup_fraction"]),
+    )
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+    target_weights = positive_weights(train_labels, train_weights).to(device)
+    max_runtime_seconds = float(training_config["max_runtime_hours"]) * 3600.0
+    best_score = -math.inf
+    best_epoch = 0
+    best_state: dict[str, torch.Tensor] | None = None
+    history = []
+    time_limit_reached = False
+    selection_targets = np.where(inner_weights > 0, inner_labels, np.nan)
+    for epoch in range(epochs):
+        loss = train_epoch(
+            model,
+            training_loader,
+            optimizer,
+            scheduler,
+            scaler,
+            device,
+            target_weights,
+            len(slot_names),
+            sampled_slices_per_slot,
+            window_size,
+            training_window_stride,
+        )
+        inner_predictions, _ = predict(
+            model,
+            inner_loader,
+            device,
+            len(slot_names),
+            sampled_slices_per_slot,
+            window_size,
+            selection_window_stride,
+        )
+        per_target_auc = target_auc_scores(selection_targets, inner_predictions)
+        if any(not math.isfinite(value) for value in per_target_auc.values()):
+            raise RuntimeError(f"Fold {fold} inner validation has a non-finite AUC")
+        auc = float(np.mean(list(per_target_auc.values())))
+        weighted_bce = weighted_binary_cross_entropy(
+            inner_labels, inner_predictions, inner_weights
+        )
+        history.append(
+            {
+                "epoch": epoch + 1,
+                "loss": loss,
+                "inner_validation_auc": auc,
+                "inner_validation_auc_by_target": per_target_auc,
+                "inner_validation_weighted_bce": weighted_bce,
+            }
+        )
+        print(
+            f"Fold {fold} epoch {epoch + 1}: loss={loss:.5f}, "
+            f"inner_auc={auc:.5f}, inner_bce={weighted_bce:.5f}",
+            flush=True,
+        )
+        if best_state is None or auc > best_score:
+            best_score = auc
+            best_epoch = epoch + 1
+            best_state = {
+                name: value.detach().cpu().clone()
+                for name, value in model.state_dict().items()
+            }
+        if time.monotonic() - started_at >= max_runtime_seconds:
+            time_limit_reached = True
+            print(f"Global runtime limit reached in fold {fold}", flush=True)
+            break
+    if best_state is None:
+        raise RuntimeError(f"Fold {fold} did not produce a model state")
+    model.load_state_dict(best_state)
+    outer_predictions, predicted_outer_labels = predict(
+        model,
+        outer_loader,
+        device,
+        len(slot_names),
+        sampled_slices_per_slot,
+        window_size,
+        inference_window_stride,
+    )
+    if predicted_outer_labels is None or not np.array_equal(
+        predicted_outer_labels, outer_labels
+    ):
+        raise RuntimeError(f"Fold {fold} outer labels changed during prediction")
+    fold_dir = output_dir / f"fold-{fold}"
+    fold_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = fold_dir / "best-model.pt"
+    torch.save(best_state, checkpoint_path)
+    artifact_metadata = model_artifact_metadata(config)
+    manifest = write_checkpoint_manifest(
+        checkpoint_path,
+        fold_dir / "checkpoint-manifest.json",
+        {
+            "model": artifact_metadata,
+            "fold": fold,
+            "seed": run_seed,
+            "best_epoch": best_epoch,
+            "best_inner_validation_auc": best_score,
+            "training_studies": len(train_table),
+            "inner_validation_studies": len(inner_table),
+            "outer_gold_studies": len(outer_table),
+            "selection_window_stride": selection_window_stride,
+        },
+    )
+    fold_summary: dict[str, object] = {
+        "fold": fold,
+        "seed": run_seed,
+        "training_studies": len(train_table),
+        "training_gold_studies": int(train_table[TARGETS].notna().all(axis=1).sum()),
+        "inner_validation_studies": len(inner_table),
+        "outer_gold_studies": len(outer_table),
+        "best_epoch": best_epoch,
+        "best_inner_validation_auc": best_score,
+        "completed_epochs": len(history),
+        "time_limit_reached": time_limit_reached,
+        "history": history,
+        "checkpoint": manifest,
+        "model_source": str(model_source),
+        "total_parameters": total_parameters,
+        "trainable_parameters": trainable_parameters,
+    }
+    write_json(fold_dir / "run-summary.json", fold_summary, allow_nan=False)
+    oof = pd.DataFrame(
+        {
+            "StudyInstanceUID": outer_table["StudyInstanceUID"].astype(str),
+            "outer_fold": fold,
+        }
+    )
+    for target_index, target in enumerate(TARGETS):
+        oof[f"label_{target}"] = outer_labels[:, target_index]
+        oof[f"prediction_{target}"] = outer_predictions[:, target_index]
+    del model, optimizer, scheduler, scaler
+    del training_loader, inner_loader, outer_loader
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return fold_summary, oof, time_limit_reached
+
+
+def run_cross_validation_training(
+    config: dict[str, object], output_dir: Path, started_at: float
+) -> int:
+    """Train four grouped folds and write auditable OOF artifacts."""
+    input_path = competition_input(
+        config["paths"]["input_root"],  # type: ignore[index]
+        config["competition"]["input_slug"],  # type: ignore[index]
+    )
+    train_table = pd.read_csv(input_path / "train.csv")
+    train_series = pd.read_csv(input_path / "train_series.csv")
+    missing_targets = [target for target in TARGETS if target not in train_table]
+    if missing_targets or "Report" not in train_table:
+        raise ValueError(
+            f"Training table schema is incomplete; targets={missing_targets}, "
+            f"report={'Report' in train_table}"
+        )
+    train_table["StudyInstanceUID"] = train_table["StudyInstanceUID"].astype(str)
+    pseudo_config = config["pseudo_labels"]
+    cv_config = config["cross_validation"]
+    if not isinstance(pseudo_config, dict) or not isinstance(cv_config, dict):
+        raise TypeError("Pseudo-label and CV configurations must be tables")
+    public = load_public_label_table(
+        locate_pseudo_labels(config),
+        str(pseudo_config["sha256"]),
+        int(pseudo_config["expected_rows"]),
+    )
+    gold = train_table.loc[train_table[TARGETS].notna().all(axis=1)]
+    label_validation = source_validation(
+        gold[["StudyInstanceUID", *TARGETS]].to_dict(orient="records"), public.rows
+    )
+    expected_gold = int(pseudo_config["expected_validation_studies"])
+    minimum_auc = float(pseudo_config["minimum_source_macro_auc"])
+    gate = {
+        "all_gold_studies_matched": label_validation["matched_gold_studies"]
+        == expected_gold,
+        "all_targets_scored": label_validation["scored_targets"] == len(TARGETS),
+        "macro_auc_at_least_minimum": label_validation["macro_auc"] >= minimum_auc,
+    }
+    gate["passed"] = all(gate.values())
+    label_validation["minimum_macro_auc"] = minimum_auc
+    label_validation["acceptance_gate"] = gate
+    write_json(output_dir / "label-source-validation.json", label_validation, True)
+    if not gate["passed"]:
+        raise ValueError("Public label source failed its acceptance gate")
+
+    design = create_outer_folds(
+        train_table,
+        public.rows,
+        int(cv_config["folds"]),
+        int(cv_config["outer_seed"]),
+        str(cv_config["split_algorithm"]),
+    )
+    design.assignments.to_csv(output_dir / "fold-assignments.csv", index=False)
+    table_with_hash = train_table.copy()
+    table_with_hash["report_hash"] = table_with_hash["Report"].fillna("").map(
+        report_hash
+    )
+    table_by_uid = table_with_hash.set_index("StudyInstanceUID", drop=False)
+    all_roles = []
+    for fold in range(int(cv_config["folds"])):
+        all_roles.append(
+            create_inner_roles(
+                design.assignments,
+                public.rows,
+                fold,
+                float(cv_config["inner_validation_fraction"]),
+                int(cv_config["inner_seed"]),
+            )
+        )
+    inner_splits = pd.concat(all_roles, ignore_index=True)
+    inner_splits.to_csv(output_dir / "inner-splits.csv", index=False)
+    design.audit["inner_seed"] = int(cv_config["inner_seed"])
+    design.audit["inner_validation_fraction"] = float(
+        cv_config["inner_validation_fraction"]
+    )
+    design.audit["inner_assignment_sha256"] = dataframe_sha256(inner_splits)
+    design.audit["inner_splits"] = {
+        str(fold): {
+            role: int(count)
+            for role, count in fold_rows["role"].value_counts().sort_index().items()
+        }
+        for fold, fold_rows in inner_splits.groupby("model_fold")
+    }
+    write_json(output_dir / "fold-audit.json", design.audit, allow_nan=False)
+
+    data_config = config["data"]
+    all_uids = design.assignments["StudyInstanceUID"].astype(str).tolist()
+    all_records = build_study_records(
+        train_series,
+        input_path / "train_series",
+        all_uids,
+        int(data_config["sampled_slices_per_slot"]),
+        float(data_config["slice_band_start"]),
+        float(data_config["slice_band_end"]),
+        list(data_config["slots"]),
+        str(data_config["series_classification"]),
+    )
+    records_by_uid = {record.study_uid: record for record in all_records}
+    selection_report = slice_selection_report(
+        {"all-training-studies": all_records},
+        int(data_config["sampled_slices_per_slot"]),
+        float(data_config["slice_band_start"]),
+        float(data_config["slice_band_end"]),
+    )
+    write_json(output_dir / "slice-selection.json", selection_report)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    fold_summaries = []
+    oof_tables = []
+    for fold in range(int(cv_config["folds"])):
+        fold_roles = inner_splits.loc[inner_splits["model_fold"] == fold]
+        summary, oof, time_limit = train_cv_fold(
+            config,
+            fold,
+            started_at,
+            output_dir,
+            table_by_uid,
+            fold_roles,
+            public.rows,
+            records_by_uid,
+            device,
+        )
+        fold_summaries.append(summary)
+        oof_tables.append(oof)
+        if time_limit and fold < int(cv_config["folds"]) - 1:
+            raise RuntimeError("Runtime limit prevented a complete four-fold ensemble")
+    oof = pd.concat(oof_tables, ignore_index=True).sort_values(
+        "StudyInstanceUID"
+    ).reset_index(drop=True)
+    if len(oof) != expected_gold or not oof["StudyInstanceUID"].is_unique:
+        raise RuntimeError("OOF predictions do not cover every gold study exactly once")
+    oof.to_csv(output_dir / "oof-predictions.csv", index=False)
+    labels = oof[[f"label_{target}" for target in TARGETS]].to_numpy()
+    predictions = oof[[f"prediction_{target}" for target in TARGETS]].to_numpy()
+    per_target_auc = target_auc_scores(labels, predictions)
+    oof_auc = macro_auc(labels, predictions)
+    interval = bootstrap_macro_auc_interval(
+        labels,
+        predictions,
+        macro_auc,
+        int(cv_config["bootstrap_resamples"]),
+        int(cv_config["outer_seed"]),
+    )
+    cv_summary = {
+        "gold_studies": len(oof),
+        "oof_macro_auc": oof_auc,
+        "oof_auc_by_target": per_target_auc,
+        "bootstrap_macro_auc": interval,
+        "fold_assignment_sha256": design.audit["assignment_sha256"],
+        "inner_assignment_sha256": design.audit["inner_assignment_sha256"],
+    }
+    write_json(output_dir / "cv-summary.json", cv_summary, allow_nan=False)
+    artifact_metadata = model_artifact_metadata(config)
+    members = []
+    for summary in fold_summaries:
+        fold = int(summary["fold"])
+        checkpoint = output_dir / f"fold-{fold}" / "best-model.pt"
+        members.append(
+            {
+                "fold": fold,
+                "checkpoint_file": f"fold-{fold}/best-model.pt",
+                "checkpoint_sha256": file_sha256(checkpoint),
+                "checkpoint_manifest_file": f"fold-{fold}/checkpoint-manifest.json",
+                "best_epoch": summary["best_epoch"],
+                "best_inner_validation_auc": summary["best_inner_validation_auc"],
+            }
+        )
+    ensemble_manifest = {
+        "format_version": ENSEMBLE_FORMAT_VERSION,
+        "model": artifact_metadata,
+        "members": members,
+        "fold_assignment_sha256": design.audit["assignment_sha256"],
+        "inner_assignment_sha256": design.audit["inner_assignment_sha256"],
+        "test_ensemble": str(cv_config["test_ensemble"]),
+        "within_model_pooling": str(data_config["inference_window_pooling"]),
+    }
+    write_json(output_dir / "ensemble-manifest.json", ensemble_manifest)
+    elapsed = time.monotonic() - started_at
+    run_summary = {
+        "status": "cross-validation-training-complete",
+        "device": str(device),
+        "elapsed_seconds": elapsed,
+        "folds": fold_summaries,
+        "cross_validation": cv_summary,
+        "ensemble_manifest": "ensemble-manifest.json",
+        "fold_audit": "fold-audit.json",
+        "fold_assignments": "fold-assignments.csv",
+        "inner_splits": "inner-splits.csv",
+        "oof_predictions": "oof-predictions.csv",
+        "label_source_validation": label_validation,
+        "pseudo_label_file": str(pseudo_config["file_name"]),
+        "pseudo_labels_sha256": public.sha256,
+        "model": artifact_metadata,
+        "selection_window_stride": int(cv_config["selection_window_stride"]),
+        "final_prediction_window_stride": int(data_config["inference_window_stride"]),
+    }
+    write_json(output_dir / "run-summary.json", run_summary, allow_nan=False)
+    print(
+        f"Completed four-fold training: OOF macro AUC={oof_auc:.5f}, "
+        f"95% interval=({interval['lower_95']:.5f}, {interval['upper_95']:.5f})",
+        flush=True,
+    )
+    return 0
+
+
 def run_inference(
     config: dict[str, object], output_dir: Path, started_at: float
 ) -> int:
@@ -748,34 +1242,40 @@ def run_inference(
     )
 
     inference_config = config["inference"]
-    checkpoint_path = resolve_input_file(
-        inference_config["checkpoint_path"], input_root  # type: ignore[index]
-    )
     manifest_path = resolve_input_file(
-        inference_config["checkpoint_manifest_path"], input_root  # type: ignore[index]
+        inference_config["ensemble_manifest_path"], input_root  # type: ignore[index]
     )
-    manifest = load_and_verify_manifest(checkpoint_path, manifest_path)
+    manifest = load_ensemble_manifest(manifest_path)
     expected_model = model_artifact_metadata(config)
     if manifest.get("model") != expected_model:
         raise ValueError(
-            "Checkpoint model metadata does not match the inference configuration"
+            "Ensemble model metadata does not match the inference configuration"
         )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, model_source, total_parameters, trainable_parameters = (
         build_configured_model(config, device)
     )
-    state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    model.load_state_dict(state_dict)
-    predictions, _ = predict(
-        model,
-        test_loader,
-        device,
-        len(slot_names),
-        sampled_slices_per_slot,
-        window_size,
-        inference_window_stride,
-    )
+    member_predictions = []
+    for member in sorted(manifest["members"], key=lambda value: value["fold"]):
+        checkpoint_path = manifest_path.parent / member["checkpoint_file"]
+        state_dict = torch.load(
+            checkpoint_path, map_location="cpu", weights_only=True
+        )
+        model.load_state_dict(state_dict)
+        predictions, _ = predict(
+            model,
+            test_loader,
+            device,
+            len(slot_names),
+            sampled_slices_per_slot,
+            window_size,
+            inference_window_stride,
+        )
+        member_predictions.append(predictions)
+    if manifest.get("test_ensemble") != "per-target-percentile-rank-mean":
+        raise ValueError("Unsupported test ensemble method")
+    predictions = percentile_rank_mean(member_predictions)
     submission_path = output_dir / "submission.csv"
     write_submission(sample_submission, test_uids, predictions, submission_path)
     summary = {
@@ -784,9 +1284,8 @@ def run_inference(
         "test_studies": len(test_records),
         "targets": TARGETS,
         "elapsed_seconds": time.monotonic() - started_at,
-        "checkpoint_source": str(checkpoint_path),
-        "checkpoint_manifest_source": str(manifest_path),
-        "checkpoint": manifest,
+        "ensemble_manifest_source": str(manifest_path),
+        "ensemble": manifest,
         "model": {
             **expected_model,
             "source": str(model_source),
@@ -825,6 +1324,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.mode == "inference":
         return run_inference(config, output_dir, started_at)
+
+    cv_config = config.get("cross_validation", {})
+    if isinstance(cv_config, dict) and bool(cv_config.get("enabled", False)):
+        return run_cross_validation_training(config, output_dir, started_at)
 
     input_path = competition_input(
         config["paths"]["input_root"], config["competition"]["input_slug"]

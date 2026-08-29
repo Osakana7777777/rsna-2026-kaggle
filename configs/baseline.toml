@@ -46,6 +46,20 @@ validation_fraction = 0.2
 # Set to a positive value for a quicker diagnostic run; 0 uses every labeled study.
 max_train_studies = 0
 
+[cross_validation]
+enabled = true
+folds = 4
+outer_seed = 42
+inner_seed = 1042
+inner_validation_fraction = 0.20
+gold_loss_weight = 3.0
+bootstrap_resamples = 5000
+# Epoch selection uses the same four non-overlapping windows seen in training.
+# Final gold OOF prediction and test inference retain the ten-window stride above.
+selection_window_stride = 3
+test_ensemble = "per-target-percentile-rank-mean"
+split_algorithm = "report-group-multilabel-v1"
+
 [pseudo_labels]
 enabled = true
 dataset = "stevenleehans/rsna-knee-llm-report-labels"
@@ -69,5 +83,4 @@ dropout = 0.25
 
 [inference]
 # Training-notebook outputs are mounted below /kaggle/input using the notebook slug.
-checkpoint_path = "/kaggle/input/rsna-2026-training/outputs/best-model.pt"
-checkpoint_manifest_path = "/kaggle/input/rsna-2026-training/outputs/checkpoint-manifest.json"
+ensemble_manifest_path = "/kaggle/input/rsna-2026-training/outputs/ensemble-manifest.json"

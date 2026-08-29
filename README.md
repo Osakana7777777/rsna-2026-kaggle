@@ -18,7 +18,7 @@ rsna-2026-kaggle/
 │   ├── kernel-metadata.json    # inference/submission notebook and inputs
 │   └── launcher.py             # remote entry point
 ├── scripts/
-│   ├── prepare.sh              # builds train or submission payload
+│   ├── prepare.sh              # builds train, submission, or EDA payload
 │   ├── push.sh                 # uploads train or submission notebook
 │   ├── status.sh               # reports the latest run state
 │   ├── wait.sh                 # polls until completion or failure
@@ -72,6 +72,21 @@ From this directory:
 ./scripts/wait.sh train
 ./scripts/output.sh train
 ```
+
+## Run EDA and download its outputs
+
+The EDA notebook uses the competition mount only, requires no GPU, and saves
+tables, charts, and representative DICOM image panels below
+`/kaggle/working/outputs/eda`. Run the entire remote workflow with:
+
+```bash
+./scripts/run-eda.sh
+```
+
+This builds and uploads the private `osakanateishoku/rsna-2026-eda` notebook,
+waits for completion, then downloads its artifacts to `outputs/eda/` on this
+computer. To run stages separately, use `./scripts/push.sh eda`,
+`./scripts/wait.sh eda`, and `./scripts/output.sh eda`.
 
 This uploads `osakanateishoku/rsna-2026-training`. It reads the public soft
 labels and competition training images, trains and validates the model, and

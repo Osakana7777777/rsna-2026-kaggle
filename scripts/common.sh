@@ -17,8 +17,14 @@ case "${RUN_KIND}" in
     OUTPUT_DIR="${PROJECT_ROOT}/outputs/submission"
     RUN_MODE="inference"
     ;;
+  eda)
+    METADATA_FILE="${PROJECT_ROOT}/kaggle/eda-kernel-metadata.json"
+    BUILD_DIR="${PROJECT_ROOT}/.kaggle-build/eda"
+    OUTPUT_DIR="${PROJECT_ROOT}/outputs/eda"
+    RUN_MODE="eda"
+    ;;
   *)
-    echo "Usage: $0 [train|submission]" >&2
+    echo "Usage: $0 [train|submission|eda]" >&2
     exit 2
     ;;
 esac

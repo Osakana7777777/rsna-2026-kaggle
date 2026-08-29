@@ -44,6 +44,7 @@ required_files=(
   "tests/test_slice_windows.py"
   "tests/test_distributed.py"
   "tests/test_study_records_cache.py"
+  "tests/test_physical_crop.py"
   "submissions/README.md"
   "submissions/TEMPLATE.md"
 )

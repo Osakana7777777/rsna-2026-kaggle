@@ -424,6 +424,7 @@ def subset_records(
 def make_loader(
     records: Sequence[StudyRecord],
     image_size: int,
+    physical_fov_mm: float,
     labels: np.ndarray | None,
     label_weights: np.ndarray | None,
     batch_size: int,
@@ -434,7 +435,13 @@ def make_loader(
     sampler: Sampler[int] | None = None,
 ) -> DataLoader:
     dataset = KneeStudyDataset(
-        records, image_size, labels, label_weights, augment, cache_dir
+        records,
+        image_size,
+        physical_fov_mm,
+        labels,
+        label_weights,
+        augment,
+        cache_dir,
     )
     return DataLoader(
         dataset,
@@ -784,6 +791,12 @@ def model_artifact_metadata(config: dict[str, object]) -> dict[str, object]:
             model_config["attention_hidden_size"]
         ),
         "image_size": int(data_config["image_size"]),  # type: ignore[index]
+        "preprocessing_version": PREPROCESSING_VERSION,
+        "physical_fov_mm": float(  # type: ignore[index]
+            data_config["physical_fov_mm"]
+        ),
+        "physical_crop_center": "image-center",
+        "physical_crop_padding": "constant-zero",
         "sampled_slices_per_slot": int(  # type: ignore[index]
             data_config["sampled_slices_per_slot"]
         ),
@@ -814,6 +827,9 @@ def build_configured_model(
     model_config = config["model"]
     data_config = config["data"]
     image_size = int(data_config["image_size"])  # type: ignore[index]
+    physical_fov_mm = float(data_config["physical_fov_mm"])  # type: ignore[index]
+    if not math.isfinite(physical_fov_mm) or physical_fov_mm <= 0:
+        raise ValueError("Physical FOV must be finite and positive")
     if str(model_config["name"]) != "dinov2-small":  # type: ignore[index]
         model_name = model_config["name"]  # type: ignore[index]
         raise ValueError(f"Unsupported model: {model_name}")
@@ -956,6 +972,7 @@ def train_cv_fold(
     outer_weights = np.ones_like(outer_labels, dtype=np.float32)
 
     image_size = int(data_config["image_size"])
+    physical_fov_mm = float(data_config["physical_fov_mm"])
     sampled_slices_per_slot = int(data_config["sampled_slices_per_slot"])
     window_size = int(data_config["window_size"])
     training_window_stride = int(data_config["training_window_stride"])
@@ -982,6 +999,7 @@ def train_cv_fold(
     training_loader = make_loader(
         _records_for(train_table, records_by_uid),
         image_size,
+        physical_fov_mm,
         train_labels,
         train_weights,
         batch_size,
@@ -994,6 +1012,7 @@ def train_cv_fold(
     inner_loader = make_loader(
         _records_for(inner_table, records_by_uid),
         image_size,
+        physical_fov_mm,
         inner_labels,
         inner_weights,
         batch_size,
@@ -1006,6 +1025,7 @@ def train_cv_fold(
     outer_loader = make_loader(
         _records_for(outer_table, records_by_uid),
         image_size,
+        physical_fov_mm,
         outer_labels,
         outer_weights,
         batch_size,
@@ -1531,6 +1551,9 @@ def run_inference(
     sample_submission = pd.read_csv(input_path / "sample_submission.csv")
     data_config = config["data"]
     image_size = int(data_config["image_size"])  # type: ignore[index]
+    physical_fov_mm = float(  # type: ignore[index]
+        data_config["physical_fov_mm"]
+    )
     sampled_slices_per_slot = int(  # type: ignore[index]
         data_config["sampled_slices_per_slot"]
     )
@@ -1565,6 +1588,7 @@ def run_inference(
     test_loader = make_loader(
         test_records,
         image_size,
+        physical_fov_mm,
         None,
         None,
         int(config["training"]["inference_batch_size"]),  # type: ignore[index]
@@ -1743,6 +1767,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     image_size = int(config["data"]["image_size"])
+    physical_fov_mm = float(config["data"]["physical_fov_mm"])
     sampled_slices_per_slot = int(
         config["data"]["sampled_slices_per_slot"]
     )
@@ -1797,6 +1822,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     training_loader = make_loader(
         training_records,
         image_size,
+        physical_fov_mm,
         training_labels,
         training_weights,
         batch_size,
@@ -1808,6 +1834,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     validation_loader = make_loader(
         validation_records,
         image_size,
+        physical_fov_mm,
         validation_labels,
         validation_weights,
         batch_size,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import lzma
+import math
 import os
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -29,7 +30,7 @@ from rsna2026.slice_selection import central_band_indices, sample_ordered_paths
 
 
 ORDERING_WORKERS = 16
-PREPROCESSING_VERSION = "dicom-window-uint8-v2"
+PREPROCESSING_VERSION = "dicom-physical-fov-window-uint8-v3"
 
 
 @dataclass(frozen=True)
@@ -418,8 +419,91 @@ def load_study_records_cache(
     return records, dict(split.get("summary", {}))
 
 
-def read_dicom(path: Path, image_size: int) -> torch.Tensor:
-    """Decode, robustly window, and resize one DICOM image."""
+def center_crop_physical_fov(
+    pixels: np.ndarray,
+    pixel_spacing: Sequence[float],
+    physical_fov_mm: float,
+) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+    """Center-crop a physical field of view and report required zero padding."""
+    if pixels.ndim != 2:
+        raise ValueError("Physical FOV cropping requires a two-dimensional image")
+    if not math.isfinite(physical_fov_mm) or physical_fov_mm <= 0:
+        raise ValueError("Physical FOV must be finite and positive")
+    try:
+        row_spacing, column_spacing = (
+            float(pixel_spacing[0]),
+            float(pixel_spacing[1]),
+        )
+    except (IndexError, TypeError, ValueError) as error:
+        raise ValueError("PixelSpacing must contain two numeric values") from error
+    if not all(
+        math.isfinite(value) and value > 0
+        for value in (row_spacing, column_spacing)
+    ):
+        raise ValueError("PixelSpacing values must be finite and positive")
+
+    target_rows = max(1, math.floor(physical_fov_mm / row_spacing + 0.5))
+    target_columns = max(
+        1, math.floor(physical_fov_mm / column_spacing + 0.5)
+    )
+    rows, columns = pixels.shape
+    crop_rows = min(rows, target_rows)
+    crop_columns = min(columns, target_columns)
+    row_start = (rows - crop_rows) // 2
+    column_start = (columns - crop_columns) // 2
+    cropped = pixels[
+        row_start : row_start + crop_rows,
+        column_start : column_start + crop_columns,
+    ]
+
+    missing_rows = target_rows - crop_rows
+    missing_columns = target_columns - crop_columns
+    top = missing_rows // 2
+    left = missing_columns // 2
+    padding = (
+        top,
+        missing_rows - top,
+        left,
+        missing_columns - left,
+    )
+    return cropped, padding
+
+
+def preprocess_physical_fov(
+    pixels: np.ndarray,
+    pixel_spacing: Sequence[float],
+    physical_fov_mm: float,
+    invert: bool,
+) -> np.ndarray:
+    """Sanitize, crop, window, and pad one image at a fixed physical scale."""
+    finite = np.isfinite(pixels)
+    if not finite.any():
+        raise ValueError("Image contains no finite pixels")
+    fill = float(np.median(pixels[finite]))
+    sanitized = np.nan_to_num(pixels, nan=fill, posinf=fill, neginf=fill)
+    cropped, (top, bottom, left, right) = center_crop_physical_fov(
+        sanitized, pixel_spacing, physical_fov_mm
+    )
+    low, high = np.percentile(cropped, (1.0, 99.0))
+    normalized = np.clip(
+        (cropped - low) / max(float(high - low), 1e-6), 0.0, 1.0
+    )
+    if invert:
+        normalized = 1.0 - normalized
+    if top or bottom or left or right:
+        normalized = np.pad(
+            normalized,
+            ((top, bottom), (left, right)),
+            mode="constant",
+            constant_values=0.0,
+        )
+    return normalized.astype(np.float32, copy=False)
+
+
+def read_dicom(
+    path: Path, image_size: int, physical_fov_mm: float
+) -> torch.Tensor:
+    """Decode, physically crop, robustly window, and resize one DICOM image."""
     dataset = pydicom.dcmread(path, force=True)
     pixels = np.asarray(dataset.pixel_array, dtype=np.float32)
     if pixels.ndim > 2:
@@ -427,17 +511,12 @@ def read_dicom(path: Path, image_size: int) -> torch.Tensor:
     slope = float(getattr(dataset, "RescaleSlope", 1.0) or 1.0)
     intercept = float(getattr(dataset, "RescaleIntercept", 0.0) or 0.0)
     pixels = pixels * slope + intercept
-
-    finite = np.isfinite(pixels)
-    if not finite.any():
-        raise ValueError(f"No finite pixels in {path}")
-    fill = float(np.median(pixels[finite]))
-    pixels = np.nan_to_num(pixels, nan=fill, posinf=fill, neginf=fill)
-    low, high = np.percentile(pixels, (1.0, 99.0))
-    pixels = np.clip((pixels - low) / max(float(high - low), 1e-6), 0.0, 1.0)
-    if str(getattr(dataset, "PhotometricInterpretation", "")) == "MONOCHROME1":
-        pixels = 1.0 - pixels
-    pixels = pixels.astype(np.float32, copy=False)
+    pixels = preprocess_physical_fov(
+        pixels,
+        getattr(dataset, "PixelSpacing", None),
+        physical_fov_mm,
+        str(getattr(dataset, "PhotometricInterpretation", "")) == "MONOCHROME1",
+    )
 
     tensor = torch.from_numpy(np.ascontiguousarray(pixels)).view(1, 1, *pixels.shape)
     tensor = functional.interpolate(
@@ -455,6 +534,7 @@ class KneeStudyDataset(
         self,
         records: Sequence[StudyRecord],
         image_size: int,
+        physical_fov_mm: float,
         labels: np.ndarray | None = None,
         label_weights: np.ndarray | None = None,
         augment: bool = False,
@@ -462,6 +542,7 @@ class KneeStudyDataset(
     ) -> None:
         self.records = list(records)
         self.image_size = image_size
+        self.physical_fov_mm = physical_fov_mm
         self.labels = labels
         self.label_weights = label_weights
         self.augment = augment
@@ -530,7 +611,11 @@ class KneeStudyDataset(
         present = []
         for path in record.image_paths:
             try:
-                image = read_dicom(path, self.image_size) if path is not None else None
+                image = (
+                    read_dicom(path, self.image_size, self.physical_fov_mm)
+                    if path is not None
+                    else None
+                )
             except Exception as error:
                 print(f"Warning: failed to decode {path}: {error}", flush=True)
                 image = None
@@ -553,6 +638,7 @@ class KneeStudyDataset(
             [
                 PREPROCESSING_VERSION,
                 str(self.image_size),
+                str(self.physical_fov_mm),
                 *(
                     str(path) if path is not None else "<missing>"
                     for path in record.image_paths

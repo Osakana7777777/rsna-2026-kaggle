@@ -1,0 +1,16 @@
+{
+  "id": "osakanateishoku/rsna-2026-eda",
+  "title": "RSNA 2026 EDA",
+  "code_file": "launcher.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": false,
+  "dataset_sources": [],
+  "competition_sources": [
+    "rsna-knee-abnormality-detection"
+  ],
+  "kernel_sources": [],
+  "model_sources": []
+}

@@ -32,7 +32,7 @@ def prepare_payload() -> Path:
 PAYLOAD_ROOT = prepare_payload()
 sys.path.insert(0, str(PAYLOAD_ROOT / "src"))
 
-from rsna2026.train import main  # noqa: E402
+from rsna2026.train import main as train_main  # noqa: E402
 
 
 class Tee:
@@ -57,7 +57,15 @@ class Tee:
 
 
 def run_payload() -> int:
-    """Run inference directly or launch two distributed training processes."""
+    """Run EDA/inference directly or launch two distributed training processes."""
+    if RUN_MODE == "eda":
+        from rsna2026.eda import main as eda_main
+
+        return eda_main([
+            "--output-dir",
+            "/kaggle/working/outputs/eda",
+        ])
+
     arguments = [
         "--config",
         str(PAYLOAD_ROOT / "configs" / "baseline.toml"),
@@ -65,7 +73,7 @@ def run_payload() -> int:
         RUN_MODE,
     ]
     if RUN_MODE != "train":
-        return main(arguments)
+        return train_main(arguments)
 
     environment = os.environ.copy()
     source_root = str(PAYLOAD_ROOT / "src")

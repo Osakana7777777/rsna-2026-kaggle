@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import lzma
 import os
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -300,6 +302,120 @@ def build_study_records(
             )
         )
     return records
+
+
+def load_study_records_cache(
+    cache_path: Path,
+    image_root: Path,
+    study_uids: Sequence[str],
+    sampled_slices_per_slot: int,
+    slice_band_start: float,
+    slice_band_end: float,
+    slot_names: Sequence[str],
+    classification_method: str,
+    expected_sha256: str,
+    expected_study_uids_sha256: str,
+) -> tuple[list[StudyRecord], dict[str, object]]:
+    """Restore and validate a pinned slice-selection report without DICOM scans."""
+    stored = cache_path.read_bytes()
+    raw = lzma.decompress(stored) if cache_path.suffix == ".xz" else stored
+    actual_sha256 = hashlib.sha256(raw).hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise ValueError(
+            f"Study-record cache SHA-256 mismatch: {actual_sha256}"
+        )
+    report = json.loads(raw)
+    if report.get("series_classification") != classification_method:
+        raise ValueError("Study-record cache classification method changed")
+    if report.get("slots") != list(slot_names):
+        raise ValueError("Study-record cache slot order changed")
+    if int(report.get("sampled_slices_per_slot", -1)) != sampled_slices_per_slot:
+        raise ValueError("Study-record cache sampled-slice count changed")
+    if report.get("slice_band") != [slice_band_start, slice_band_end]:
+        raise ValueError("Study-record cache slice band changed")
+
+    split = report.get("splits", {}).get("all-training-studies", {})
+    entries = split.get("studies", [])
+    entries_by_uid = {str(entry["study_uid"]): entry for entry in entries}
+    expected_uids = [str(uid) for uid in study_uids]
+    actual_uids = set(entries_by_uid)
+    if actual_uids != set(expected_uids) or len(entries) != len(expected_uids):
+        raise ValueError("Study-record cache UID set changed")
+    uid_material = "\n".join(sorted(actual_uids)) + "\n"
+    actual_uid_sha256 = hashlib.sha256(uid_material.encode("utf-8")).hexdigest()
+    if actual_uid_sha256 != expected_study_uids_sha256:
+        raise ValueError(
+            f"Study-record cache UID SHA-256 mismatch: {actual_uid_sha256}"
+        )
+
+    records = []
+    for study_uid in expected_uids:
+        entry = entries_by_uid[study_uid]
+        selections = []
+        image_paths: list[Path | None] = []
+        series_rows = entry.get("series", [])
+        if [row.get("slot") for row in series_rows] != list(slot_names):
+            raise ValueError(f"Cached slot order changed for study {study_uid}")
+        for row in series_rows:
+            selected_paths = tuple(str(path) for path in row["selected_paths"])
+            if row["series_uid"] is None:
+                if selected_paths:
+                    raise ValueError("Missing cached series contains selected paths")
+                image_paths.extend([None] * sampled_slices_per_slot)
+            else:
+                if len(selected_paths) != sampled_slices_per_slot:
+                    raise ValueError("Cached series has an invalid selected-path count")
+                image_paths.extend(image_root / path for path in selected_paths)
+            selections.append(
+                SeriesSelection(
+                    slot=str(row["slot"]),
+                    plane=str(row["plane"]),
+                    series_uid=(
+                        str(row["series_uid"])
+                        if row["series_uid"] is not None
+                        else None
+                    ),
+                    weighting=row["weighting"],
+                    fluid_sensitive=row["fluid_sensitive"],
+                    fat_suppressed=row["fat_suppressed"],
+                    weighting_source=str(row["weighting_source"]),
+                    fat_suppression_source=str(row["fat_suppression_source"]),
+                    representative_path=row["representative_path"],
+                    ordering_method=str(row["ordering_method"]),
+                    total_slices=int(row["total_slices"]),
+                    selected_indices=tuple(
+                        int(value) for value in row["selected_indices"]
+                    ),
+                    selected_relative_positions=tuple(
+                        float(value) for value in row["selected_relative_positions"]
+                    ),
+                    selected_paths=selected_paths,
+                )
+            )
+        classifications = tuple(
+            SeriesClassification(
+                series_uid=str(row["series_uid"]),
+                plane=str(row["plane"]),
+                total_slices=int(row["total_slices"]),
+                weighting=str(row["weighting"]),
+                fluid_sensitive=bool(row["fluid_sensitive"]),
+                fat_suppressed=bool(row["fat_suppressed"]),
+                weighting_source=str(row["weighting_source"]),
+                fat_suppression_source=str(row["fat_suppression_source"]),
+                representative_path=str(row["representative_path"]),
+                matching_slots=tuple(str(value) for value in row["matching_slots"]),
+            )
+            for row in entry.get("series_classifications", [])
+        )
+        records.append(
+            StudyRecord(
+                study_uid=study_uid,
+                image_paths=tuple(image_paths),
+                selections=tuple(selections),
+                classifications=classifications,
+            )
+        )
+    return records, dict(split.get("summary", {}))
 
 
 def read_dicom(path: Path, image_size: int) -> torch.Tensor:

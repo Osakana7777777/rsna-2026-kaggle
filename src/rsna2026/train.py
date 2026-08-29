@@ -5,20 +5,26 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import lzma
 import math
+import os
+import pickle
 import random
+import shutil
 import time
 from collections import Counter
-from collections.abc import Sequence
-from dataclasses import asdict
+from collections.abc import Iterator, Sequence
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.nn import functional
-from torch.utils.data import DataLoader
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader, DistributedSampler, Sampler
 
 from rsna2026.acquisition import CLASSIFICATION_METHOD, SLOT_NAMES
 from rsna2026.checkpoint import (
@@ -41,6 +47,7 @@ from rsna2026.dataset import (
     KneeStudyDataset,
     StudyRecord,
     build_study_records,
+    load_study_records_cache,
 )
 from rsna2026.model import build_dinov2_model
 from rsna2026.ensemble import (
@@ -73,6 +80,137 @@ def seed_everything(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+@dataclass(frozen=True)
+class DistributedContext:
+    """Describe one process in a fixed-size distributed training job."""
+
+    enabled: bool
+    rank: int = 0
+    local_rank: int = 0
+    world_size: int = 1
+    backend: str | None = None
+
+    @property
+    def primary(self) -> bool:
+        return self.rank == 0
+
+
+class DistributedEvaluationSampler(Sampler[int]):
+    """Shard evaluation indices without padding or duplicate studies."""
+
+    def __init__(self, size: int, rank: int, world_size: int) -> None:
+        if size < 0:
+            raise ValueError("Evaluation size must be non-negative")
+        if world_size <= 0 or rank < 0 or rank >= world_size:
+            raise ValueError("Invalid distributed rank or world size")
+        self.size = size
+        self.rank = rank
+        self.world_size = world_size
+
+    def __iter__(self) -> Iterator[int]:
+        return iter(range(self.rank, self.size, self.world_size))
+
+    def __len__(self) -> int:
+        if self.rank >= self.size:
+            return 0
+        return (self.size - 1 - self.rank) // self.world_size + 1
+
+
+def initialize_distributed(
+    config: dict[str, object], mode: str
+) -> DistributedContext:
+    """Initialize the requested two-GPU NCCL process group."""
+    training_config = config.get("training", {})
+    enabled = (
+        mode == "train"
+        and isinstance(training_config, dict)
+        and bool(training_config.get("distributed", False))
+    )
+    if not enabled:
+        return DistributedContext(enabled=False)
+
+    expected = int(training_config.get("expected_gpu_count", 2))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if expected != 2:
+        raise ValueError("This experiment requires exactly two GPUs")
+    if world_size != expected:
+        raise RuntimeError(
+            f"Expected torchrun world size {expected}, received {world_size}"
+        )
+    if not torch.cuda.is_available() or torch.cuda.device_count() != expected:
+        raise RuntimeError(
+            f"Expected exactly {expected} visible CUDA devices, found "
+            f"{torch.cuda.device_count()}"
+        )
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl", init_method="env://")
+    return DistributedContext(
+        enabled=True,
+        rank=rank,
+        local_rank=local_rank,
+        world_size=world_size,
+        backend="nccl",
+    )
+
+
+def unwrap_model(model: nn.Module) -> nn.Module:
+    """Return the underlying model without a distributed wrapper."""
+    return getattr(model, "module", model)
+
+
+def checkpoint_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
+    """Copy a wrapper-free model state to CPU for a reusable checkpoint."""
+    return {
+        name: value.detach().cpu().clone()
+        for name, value in unwrap_model(model).state_dict().items()
+    }
+
+
+def mean_loss_from_totals(total_loss: float, total_batches: float) -> float:
+    """Calculate the global mean after distributed loss totals are reduced."""
+    return total_loss / max(total_batches, 1.0)
+
+
+def merge_prediction_shards(
+    shards: Sequence[tuple[Sequence[int], np.ndarray, np.ndarray | None]],
+    expected_size: int,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Restore distributed evaluation predictions to dataset order."""
+    indexed_predictions: dict[int, np.ndarray] = {}
+    indexed_labels: dict[int, np.ndarray] = {}
+    labels_expected = any(labels is not None for _, _, labels in shards)
+    for indices, predictions, labels in shards:
+        if len(indices) != len(predictions):
+            raise ValueError("Prediction shard length does not match its indices")
+        if labels is not None and len(labels) != len(indices):
+            raise ValueError("Label shard length does not match its indices")
+        for offset, index in enumerate(indices):
+            if index in indexed_predictions:
+                raise ValueError(f"Duplicate distributed prediction index: {index}")
+            indexed_predictions[int(index)] = predictions[offset]
+            if labels is not None:
+                indexed_labels[int(index)] = labels[offset]
+    expected_indices = set(range(expected_size))
+    if set(indexed_predictions) != expected_indices:
+        missing = sorted(expected_indices.difference(indexed_predictions))
+        extra = sorted(set(indexed_predictions).difference(expected_indices))
+        raise ValueError(
+            f"Distributed predictions are incomplete; missing={missing[:3]}, "
+            f"extra={extra[:3]}"
+        )
+    predictions = np.stack(
+        [indexed_predictions[index] for index in range(expected_size)]
+    )
+    if not labels_expected:
+        return predictions, None
+    if set(indexed_labels) != expected_indices:
+        raise ValueError("Distributed labels are incomplete")
+    labels = np.stack([indexed_labels[index] for index in range(expected_size)])
+    return predictions, labels
 
 
 def target_auc_scores(
@@ -293,6 +431,7 @@ def make_loader(
     shuffle: bool,
     augment: bool,
     cache_dir: str | Path | None,
+    sampler: Sampler[int] | None = None,
 ) -> DataLoader:
     dataset = KneeStudyDataset(
         records, image_size, labels, label_weights, augment, cache_dir
@@ -300,7 +439,8 @@ def make_loader(
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=shuffle if sampler is None else False,
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
         persistent_workers=num_workers > 0,
@@ -333,6 +473,7 @@ def train_epoch(
     sampled_slices_per_slot: int,
     window_size: int,
     training_window_stride: int,
+    distributed: DistributedContext | None = None,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -341,7 +482,10 @@ def train_epoch(
         sampled_slices_per_slot, window_size, training_window_stride
     )
     for images, present, labels, label_weights in loader:
-        start = starts[int(torch.randint(len(starts), (1,)).item())]
+        start_index = torch.randint(len(starts), (1,), device=device)
+        if distributed is not None and distributed.enabled:
+            dist.broadcast(start_index, src=0)
+        start = starts[int(start_index.item())]
         images, present = select_slice_window(
             images,
             present,
@@ -370,7 +514,12 @@ def train_epoch(
         scheduler.step()
         total_loss += float(loss.detach().cpu())
         total_batches += 1
-    return total_loss / max(total_batches, 1)
+    totals = torch.tensor(
+        [total_loss, float(total_batches)], dtype=torch.float64, device=device
+    )
+    if distributed is not None and distributed.enabled:
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+    return mean_loss_from_totals(float(totals[0].cpu()), float(totals[1].cpu()))
 
 
 @torch.no_grad()
@@ -426,6 +575,39 @@ def predict(
     )
     label_array = np.concatenate(labels) if labels else None
     return prediction_array, label_array
+
+
+def predict_distributed(
+    model: nn.Module,
+    loader: DataLoader,
+    sampler: DistributedEvaluationSampler,
+    expected_size: int,
+    device: torch.device,
+    num_slots: int,
+    sampled_slices_per_slot: int,
+    window_size: int,
+    inference_window_stride: int,
+    distributed: DistributedContext,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Predict one non-overlapping shard and restore order on rank zero."""
+    predictions, labels = predict(
+        unwrap_model(model),
+        loader,
+        device,
+        num_slots,
+        sampled_slices_per_slot,
+        window_size,
+        inference_window_stride,
+    )
+    local = (list(sampler), predictions, labels)
+    gathered: list[
+        tuple[Sequence[int], np.ndarray, np.ndarray | None] | None
+    ] = [None] * distributed.world_size
+    dist.all_gather_object(gathered, local)
+    if not distributed.primary:
+        return None, None
+    complete = [shard for shard in gathered if shard is not None]
+    return merge_prediction_shards(complete, expected_size)
 
 
 def slice_window_starts(
@@ -688,11 +870,12 @@ def build_configured_model(
         for parameter in model.parameters()
         if parameter.requires_grad
     )
-    print(
-        f"Loaded {model_config['name']} from {model_source}; "  # type: ignore[index]
-        f"parameters={total_parameters}, trainable={trainable_parameters}",
-        flush=True,
-    )
+    if int(os.environ.get("RANK", "0")) == 0:
+        print(
+            f"Loaded {model_config['name']} from {model_source}; "  # type: ignore[index]
+            f"parameters={total_parameters}, trainable={trainable_parameters}",
+            flush=True,
+        )
     return model, model_source, total_parameters, trainable_parameters
 
 
@@ -742,10 +925,11 @@ def train_cv_fold(
     public_rows: dict[str, tuple[float, ...]],
     records_by_uid: dict[str, StudyRecord],
     device: torch.device,
-) -> tuple[dict[str, object], pd.DataFrame, bool]:
+    distributed: DistributedContext,
+) -> tuple[dict[str, object] | None, pd.DataFrame | None, bool]:
     """Train one outer fold using only its weak inner validation for selection."""
     run_seed = int(config["run"]["seed"]) + fold  # type: ignore[index]
-    seed_everything(run_seed)
+    seed_everything(run_seed + distributed.rank)
     cv_config = config["cross_validation"]
     training_config = config["training"]
     data_config = config["data"]
@@ -778,9 +962,23 @@ def train_cv_fold(
     selection_window_stride = int(cv_config["selection_window_stride"])
     inference_window_stride = int(data_config["inference_window_stride"])
     slot_names = list(data_config["slots"])
-    batch_size = int(training_config["batch_size"])
+    batch_size = int(training_config["batch_size_per_device"])
     num_workers = int(training_config["num_workers"])
     cache_dir = data_config.get("dicom_cache_dir")
+    training_sampler = DistributedSampler(
+        range(len(train_table)),
+        num_replicas=distributed.world_size,
+        rank=distributed.rank,
+        shuffle=True,
+        seed=run_seed,
+        drop_last=False,
+    )
+    inner_sampler = DistributedEvaluationSampler(
+        len(inner_table), distributed.rank, distributed.world_size
+    )
+    outer_sampler = DistributedEvaluationSampler(
+        len(outer_table), distributed.rank, distributed.world_size
+    )
     training_loader = make_loader(
         _records_for(train_table, records_by_uid),
         image_size,
@@ -791,6 +989,7 @@ def train_cv_fold(
         True,
         True,
         cache_dir,
+        training_sampler,
     )
     inner_loader = make_loader(
         _records_for(inner_table, records_by_uid),
@@ -802,6 +1001,7 @@ def train_cv_fold(
         False,
         False,
         cache_dir,
+        inner_sampler,
     )
     outer_loader = make_loader(
         _records_for(outer_table, records_by_uid),
@@ -813,15 +1013,25 @@ def train_cv_fold(
         False,
         False,
         cache_dir,
+        outer_sampler,
     )
-    print(
-        f"Fold {fold}: train={len(train_table)}, inner={len(inner_table)}, "
-        f"outer_gold={len(outer_table)}",
-        flush=True,
-    )
+    if distributed.primary:
+        print(
+            f"Fold {fold}: train={len(train_table)}, inner={len(inner_table)}, "
+            f"outer_gold={len(outer_table)}",
+            flush=True,
+        )
     model, model_source, total_parameters, trainable_parameters = (
         build_configured_model(config, device)
     )
+    model = DistributedDataParallel(
+        model,
+        device_ids=[distributed.local_rank],
+        output_device=distributed.local_rank,
+        broadcast_buffers=True,
+        find_unused_parameters=False,
+    )
+    raw_model = unwrap_model(model)
     backbone_learning_rate = float(training_config["backbone_learning_rate"])
     head_learning_rate = float(training_config["head_learning_rate"])
     optimizer = torch.optim.AdamW(
@@ -829,12 +1039,12 @@ def train_cv_fold(
             {
                 "params": [
                     parameter
-                    for parameter in model.backbone.parameters()
+                    for parameter in raw_model.backbone.parameters()
                     if parameter.requires_grad
                 ],
                 "lr": backbone_learning_rate,
             },
-            {"params": model.head.parameters(), "lr": head_learning_rate},
+            {"params": raw_model.head.parameters(), "lr": head_learning_rate},
         ],
         weight_decay=float(training_config["weight_decay"]),
     )
@@ -856,6 +1066,7 @@ def train_cv_fold(
     time_limit_reached = False
     selection_targets = np.where(inner_weights > 0, inner_labels, np.nan)
     for epoch in range(epochs):
+        training_sampler.set_epoch(epoch)
         loss = train_epoch(
             model,
             training_loader,
@@ -868,121 +1079,158 @@ def train_cv_fold(
             sampled_slices_per_slot,
             window_size,
             training_window_stride,
+            distributed,
         )
-        inner_predictions, _ = predict(
+        inner_predictions, _ = predict_distributed(
             model,
             inner_loader,
+            inner_sampler,
+            len(inner_table),
             device,
             len(slot_names),
             sampled_slices_per_slot,
             window_size,
             selection_window_stride,
+            distributed,
         )
-        per_target_auc = target_auc_scores(selection_targets, inner_predictions)
-        if any(not math.isfinite(value) for value in per_target_auc.values()):
-            raise RuntimeError(f"Fold {fold} inner validation has a non-finite AUC")
-        auc = float(np.mean(list(per_target_auc.values())))
-        weighted_bce = weighted_binary_cross_entropy(
-            inner_labels, inner_predictions, inner_weights
+        if distributed.primary:
+            if inner_predictions is None:
+                raise RuntimeError("Primary rank did not receive inner predictions")
+            per_target_auc = target_auc_scores(
+                selection_targets, inner_predictions
+            )
+            if any(not math.isfinite(value) for value in per_target_auc.values()):
+                raise RuntimeError(
+                    f"Fold {fold} inner validation has a non-finite AUC"
+                )
+            auc = float(np.mean(list(per_target_auc.values())))
+            weighted_bce = weighted_binary_cross_entropy(
+                inner_labels, inner_predictions, inner_weights
+            )
+            history.append(
+                {
+                    "epoch": epoch + 1,
+                    "loss": loss,
+                    "inner_validation_auc": auc,
+                    "inner_validation_auc_by_target": per_target_auc,
+                    "inner_validation_weighted_bce": weighted_bce,
+                }
+            )
+            print(
+                f"Fold {fold} epoch {epoch + 1}: loss={loss:.5f}, "
+                f"inner_auc={auc:.5f}, inner_bce={weighted_bce:.5f}",
+                flush=True,
+            )
+            if best_state is None or auc > best_score:
+                best_score = auc
+                best_epoch = epoch + 1
+                best_state = checkpoint_state_dict(model)
+            time_limit_reached = (
+                time.monotonic() - started_at >= max_runtime_seconds
+            )
+            if time_limit_reached:
+                print(f"Global runtime limit reached in fold {fold}", flush=True)
+        stop = torch.tensor(
+            int(time_limit_reached), dtype=torch.int32, device=device
         )
-        history.append(
-            {
-                "epoch": epoch + 1,
-                "loss": loss,
-                "inner_validation_auc": auc,
-                "inner_validation_auc_by_target": per_target_auc,
-                "inner_validation_weighted_bce": weighted_bce,
-            }
-        )
-        print(
-            f"Fold {fold} epoch {epoch + 1}: loss={loss:.5f}, "
-            f"inner_auc={auc:.5f}, inner_bce={weighted_bce:.5f}",
-            flush=True,
-        )
-        if best_state is None or auc > best_score:
-            best_score = auc
-            best_epoch = epoch + 1
-            best_state = {
-                name: value.detach().cpu().clone()
-                for name, value in model.state_dict().items()
-            }
-        if time.monotonic() - started_at >= max_runtime_seconds:
-            time_limit_reached = True
-            print(f"Global runtime limit reached in fold {fold}", flush=True)
+        dist.broadcast(stop, src=0)
+        time_limit_reached = bool(stop.item())
+        if time_limit_reached:
             break
-    if best_state is None:
-        raise RuntimeError(f"Fold {fold} did not produce a model state")
-    model.load_state_dict(best_state)
-    outer_predictions, predicted_outer_labels = predict(
+    if distributed.primary:
+        if best_state is None:
+            raise RuntimeError(f"Fold {fold} did not produce a model state")
+        raw_model.load_state_dict(best_state)
+    for tensor in raw_model.state_dict().values():
+        dist.broadcast(tensor, src=0)
+    outer_predictions, predicted_outer_labels = predict_distributed(
         model,
         outer_loader,
+        outer_sampler,
+        len(outer_table),
         device,
         len(slot_names),
         sampled_slices_per_slot,
         window_size,
         inference_window_stride,
+        distributed,
     )
-    if predicted_outer_labels is None or not np.array_equal(
-        predicted_outer_labels, outer_labels
-    ):
-        raise RuntimeError(f"Fold {fold} outer labels changed during prediction")
-    fold_dir = output_dir / f"fold-{fold}"
-    fold_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = fold_dir / "best-model.pt"
-    torch.save(best_state, checkpoint_path)
-    artifact_metadata = model_artifact_metadata(config)
-    manifest = write_checkpoint_manifest(
-        checkpoint_path,
-        fold_dir / "checkpoint-manifest.json",
-        {
-            "model": artifact_metadata,
+    fold_summary: dict[str, object] | None = None
+    oof: pd.DataFrame | None = None
+    if distributed.primary:
+        if outer_predictions is None or predicted_outer_labels is None:
+            raise RuntimeError("Primary rank did not receive outer predictions")
+        if not np.array_equal(predicted_outer_labels, outer_labels):
+            raise RuntimeError(f"Fold {fold} outer labels changed during prediction")
+        fold_dir = output_dir / f"fold-{fold}"
+        fold_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_path = fold_dir / "best-model.pt"
+        torch.save(best_state, checkpoint_path)
+        artifact_metadata = model_artifact_metadata(config)
+        manifest = write_checkpoint_manifest(
+            checkpoint_path,
+            fold_dir / "checkpoint-manifest.json",
+            {
+                "model": artifact_metadata,
+                "fold": fold,
+                "seed": run_seed,
+                "best_epoch": best_epoch,
+                "best_inner_validation_auc": best_score,
+                "training_studies": len(train_table),
+                "inner_validation_studies": len(inner_table),
+                "outer_gold_studies": len(outer_table),
+                "selection_window_stride": selection_window_stride,
+            },
+        )
+        fold_summary = {
             "fold": fold,
             "seed": run_seed,
-            "best_epoch": best_epoch,
-            "best_inner_validation_auc": best_score,
             "training_studies": len(train_table),
+            "training_gold_studies": int(
+                train_table[TARGETS].notna().all(axis=1).sum()
+            ),
             "inner_validation_studies": len(inner_table),
             "outer_gold_studies": len(outer_table),
-            "selection_window_stride": selection_window_stride,
-        },
-    )
-    fold_summary: dict[str, object] = {
-        "fold": fold,
-        "seed": run_seed,
-        "training_studies": len(train_table),
-        "training_gold_studies": int(train_table[TARGETS].notna().all(axis=1).sum()),
-        "inner_validation_studies": len(inner_table),
-        "outer_gold_studies": len(outer_table),
-        "best_epoch": best_epoch,
-        "best_inner_validation_auc": best_score,
-        "completed_epochs": len(history),
-        "time_limit_reached": time_limit_reached,
-        "history": history,
-        "checkpoint": manifest,
-        "model_source": str(model_source),
-        "total_parameters": total_parameters,
-        "trainable_parameters": trainable_parameters,
-    }
-    write_json(fold_dir / "run-summary.json", fold_summary, allow_nan=False)
-    oof = pd.DataFrame(
-        {
-            "StudyInstanceUID": outer_table["StudyInstanceUID"].astype(str),
-            "outer_fold": fold,
+            "best_epoch": best_epoch,
+            "best_inner_validation_auc": best_score,
+            "completed_epochs": len(history),
+            "time_limit_reached": time_limit_reached,
+            "history": history,
+            "checkpoint": manifest,
+            "model_source": str(model_source),
+            "total_parameters": total_parameters,
+            "trainable_parameters": trainable_parameters,
+            "distributed": {
+                "backend": distributed.backend,
+                "world_size": distributed.world_size,
+                "batch_size_per_device": batch_size,
+                "global_batch_size": batch_size * distributed.world_size,
+            },
         }
-    )
-    for target_index, target in enumerate(TARGETS):
-        oof[f"label_{target}"] = outer_labels[:, target_index]
-        oof[f"prediction_{target}"] = outer_predictions[:, target_index]
+        write_json(fold_dir / "run-summary.json", fold_summary, allow_nan=False)
+        oof = pd.DataFrame(
+            {
+                "StudyInstanceUID": outer_table["StudyInstanceUID"].astype(str),
+                "outer_fold": fold,
+            }
+        )
+        for target_index, target in enumerate(TARGETS):
+            oof[f"label_{target}"] = outer_labels[:, target_index]
+            oof[f"prediction_{target}"] = outer_predictions[:, target_index]
+    dist.barrier()
+    del raw_model
     del model, optimizer, scheduler, scaler
     del training_loader, inner_loader, outer_loader
     gc.collect()
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+    torch.cuda.empty_cache()
     return fold_summary, oof, time_limit_reached
 
 
 def run_cross_validation_training(
-    config: dict[str, object], output_dir: Path, started_at: float
+    config: dict[str, object],
+    output_dir: Path,
+    started_at: float,
+    distributed: DistributedContext,
 ) -> int:
     """Train four grouped folds and write auditable OOF artifacts."""
     input_path = competition_input(
@@ -1022,7 +1270,10 @@ def run_cross_validation_training(
     gate["passed"] = all(gate.values())
     label_validation["minimum_macro_auc"] = minimum_auc
     label_validation["acceptance_gate"] = gate
-    write_json(output_dir / "label-source-validation.json", label_validation, True)
+    if distributed.primary:
+        write_json(
+            output_dir / "label-source-validation.json", label_validation, True
+        )
     if not gate["passed"]:
         raise ValueError("Public label source failed its acceptance gate")
 
@@ -1033,7 +1284,10 @@ def run_cross_validation_training(
         int(cv_config["outer_seed"]),
         str(cv_config["split_algorithm"]),
     )
-    design.assignments.to_csv(output_dir / "fold-assignments.csv", index=False)
+    if distributed.primary:
+        design.assignments.to_csv(
+            output_dir / "fold-assignments.csv", index=False
+        )
     table_with_hash = train_table.copy()
     table_with_hash["report_hash"] = table_with_hash["Report"].fillna("").map(
         report_hash
@@ -1051,7 +1305,8 @@ def run_cross_validation_training(
             )
         )
     inner_splits = pd.concat(all_roles, ignore_index=True)
-    inner_splits.to_csv(output_dir / "inner-splits.csv", index=False)
+    if distributed.primary:
+        inner_splits.to_csv(output_dir / "inner-splits.csv", index=False)
     design.audit["inner_seed"] = int(cv_config["inner_seed"])
     design.audit["inner_validation_fraction"] = float(
         cv_config["inner_validation_fraction"]
@@ -1064,29 +1319,65 @@ def run_cross_validation_training(
         }
         for fold, fold_rows in inner_splits.groupby("model_fold")
     }
-    write_json(output_dir / "fold-audit.json", design.audit, allow_nan=False)
+    if distributed.primary:
+        write_json(output_dir / "fold-audit.json", design.audit, allow_nan=False)
 
     data_config = config["data"]
     all_uids = design.assignments["StudyInstanceUID"].astype(str).tolist()
-    all_records = build_study_records(
-        train_series,
-        input_path / "train_series",
-        all_uids,
-        int(data_config["sampled_slices_per_slot"]),
-        float(data_config["slice_band_start"]),
-        float(data_config["slice_band_end"]),
-        list(data_config["slots"]),
-        str(data_config["series_classification"]),
+    run_id = os.environ.get("TORCHELASTIC_RUN_ID", "local").replace("/", "-")
+    records_cache = Path(
+        f"/tmp/rsna2026-distributed-study-records-{run_id}.pkl"
     )
+    if distributed.primary:
+        selection_cache_path = Path(str(data_config["study_records_cache_path"]))
+        all_records, selection_summary = load_study_records_cache(
+            selection_cache_path,
+            input_path / "train_series",
+            all_uids,
+            int(data_config["sampled_slices_per_slot"]),
+            float(data_config["slice_band_start"]),
+            float(data_config["slice_band_end"]),
+            list(data_config["slots"]),
+            str(data_config["series_classification"]),
+            str(data_config["study_records_cache_sha256"]),
+            str(data_config["study_records_cache_uids_sha256"]),
+        )
+        temporary_records_cache = records_cache.with_suffix(".temporary")
+        with temporary_records_cache.open("wb") as file:
+            pickle.dump(all_records, file, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(temporary_records_cache, records_cache)
+        selection_output = output_dir / "slice-selection.json"
+        if selection_cache_path.suffix == ".xz":
+            with lzma.open(selection_cache_path, "rb") as source:
+                with selection_output.open("wb") as destination:
+                    shutil.copyfileobj(source, destination)
+        else:
+            shutil.copyfile(selection_cache_path, selection_output)
+        print(
+            f"Loaded pinned study-record cache: {selection_summary}", flush=True
+        )
+    if not distributed.primary:
+        deadline = time.monotonic() + 1800.0
+        while not records_cache.is_file():
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Timed out waiting for the study-record cache")
+            time.sleep(1.0)
+        with records_cache.open("rb") as file:
+            all_records = pickle.load(file)
+    if len(all_records) != len(all_uids):
+        raise RuntimeError("Distributed study-record cache is incomplete")
     records_by_uid = {record.study_uid: record for record in all_records}
-    selection_report = slice_selection_report(
-        {"all-training-studies": all_records},
-        int(data_config["sampled_slices_per_slot"]),
-        float(data_config["slice_band_start"]),
-        float(data_config["slice_band_end"]),
-    )
-    write_json(output_dir / "slice-selection.json", selection_report)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dist.barrier()
+    device = torch.device("cuda", distributed.local_rank)
+    local_gpu_name = torch.cuda.get_device_name(distributed.local_rank)
+    gpu_names: list[str | None] = [None] * distributed.world_size
+    dist.all_gather_object(gpu_names, local_gpu_name)
+    if distributed.primary:
+        print(
+            f"Distributed training on {distributed.world_size} GPUs: "
+            f"{gpu_names}",
+            flush=True,
+        )
     fold_summaries = []
     oof_tables = []
     for fold in range(int(cv_config["folds"])):
@@ -1101,11 +1392,17 @@ def run_cross_validation_training(
             public.rows,
             records_by_uid,
             device,
+            distributed,
         )
-        fold_summaries.append(summary)
-        oof_tables.append(oof)
+        if distributed.primary:
+            if summary is None or oof is None:
+                raise RuntimeError("Primary rank did not receive fold artifacts")
+            fold_summaries.append(summary)
+            oof_tables.append(oof)
         if time_limit and fold < int(cv_config["folds"]) - 1:
             raise RuntimeError("Runtime limit prevented a complete four-fold ensemble")
+    if not distributed.primary:
+        return 0
     oof = pd.concat(oof_tables, ignore_index=True).sort_values(
         "StudyInstanceUID"
     ).reset_index(drop=True)
@@ -1161,6 +1458,35 @@ def run_cross_validation_training(
     run_summary = {
         "status": "cross-validation-training-complete",
         "device": str(device),
+        "distributed": {
+            "enabled": distributed.enabled,
+            "backend": distributed.backend,
+            "world_size": distributed.world_size,
+            "gpu_names": gpu_names,
+            "batch_size_per_device": int(
+                config["training"]["batch_size_per_device"]  # type: ignore[index]
+            ),
+            "global_batch_size": int(
+                config["training"]["batch_size_per_device"]  # type: ignore[index]
+            )
+            * distributed.world_size,
+        },
+        "optimization": {
+            "epochs": int(config["training"]["epochs"]),  # type: ignore[index]
+            "backbone_learning_rate": float(
+                config["training"]["backbone_learning_rate"]  # type: ignore[index]
+            ),
+            "head_learning_rate": float(
+                config["training"]["head_learning_rate"]  # type: ignore[index]
+            ),
+            "weight_decay": float(
+                config["training"]["weight_decay"]  # type: ignore[index]
+            ),
+            "scheduler": "one-cycle",
+            "one_cycle_warmup_fraction": float(
+                config["training"]["one_cycle_warmup_fraction"]  # type: ignore[index]
+            ),
+        },
         "elapsed_seconds": elapsed,
         "folds": fold_summaries,
         "cross_validation": cv_summary,
@@ -1170,6 +1496,13 @@ def run_cross_validation_training(
         "inner_splits": "inner-splits.csv",
         "oof_predictions": "oof-predictions.csv",
         "label_source_validation": label_validation,
+        "study_records_cache": {
+            "sha256": str(data_config["study_records_cache_sha256"]),
+            "study_uids_sha256": str(
+                data_config["study_records_cache_uids_sha256"]
+            ),
+            "artifact": "slice-selection.json",
+        },
         "pseudo_label_file": str(pseudo_config["file_name"]),
         "pseudo_labels_sha256": public.sha256,
         "model": artifact_metadata,
@@ -1234,7 +1567,7 @@ def run_inference(
         image_size,
         None,
         None,
-        int(config["training"]["batch_size"]),  # type: ignore[index]
+        int(config["training"]["inference_batch_size"]),  # type: ignore[index]
         int(config["training"]["num_workers"]),  # type: ignore[index]
         False,
         False,
@@ -1316,8 +1649,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     started_at = time.monotonic()
     args = parse_args(argv)
     config = load_config(args.config)
+    distributed = initialize_distributed(config, args.mode)
     seed = int(config["run"]["seed"])
-    seed_everything(seed)
+    seed_everything(seed + distributed.rank)
 
     output_dir = Path(config["paths"]["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1327,7 +1661,22 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     cv_config = config.get("cross_validation", {})
     if isinstance(cv_config, dict) and bool(cv_config.get("enabled", False)):
-        return run_cross_validation_training(config, output_dir, started_at)
+        if not distributed.enabled:
+            raise RuntimeError(
+                "Cross-validation experiment requires two-GPU distributed training"
+            )
+        try:
+            return run_cross_validation_training(
+                config, output_dir, started_at, distributed
+            )
+        finally:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+
+    if distributed.enabled:
+        raise RuntimeError(
+            "Distributed training is supported only for cross-validation"
+        )
 
     input_path = competition_input(
         config["paths"]["input_root"], config["competition"]["input_slug"]
@@ -1442,7 +1791,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         encoding="utf-8",
     )
 
-    batch_size = int(config["training"]["batch_size"])
+    batch_size = int(config["training"]["batch_size_per_device"])
     num_workers = int(config["training"]["num_workers"])
     dicom_cache_dir = config["data"].get("dicom_cache_dir")
     training_loader = make_loader(

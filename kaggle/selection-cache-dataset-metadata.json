@@ -1,0 +1,16 @@
+{
+  "title": "RSNA 2026 Slice Selection Cache",
+  "id": "osakanateishoku/rsna-2026-slice-selection-cache",
+  "licenses": [
+    {
+      "name": "other"
+    }
+  ],
+  "description": "Private, derived slice-selection metadata for the RSNA Knee Abnormality Detection competition. Use is restricted to the competition workflow and its rules.",
+  "resources": [
+    {
+      "path": "slice-selection.json.xz",
+      "description": "XZ-compressed, SHA-256-pinned v21 DICOM series and slice selections. Contains metadata and relative paths only; no image pixels."
+    }
+  ]
+}

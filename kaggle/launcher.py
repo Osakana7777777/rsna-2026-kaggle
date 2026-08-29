@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import shutil
+import subprocess
 import sys
 import traceback
 from pathlib import Path
@@ -54,6 +56,53 @@ class Tee:
         return False
 
 
+def run_payload() -> int:
+    """Run inference directly or launch two distributed training processes."""
+    arguments = [
+        "--config",
+        str(PAYLOAD_ROOT / "configs" / "baseline.toml"),
+        "--mode",
+        RUN_MODE,
+    ]
+    if RUN_MODE != "train":
+        return main(arguments)
+
+    environment = os.environ.copy()
+    source_root = str(PAYLOAD_ROOT / "src")
+    current_python_path = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = (
+        source_root
+        if not current_python_path
+        else os.pathsep.join((source_root, current_python_path))
+    )
+    environment["PYTHONUNBUFFERED"] = "1"
+    command = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc-per-node=2",
+        "-m",
+        "rsna2026.train",
+        *arguments,
+    ]
+    print(f"Launching two-GPU training: {' '.join(command)}", flush=True)
+    process = subprocess.Popen(
+        command,
+        cwd=PAYLOAD_ROOT,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    if process.stdout is None:
+        raise RuntimeError("Distributed training output stream is unavailable")
+    for line in process.stdout:
+        print(line, end="", flush=True)
+    return process.wait()
+
+
 if __name__ == "__main__":
     output_dir = Path("/kaggle/working/outputs")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -61,14 +110,7 @@ if __name__ == "__main__":
         with contextlib.redirect_stdout(Tee(sys.stdout, log_file)):
             with contextlib.redirect_stderr(Tee(sys.stderr, log_file)):
                 try:
-                    exit_code = main(
-                        [
-                            "--config",
-                            str(PAYLOAD_ROOT / "configs" / "baseline.toml"),
-                            "--mode",
-                            RUN_MODE,
-                        ]
-                    )
+                    exit_code = run_payload()
                     submission = output_dir / "submission.csv"
                     competition_submission = Path("/kaggle/working/submission.csv")
                     if exit_code == 0 and submission.is_file():

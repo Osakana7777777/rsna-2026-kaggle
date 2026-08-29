@@ -24,6 +24,10 @@ dicom_cache_dir = "/tmp/rsna2026-dicom-cache"
 slice_band_start = 0.20
 slice_band_end = 0.80
 series_classification = "dicom-header-v1"
+# Pinned v21 selection metadata is embedded into the generated training notebook.
+study_records_cache_path = "/kaggle/input/rsna-2026-slice-selection-cache/slice-selection.json.xz"
+study_records_cache_sha256 = "8d691f5f58a19f9c0b4196103267844fdb65996b4c0ab29d3749328123b03a75"
+study_records_cache_uids_sha256 = "72bb18659cba9fc84f4f363c2585f1a99f84e6f03971e4d8313813ba647aa81e"
 slots = [
   "sagittal-fluid-fs",
   "coronal-fluid-fs",
@@ -34,11 +38,15 @@ slots = [
 ]
 
 [training]
-epochs = 10
-batch_size = 4
+epochs = 20
+# Training uses this many studies on each GPU, for a global batch size of 8.
+batch_size_per_device = 4
+inference_batch_size = 4
 num_workers = 2
-backbone_learning_rate = 0.000008
-head_learning_rate = 0.001
+distributed = true
+expected_gpu_count = 2
+backbone_learning_rate = 0.000016
+head_learning_rate = 0.002
 weight_decay = 0.02
 one_cycle_warmup_fraction = 0.15
 max_runtime_hours = 8.0

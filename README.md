@@ -124,7 +124,9 @@ and inference average probabilities over all ten overlapping windows. The result
 six 2.5D features are combined with target-specific masked attention. Decoded,
 windowed, and resized DICOM tensors are cached under the ephemeral directory
 configured by `dicom_cache_dir`, so later epochs do not repeat DICOM preprocessing.
-The slot order, image size, epoch count, batch size, learning rate, and public-label
+Training applies synchronized, per-slot geometric and intensity augmentation to all
+three slice channels; validation and inference remain deterministic. The slot order,
+augmentation, image size, epoch count, batch size, learning rate, and public-label
 selection are set in `configs/baseline.toml`.
 
 The Kaggle image supplies PyTorch, pandas, NumPy, and pydicom. Internet access

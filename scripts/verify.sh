@@ -14,6 +14,7 @@ required_files=(
   "kaggle/launcher.py"
   "src/rsna2026/checkpoint.py"
   "src/rsna2026/acquisition.py"
+  "src/rsna2026/augmentation.py"
   "src/rsna2026/config.py"
   "src/rsna2026/constants.py"
   "src/rsna2026/cross_validation.py"
@@ -45,6 +46,7 @@ required_files=(
   "tests/test_distributed.py"
   "tests/test_study_records_cache.py"
   "tests/test_physical_crop.py"
+  "tests/test_augmentation.py"
   "submissions/README.md"
   "submissions/TEMPLATE.md"
 )

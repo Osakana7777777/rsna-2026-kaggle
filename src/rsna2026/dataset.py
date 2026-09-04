@@ -537,7 +537,6 @@ class KneeStudyDataset(
         physical_fov_mm: float,
         labels: np.ndarray | None = None,
         label_weights: np.ndarray | None = None,
-        augment: bool = False,
         cache_dir: str | Path | None = None,
     ) -> None:
         self.records = list(records)
@@ -545,7 +544,6 @@ class KneeStudyDataset(
         self.physical_fov_mm = physical_fov_mm
         self.labels = labels
         self.label_weights = label_weights
-        self.augment = augment
         self.cache_dir = Path(cache_dir) if cache_dir else None
         if self.cache_dir is not None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -563,9 +561,6 @@ class KneeStudyDataset(
         self, index: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         images, present = self._load_images(self.records[index])
-        if self.augment:
-            scales = 0.9 + 0.2 * torch.rand((len(images), 1, 1, 1))
-            images = (images * scales).clamp(0.0, 1.0)
 
         label = (
             torch.from_numpy(self.labels[index]).float()

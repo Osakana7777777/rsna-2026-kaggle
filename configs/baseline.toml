@@ -38,6 +38,27 @@ slots = [
   "sagittal-t1",
 ]
 
+[augmentation]
+enabled = true
+rotation_degrees = 8.0
+rotation_probability = 0.5
+translation_fraction = 0.05
+scale_min = 0.92
+scale_max = 1.08
+affine_probability = 0.5
+brightness_limit = 0.10
+contrast_limit = 0.10
+brightness_contrast_probability = 0.4
+gamma_min = 0.85
+gamma_max = 1.15
+gamma_probability = 0.3
+noise_std_max = 0.02
+noise_probability = 0.2
+blur_kernel_sizes = [3, 5]
+blur_sigma_min = 0.1
+blur_sigma_max = 1.0
+blur_probability = 0.1
+
 [training]
 epochs = 20
 # Training uses this many studies on each GPU, for a global batch size of 8.

@@ -27,6 +27,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler, Sampler
 
 from rsna2026.acquisition import CLASSIFICATION_METHOD, SLOT_NAMES
+from rsna2026.augmentation import AugmentationConfig, augment_2_5d_slots
 from rsna2026.checkpoint import (
     file_sha256,
     resolve_input_file,
@@ -430,7 +431,6 @@ def make_loader(
     batch_size: int,
     num_workers: int,
     shuffle: bool,
-    augment: bool,
     cache_dir: str | Path | None,
     sampler: Sampler[int] | None = None,
 ) -> DataLoader:
@@ -440,7 +440,6 @@ def make_loader(
         physical_fov_mm,
         labels,
         label_weights,
-        augment,
         cache_dir,
     )
     return DataLoader(
@@ -480,6 +479,7 @@ def train_epoch(
     sampled_slices_per_slot: int,
     window_size: int,
     training_window_stride: int,
+    augmentation: AugmentationConfig,
     distributed: DistributedContext | None = None,
 ) -> float:
     model.train()
@@ -503,6 +503,13 @@ def train_epoch(
         )
         images = images.to(device, non_blocking=True)
         present = present.to(device, non_blocking=True)
+        images = augment_2_5d_slots(
+            images,
+            present,
+            num_slots,
+            window_size,
+            augmentation,
+        )
         labels = labels.to(device, non_blocking=True)
         label_weights = label_weights.to(device, non_blocking=True)
         valid = torch.isfinite(labels) & torch.isfinite(label_weights)
@@ -976,6 +983,7 @@ def train_cv_fold(
     sampled_slices_per_slot = int(data_config["sampled_slices_per_slot"])
     window_size = int(data_config["window_size"])
     training_window_stride = int(data_config["training_window_stride"])
+    augmentation = AugmentationConfig.from_mapping(config["augmentation"])
     selection_window_stride = int(cv_config["selection_window_stride"])
     inference_window_stride = int(data_config["inference_window_stride"])
     slot_names = list(data_config["slots"])
@@ -1005,7 +1013,6 @@ def train_cv_fold(
         batch_size,
         num_workers,
         True,
-        True,
         cache_dir,
         training_sampler,
     )
@@ -1018,7 +1025,6 @@ def train_cv_fold(
         batch_size,
         num_workers,
         False,
-        False,
         cache_dir,
         inner_sampler,
     )
@@ -1030,7 +1036,6 @@ def train_cv_fold(
         outer_weights,
         batch_size,
         num_workers,
-        False,
         False,
         cache_dir,
         outer_sampler,
@@ -1099,6 +1104,7 @@ def train_cv_fold(
             sampled_slices_per_slot,
             window_size,
             training_window_stride,
+            augmentation,
             distributed,
         )
         inner_predictions, _ = predict_distributed(
@@ -1200,6 +1206,7 @@ def train_cv_fold(
                 "inner_validation_studies": len(inner_table),
                 "outer_gold_studies": len(outer_table),
                 "selection_window_stride": selection_window_stride,
+                "augmentation": augmentation.metadata(),
             },
         )
         fold_summary = {
@@ -1220,6 +1227,7 @@ def train_cv_fold(
             "model_source": str(model_source),
             "total_parameters": total_parameters,
             "trainable_parameters": trainable_parameters,
+            "augmentation": augmentation.metadata(),
             "distributed": {
                 "backend": distributed.backend,
                 "world_size": distributed.world_size,
@@ -1253,6 +1261,7 @@ def run_cross_validation_training(
     distributed: DistributedContext,
 ) -> int:
     """Train four grouped folds and write auditable OOF artifacts."""
+    augmentation = AugmentationConfig.from_mapping(config["augmentation"])
     input_path = competition_input(
         config["paths"]["input_root"],  # type: ignore[index]
         config["competition"]["input_slug"],  # type: ignore[index]
@@ -1507,6 +1516,7 @@ def run_cross_validation_training(
                 config["training"]["one_cycle_warmup_fraction"]  # type: ignore[index]
             ),
         },
+        "augmentation": augmentation.metadata(),
         "elapsed_seconds": elapsed,
         "folds": fold_summaries,
         "cross_validation": cv_summary,
@@ -1593,7 +1603,6 @@ def run_inference(
         None,
         int(config["training"]["inference_batch_size"]),  # type: ignore[index]
         int(config["training"]["num_workers"]),  # type: ignore[index]
-        False,
         False,
         data_config.get("dicom_cache_dir"),  # type: ignore[union-attr]
     )
@@ -1775,6 +1784,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     training_window_stride = int(
         config["data"]["training_window_stride"]
     )
+    augmentation = AugmentationConfig.from_mapping(config["augmentation"])
     inference_window_stride = int(
         config["data"]["inference_window_stride"]
     )
@@ -1828,7 +1838,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         batch_size,
         num_workers,
         True,
-        True,
         dicom_cache_dir,
     )
     validation_loader = make_loader(
@@ -1839,7 +1848,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         validation_weights,
         batch_size,
         num_workers,
-        False,
         False,
         dicom_cache_dir,
     )
@@ -1905,6 +1913,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             sampled_slices_per_slot,
             window_size,
             training_window_stride,
+            augmentation,
         )
         validation_predictions, validation_labels = predict(
             model,
@@ -1962,6 +1971,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "best_validation_score": best_score,
             "training_studies": len(training_records),
             "validation_studies": len(validation_records),
+            "augmentation": augmentation.metadata(),
         },
     )
     elapsed_seconds = time.monotonic() - started_at
@@ -1977,6 +1987,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "best_epoch": best_epoch,
         "time_limit_reached": time_limit_reached,
         "checkpoint": manifest,
+        "augmentation": augmentation.metadata(),
         "model": {
             **artifact_metadata,
             "source": str(model_source),

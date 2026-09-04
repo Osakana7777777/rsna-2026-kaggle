@@ -12,7 +12,7 @@ output_dir = "/kaggle/working/outputs"
 seed = 42
 
 [data]
-image_size = 224
+image_size = 336
 physical_fov_mm = 130.0
 sampled_slices_per_slot = 12
 window_size = 3

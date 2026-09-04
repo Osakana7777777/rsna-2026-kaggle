@@ -225,8 +225,10 @@ def build_dinov2_model(
 ) -> tuple[KneeAbnormalityModel, Path]:
     """Load a mounted DINOv2 model without any network access."""
     from transformers import AutoModel
+    from transformers.utils import logging as transformers_logging
 
     source = find_dinov2_source(input_root, variant)
+    transformers_logging.disable_progress_bar()
     backbone = AutoModel.from_pretrained(str(source), local_files_only=True)
     model = KneeAbnormalityModel(
         backbone=backbone,

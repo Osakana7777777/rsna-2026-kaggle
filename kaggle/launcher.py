@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import os
 import shutil
 import subprocess
@@ -32,6 +33,7 @@ def prepare_payload() -> Path:
 PAYLOAD_ROOT = prepare_payload()
 sys.path.insert(0, str(PAYLOAD_ROOT / "src"))
 
+from rsna2026.config import load_config  # noqa: E402
 from rsna2026.train import main as train_main  # noqa: E402
 
 
@@ -76,6 +78,35 @@ def run_payload() -> int:
         return train_main(arguments)
 
     environment = os.environ.copy()
+    config = load_config(arguments[1])
+    data_config = config["data"]
+    configured_cache = str(data_config.get("study_records_cache_path", ""))
+    configured_sha256 = str(data_config.get("study_records_cache_sha256", ""))
+    if bool(configured_cache) != bool(configured_sha256):
+        raise ValueError(
+            "Configured study-record cache path and SHA-256 must be set together"
+        )
+    if not configured_cache:
+        preparation_arguments = [
+            "--config",
+            arguments[1],
+            "--mode",
+            "prepare-selection-cache",
+        ]
+        preparation_exit_code = train_main(preparation_arguments)
+        if preparation_exit_code:
+            return preparation_exit_code
+        generated_cache = Path("/kaggle/working/outputs/slice-selection.json")
+        runtime_cache = Path("/tmp/rsna2026-slice-selection.json")
+        shutil.copyfile(generated_cache, runtime_cache)
+        cache_sha256 = hashlib.sha256(runtime_cache.read_bytes()).hexdigest()
+        environment["RSNA2026_STUDY_RECORDS_CACHE_PATH"] = str(runtime_cache)
+        environment["RSNA2026_STUDY_RECORDS_CACHE_SHA256"] = cache_sha256
+        print(
+            "Starting two-GPU training with the newly prepared physical-window "
+            f"selection cache: sha256={cache_sha256}",
+            flush=True,
+        )
     source_root = str(PAYLOAD_ROOT / "src")
     current_python_path = environment.get("PYTHONPATH")
     environment["PYTHONPATH"] = (

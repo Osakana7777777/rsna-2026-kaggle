@@ -1,8 +1,11 @@
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+
+torch = pytest.importorskip("torch")
 
 from rsna2026.dataset import (
     KneeStudyDataset,
@@ -11,7 +14,8 @@ from rsna2026.dataset import (
     preprocess_physical_fov,
     read_dicom,
 )
-from rsna2026.train import model_artifact_metadata
+from rsna2026.config import load_config
+from rsna2026.train import build_configured_model, model_artifact_metadata
 
 
 def test_center_crop_uses_row_and_column_spacing_independently() -> None:
@@ -79,7 +83,11 @@ def test_read_dicom_returns_finite_requested_shape(monkeypatch) -> None:
 
 
 def test_cache_identity_includes_physical_fov(tmp_path) -> None:
-    record = StudyRecord("study", (Path("slice.dcm"),))
+    record = StudyRecord(
+        "study",
+        ((Path("a.dcm"), Path("slice.dcm"), Path("b.dcm")),),
+        ((0.5, 1.0, 1.0),),
+    )
     crop_130 = KneeStudyDataset(
         [record], 224, 130.0, cache_dir=tmp_path
     )._cache_path(record)
@@ -95,11 +103,8 @@ def test_artifact_metadata_binds_physical_preprocessing() -> None:
         "data": {
             "image_size": 224,
             "physical_fov_mm": 130.0,
-            "sampled_slices_per_slot": 12,
+            "window_count": 10,
             "window_size": 3,
-            "training_window_stride": 3,
-            "inference_window_stride": 1,
-            "inference_window_pooling": "probability-mean",
             "series_classification": "dicom-header-v1",
             "slots": ["slot"],
         },
@@ -107,9 +112,10 @@ def test_artifact_metadata_binds_physical_preprocessing() -> None:
             "name": "dinov2-small",
             "variant": "small",
             "unfreeze_last": 6,
+            "gradient_checkpointing": True,
             "dropout": 0.25,
             "pooling": "cls-patch-mean",
-            "aggregation": "target-attention",
+            "aggregation": "hierarchical-target-attention",
             "attention_hidden_size": 256,
             "input_representation": "2.5d-slice-channels",
         },
@@ -119,3 +125,11 @@ def test_artifact_metadata_binds_physical_preprocessing() -> None:
     config["data"]["physical_fov_mm"] = 140.0
 
     assert model_artifact_metadata(config) != baseline
+
+
+def test_configured_model_rejects_legacy_window_settings() -> None:
+    config = deepcopy(load_config("configs/baseline.toml"))
+    config["data"]["sampled_slices_per_slot"] = 12
+
+    with pytest.raises(ValueError, match="Legacy window configuration"):
+        build_configured_model(config, torch.device("cpu"))

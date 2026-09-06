@@ -26,11 +26,12 @@ from rsna2026.acquisition import (
     read_acquisition_header,
     resolve_slots,
 )
-from rsna2026.slice_selection import central_band_indices, sample_ordered_paths
+from rsna2026.slice_selection import select_physical_windows
 
 
 ORDERING_WORKERS = 16
-PREPROCESSING_VERSION = "dicom-physical-fov-window-uint8-v3"
+PREPROCESSING_VERSION = "dicom-physical-fov-window-uint8-v4"
+SLICE_SELECTION_METHOD = "physical-adjacent-three-window-v1"
 
 
 @dataclass(frozen=True)
@@ -38,7 +39,8 @@ class StudyRecord:
     """Paths sampled from one MRI study."""
 
     study_uid: str
-    image_paths: tuple[Path | None, ...]
+    window_paths: tuple[tuple[Path | None, Path | None, Path | None], ...]
+    position_features: tuple[tuple[float, float, float], ...]
     selections: tuple["SeriesSelection", ...] = ()
     classifications: tuple["SeriesClassification", ...] = ()
 
@@ -74,9 +76,15 @@ class SeriesSelection:
     representative_path: str | None
     ordering_method: str
     total_slices: int
-    selected_indices: tuple[int, ...]
-    selected_relative_positions: tuple[float, ...]
-    selected_paths: tuple[str, ...]
+    physical_coverage_mm: float
+    median_spacing_mm: float
+    duplicate_positions: int
+    large_gaps: int
+    all_positions_mm: tuple[float, ...]
+    target_positions_mm: tuple[float, ...]
+    selected_center_positions_mm: tuple[float, ...]
+    selected_windows: tuple[tuple[str, str, str], ...]
+    position_features: tuple[tuple[float, float, float], ...]
 
 
 @dataclass(frozen=True)
@@ -95,16 +103,13 @@ def build_study_records(
     series_table: pd.DataFrame,
     image_root: Path,
     study_uids: Sequence[str],
-    sampled_slices_per_slot: int,
-    slice_band_start: float,
-    slice_band_end: float,
+    window_count: int,
     slot_names: Sequence[str],
     classification_method: str,
 ) -> list[StudyRecord]:
     """Classify series, fill fixed acquisition slots, and sample each stack."""
-    central_band_indices(
-        0, sampled_slices_per_slot, slice_band_start, slice_band_end
-    )
+    if window_count <= 0:
+        raise ValueError("Window count must be positive")
     if classification_method != CLASSIFICATION_METHOD:
         raise ValueError(
             f"Unsupported series classification method: {classification_method}"
@@ -220,12 +225,7 @@ def build_study_records(
 
     def sample_series(series_dir: Path):
         paths = list(series_dir.glob("*.dcm"))
-        return paths, sample_ordered_paths(
-            paths,
-            sampled_slices_per_slot,
-            slice_band_start,
-            slice_band_end,
-        )
+        return paths, select_physical_windows(paths, window_count)
 
     with ThreadPoolExecutor(max_workers=ORDERING_WORKERS) as pool:
         sampled_series = dict(
@@ -235,22 +235,26 @@ def build_study_records(
     records = []
     for uid in study_uids:
         study_uid = str(uid)
-        selected: list[Path | None] = []
+        selected: list[tuple[Path | None, Path | None, Path | None]] = []
+        position_features: list[tuple[float, float, float]] = []
         selections = []
         for slot in slots:
             candidate = chosen.get(study_uid, {}).get(slot.name)
             if candidate is None:
                 paths = []
-                sampled, method, indices, relative_positions = (
-                    [],
-                    "missing",
-                    (),
-                    (),
-                )
+                sample = select_physical_windows([], window_count)
             else:
                 paths, sample = sampled_series[candidate.series_dir]
-                sampled, method, indices, relative_positions = sample
-            selected.extend(sampled or [None] * sampled_slices_per_slot)
+            padded_windows = list(sample.windows)
+            padded_features = list(sample.position_features)
+            padded_windows.extend(
+                [(None, None, None)] * (window_count - len(padded_windows))
+            )
+            padded_features.extend(
+                [(0.0, 0.0, 0.0)] * (window_count - len(padded_features))
+            )
+            selected.extend(padded_windows)
+            position_features.extend(padded_features)
             series_uid = candidate.series_uid if candidate is not None else None
             acquisition = candidate.acquisition if candidate is not None else None
             selections.append(
@@ -279,20 +283,30 @@ def build_study_records(
                         if candidate is not None
                         else None
                     ),
-                    ordering_method=method,
+                    ordering_method=sample.method,
                     total_slices=len(paths),
-                    selected_indices=indices,
-                    selected_relative_positions=relative_positions,
-                    selected_paths=tuple(
-                        f"{study_uid}/{series_uid}/{path.name}"
-                        for path in sampled
+                    physical_coverage_mm=sample.coverage_mm,
+                    median_spacing_mm=sample.median_spacing_mm,
+                    duplicate_positions=sample.duplicate_positions,
+                    large_gaps=sample.large_gaps,
+                    all_positions_mm=sample.all_positions_mm,
+                    target_positions_mm=sample.target_positions_mm,
+                    selected_center_positions_mm=sample.center_positions_mm,
+                    selected_windows=tuple(
+                        tuple(
+                            f"{study_uid}/{series_uid}/{path.name}"
+                            for path in window
+                        )
+                        for window in sample.windows
                     ),
+                    position_features=sample.position_features,
                 )
             )
         records.append(
             StudyRecord(
                 study_uid,
                 tuple(selected),
+                tuple(position_features),
                 tuple(selections),
                 tuple(
                     sorted(
@@ -309,9 +323,7 @@ def load_study_records_cache(
     cache_path: Path,
     image_root: Path,
     study_uids: Sequence[str],
-    sampled_slices_per_slot: int,
-    slice_band_start: float,
-    slice_band_end: float,
+    window_count: int,
     slot_names: Sequence[str],
     classification_method: str,
     expected_sha256: str,
@@ -330,10 +342,12 @@ def load_study_records_cache(
         raise ValueError("Study-record cache classification method changed")
     if report.get("slots") != list(slot_names):
         raise ValueError("Study-record cache slot order changed")
-    if int(report.get("sampled_slices_per_slot", -1)) != sampled_slices_per_slot:
-        raise ValueError("Study-record cache sampled-slice count changed")
-    if report.get("slice_band") != [slice_band_start, slice_band_end]:
-        raise ValueError("Study-record cache slice band changed")
+    if report.get("slice_selection_method") != SLICE_SELECTION_METHOD:
+        raise ValueError("Study-record cache selection method changed")
+    if int(report.get("window_count", -1)) != window_count:
+        raise ValueError("Study-record cache window count changed")
+    if int(report.get("window_size", -1)) != 3:
+        raise ValueError("Study-record cache window size changed")
 
     split = report.get("splits", {}).get("all-training-studies", {})
     entries = split.get("studies", [])
@@ -353,20 +367,39 @@ def load_study_records_cache(
     for study_uid in expected_uids:
         entry = entries_by_uid[study_uid]
         selections = []
-        image_paths: list[Path | None] = []
+        window_paths: list[tuple[Path | None, Path | None, Path | None]] = []
+        position_features: list[tuple[float, float, float]] = []
         series_rows = entry.get("series", [])
         if [row.get("slot") for row in series_rows] != list(slot_names):
             raise ValueError(f"Cached slot order changed for study {study_uid}")
         for row in series_rows:
-            selected_paths = tuple(str(path) for path in row["selected_paths"])
+            selected_windows = tuple(
+                tuple(str(path) for path in window)
+                for window in row["selected_windows"]
+            )
+            features = tuple(
+                tuple(float(value) for value in feature)
+                for feature in row["position_features"]
+            )
             if row["series_uid"] is None:
-                if selected_paths:
-                    raise ValueError("Missing cached series contains selected paths")
-                image_paths.extend([None] * sampled_slices_per_slot)
+                if selected_windows:
+                    raise ValueError("Missing cached series contains selected windows")
             else:
-                if len(selected_paths) != sampled_slices_per_slot:
-                    raise ValueError("Cached series has an invalid selected-path count")
-                image_paths.extend(image_root / path for path in selected_paths)
+                if len(selected_windows) > window_count:
+                    raise ValueError("Cached series has too many selected windows")
+            if len(features) != len(selected_windows):
+                raise ValueError("Cached position-feature count changed")
+            window_paths.extend(
+                tuple(image_root / path for path in window)
+                for window in selected_windows
+            )
+            window_paths.extend(
+                [(None, None, None)] * (window_count - len(selected_windows))
+            )
+            position_features.extend(features)
+            position_features.extend(
+                [(0.0, 0.0, 0.0)] * (window_count - len(features))
+            )
             selections.append(
                 SeriesSelection(
                     slot=str(row["slot"]),
@@ -384,13 +417,22 @@ def load_study_records_cache(
                     representative_path=row["representative_path"],
                     ordering_method=str(row["ordering_method"]),
                     total_slices=int(row["total_slices"]),
-                    selected_indices=tuple(
-                        int(value) for value in row["selected_indices"]
+                    physical_coverage_mm=float(row["physical_coverage_mm"]),
+                    median_spacing_mm=float(row["median_spacing_mm"]),
+                    duplicate_positions=int(row["duplicate_positions"]),
+                    large_gaps=int(row["large_gaps"]),
+                    all_positions_mm=tuple(
+                        float(value) for value in row["all_positions_mm"]
                     ),
-                    selected_relative_positions=tuple(
-                        float(value) for value in row["selected_relative_positions"]
+                    target_positions_mm=tuple(
+                        float(value) for value in row["target_positions_mm"]
                     ),
-                    selected_paths=selected_paths,
+                    selected_center_positions_mm=tuple(
+                        float(value)
+                        for value in row["selected_center_positions_mm"]
+                    ),
+                    selected_windows=selected_windows,
+                    position_features=features,
                 )
             )
         classifications = tuple(
@@ -411,7 +453,8 @@ def load_study_records_cache(
         records.append(
             StudyRecord(
                 study_uid=study_uid,
-                image_paths=tuple(image_paths),
+                window_paths=tuple(window_paths),
+                position_features=tuple(position_features),
                 selections=tuple(selections),
                 classifications=classifications,
             )
@@ -526,7 +569,15 @@ def read_dicom(
 
 
 class KneeStudyDataset(
-    Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]
+    Dataset[
+        tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ]
+    ]
 ):
     """Load a fixed-size bag of MRI slices for each study."""
 
@@ -559,8 +610,22 @@ class KneeStudyDataset(
 
     def __getitem__(
         self, index: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        images, present = self._load_images(self.records[index])
+    ) -> tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
+        record = self.records[index]
+        images, present = self._load_images(record)
+        num_slots = len(record.selections)
+        if num_slots <= 0 or len(record.window_paths) % num_slots:
+            raise ValueError("Study record has an invalid window layout")
+        window_count = len(record.window_paths) // num_slots
+        images = images.reshape(
+            num_slots, window_count, 3, self.image_size, self.image_size
+        )
+        present = present.reshape(num_slots, window_count)
+        positions = torch.tensor(record.position_features, dtype=torch.float32).reshape(
+            num_slots, window_count, 3
+        )
 
         label = (
             torch.from_numpy(self.labels[index]).float()
@@ -572,45 +637,44 @@ class KneeStudyDataset(
             if self.label_weights is not None
             else torch.empty(0)
         )
-        return images, present, label, label_weight
+        return images, present, positions, label, label_weight
 
     def _load_images(self, record: StudyRecord) -> tuple[torch.Tensor, torch.Tensor]:
         """Load one study, reusing an ephemeral preprocessed cache when enabled."""
+        flat_paths = [path for window in record.window_paths for path in window]
+        unique_paths = tuple(
+            dict.fromkeys(path for path in flat_paths if path is not None)
+        )
+        path_indices = {path: index for index, path in enumerate(unique_paths)}
+        inverse = tuple(
+            path_indices[path] if path is not None else -1 for path in flat_paths
+        )
         cache_path = self._cache_path(record)
         if cache_path is not None and cache_path.is_file():
             try:
                 with np.load(cache_path, allow_pickle=False) as cached:
-                    present = torch.from_numpy(cached["present"].astype(np.bool_))
+                    unique_present = torch.from_numpy(
+                        cached["present"].astype(np.bool_)
+                    )
                     present_images = torch.from_numpy(
                         np.asarray(cached["images"], dtype=np.float32)
                     ).div_(255.0)
-                image_shape = (
-                    1,
-                    self.image_size,
-                    self.image_size,
-                )
-                if tuple(present.shape) != (
-                    len(record.image_paths),
-                ) or tuple(present_images.shape) != (
-                    int(present.sum()),
-                    *image_shape,
-                ):
+                image_shape = (1, self.image_size, self.image_size)
+                if tuple(unique_present.shape) != (len(unique_paths),) or tuple(
+                    present_images.shape
+                ) != (int(unique_present.sum()), *image_shape):
                     raise ValueError("cached tensor shape does not match the study")
-                images = torch.zeros((len(present), *image_shape))
-                images[present] = present_images
-                return images, present
+                unique_images = torch.zeros((len(unique_paths), *image_shape))
+                unique_images[unique_present] = present_images
+                return self._assemble_windows(unique_images, unique_present, inverse)
             except (OSError, ValueError, KeyError) as error:
                 print(f"Warning: ignoring invalid DICOM cache {cache_path}: {error}")
 
         images = []
         present = []
-        for path in record.image_paths:
+        for path in unique_paths:
             try:
-                image = (
-                    read_dicom(path, self.image_size, self.physical_fov_mm)
-                    if path is not None
-                    else None
-                )
+                image = read_dicom(path, self.image_size, self.physical_fov_mm)
             except Exception as error:
                 print(f"Warning: failed to decode {path}: {error}", flush=True)
                 image = None
@@ -620,11 +684,34 @@ class KneeStudyDataset(
             else:
                 present.append(True)
             images.append(image.float())
-        image_tensor = torch.stack(images)
+        image_tensor = (
+            torch.stack(images)
+            if images
+            else torch.empty((0, 1, self.image_size, self.image_size))
+        )
         present_tensor = torch.tensor(present)
         if cache_path is not None:
             self._write_cache(cache_path, image_tensor, present_tensor)
-        return image_tensor, present_tensor
+        return self._assemble_windows(image_tensor, present_tensor, inverse)
+
+    def _assemble_windows(
+        self,
+        unique_images: torch.Tensor,
+        unique_present: torch.Tensor,
+        inverse: Sequence[int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        images = torch.zeros(
+            (len(inverse), 1, self.image_size, self.image_size),
+            dtype=torch.float32,
+        )
+        channels_present = torch.zeros(len(inverse), dtype=torch.bool)
+        for output_index, source_index in enumerate(inverse):
+            if source_index >= 0 and bool(unique_present[source_index]):
+                images[output_index] = unique_images[source_index]
+                channels_present[output_index] = True
+        return images.reshape(-1, 3, self.image_size, self.image_size), (
+            channels_present.reshape(-1, 3).all(dim=1)
+        )
 
     def _cache_path(self, record: StudyRecord) -> Path | None:
         if self.cache_dir is None:
@@ -636,7 +723,8 @@ class KneeStudyDataset(
                 str(self.physical_fov_mm),
                 *(
                     str(path) if path is not None else "<missing>"
-                    for path in record.image_paths
+                    for window in record.window_paths
+                    for path in window
                 ),
             ]
         )
@@ -653,7 +741,7 @@ class KneeStudyDataset(
         )
         try:
             with temporary.open("wb") as file:
-                np.savez(
+                np.savez_compressed(
                     file,
                     images=(images[present].mul(255.0).round().byte().numpy()),
                     present=present.numpy().astype(np.bool_),

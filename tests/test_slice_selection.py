@@ -7,6 +7,7 @@ from rsna2026.slice_selection import (
     central_band_indices,
     order_slice_paths,
     sample_ordered_paths,
+    select_physical_windows,
 )
 
 
@@ -156,3 +157,67 @@ def test_sampling_reports_method_indices_and_relative_positions() -> None:
     assert indices == (2, 5, 7)
     assert [path.name for path in selected] == ["02.dcm", "05.dcm", "07.dcm"]
     assert relative == pytest.approx((2 / 9, 5 / 9, 7 / 9))
+
+
+def test_physical_windows_are_adjacent_unique_and_span_irregular_positions() -> None:
+    paths = [Path(f"slice-{index}.dcm") for index in range(14)]
+    coordinates = [
+        0.0, 1.0, 2.0, 3.0, 5.0, 8.0, 9.0,
+        10.0, 14.0, 15.0, 18.0, 22.0, 23.0, 27.0,
+    ]
+    headers = {
+        path.name: header(
+            (0.0, 0.0, coordinate), (1, 0, 0, 0, 1, 0), 0
+        )
+        for path, coordinate in zip(paths, coordinates)
+    }
+
+    selected = select_physical_windows(
+        paths[::-1], 10, lambda path: headers[path.name]
+    )
+
+    assert selected.method == "physical-coordinate-v1"
+    assert len(selected.windows) == 10
+    assert len(set(selected.windows)) == 10
+    for window in selected.windows:
+        indices = [paths.index(path) for path in window]
+        assert indices == list(range(indices[0], indices[0] + 3))
+    assert selected.center_positions_mm == tuple(
+        sorted(selected.center_positions_mm)
+    )
+    assert selected.position_features[0][0] == pytest.approx(0.0)
+    assert selected.position_features[-1][0] == pytest.approx(1.0)
+
+
+def test_physical_windows_keep_short_series_without_repeating_windows() -> None:
+    paths = [Path(f"slice-{index}.dcm") for index in range(5)]
+
+    selected = select_physical_windows(
+        paths,
+        10,
+        lambda path: header(
+            (0.0, 0.0, float(paths.index(path) * 3)),
+            (1, 0, 0, 0, 1, 0),
+            0,
+        ),
+    )
+
+    assert len(selected.windows) == 3
+    assert len(set(selected.windows)) == 3
+
+
+def test_physical_windows_reject_missing_or_duplicate_geometry() -> None:
+    paths = [Path(f"slice-{index}.dcm") for index in range(3)]
+    missing = select_physical_windows(
+        paths, 10, lambda path: header(None, None, 1)
+    )
+    duplicate = select_physical_windows(
+        paths,
+        10,
+        lambda path: header((0, 0, 0), (1, 0, 0, 0, 1, 0), 1),
+    )
+
+    assert missing.windows == ()
+    assert missing.method == "invalid-geometry:orientation"
+    assert duplicate.windows == ()
+    assert duplicate.method == "invalid-geometry:duplicate-position"

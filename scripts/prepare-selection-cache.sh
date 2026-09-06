@@ -11,11 +11,12 @@ find "${cache_build_dir}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 
 cp "${PROJECT_ROOT}/kaggle/selection-cache-dataset-metadata.json" \
   "${cache_build_dir}/dataset-metadata.json"
+selection_source="${PROJECT_ROOT}/outputs/train/outputs/slice-selection.json"
+selection_sha256="$(shasum -a 256 "${selection_source}" | awk '{print $1}')"
 UV_CACHE_DIR="${TMPDIR:-/tmp}/rsna-2026-kaggle-uv-cache" \
   uv run --no-project python "${PROJECT_ROOT}/scripts/build_selection_cache.py" \
-    --source "${PROJECT_ROOT}/outputs/train/outputs/slice-selection.json" \
+    --source "${selection_source}" \
     --output "${cache_build_dir}/slice-selection.json.xz" \
-    --expected-sha256 \
-      "8d691f5f58a19f9c0b4196103267844fdb65996b4c0ab29d3749328123b03a75"
+    --expected-sha256 "${selection_sha256}"
 
 echo "Prepared private Kaggle dataset at ${cache_build_dir}"

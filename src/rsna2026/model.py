@@ -77,6 +77,101 @@ class TargetAttentionHead(nn.Module):
         )
 
 
+class HierarchicalTargetAttentionHead(nn.Module):
+    """Attend to physical windows and acquisition slots for every target."""
+
+    def __init__(
+        self,
+        feature_size: int,
+        hidden_size: int,
+        num_slots: int,
+        num_targets: int,
+        position_size: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        self.window_projection = nn.Sequential(
+            nn.LayerNorm(feature_size),
+            nn.Linear(feature_size, hidden_size),
+            nn.GELU(),
+        )
+        self.position_projection = nn.Sequential(
+            nn.Linear(position_size, hidden_size), nn.GELU()
+        )
+        self.window_query = nn.Parameter(
+            torch.randn(num_targets, hidden_size) * 0.02
+        )
+        self.slot_projection = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+        )
+        self.slot_embedding = nn.Parameter(
+            torch.randn(num_slots, hidden_size) * 0.02
+        )
+        self.slot_query = nn.Parameter(
+            torch.randn(num_targets, hidden_size) * 0.02
+        )
+        self.output_weight = nn.Parameter(
+            torch.randn(num_targets, hidden_size) * 0.02
+        )
+        self.output_bias = nn.Parameter(torch.zeros(num_targets))
+        self.dropout = nn.Dropout(dropout)
+        self.hidden_size = hidden_size
+        self.num_slots = num_slots
+        self.num_targets = num_targets
+        self.position_size = position_size
+
+    @staticmethod
+    def _masked_softmax(scores: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        weights = torch.softmax(scores.masked_fill(~mask, -1e4), dim=-1)
+        weights = weights * mask.to(weights.dtype)
+        return weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+    def forward(
+        self,
+        window_features: torch.Tensor,
+        window_present: torch.Tensor,
+        position_features: torch.Tensor,
+        return_attention: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size, num_slots, _, _ = window_features.shape
+        if num_slots != self.num_slots:
+            raise ValueError(f"Expected {self.num_slots} slots, received {num_slots}")
+        if window_present.shape != window_features.shape[:3]:
+            raise ValueError("Window mask shape does not match window features")
+        if position_features.shape != (*window_features.shape[:3], self.position_size):
+            raise ValueError("Position feature shape does not match windows")
+        hidden = self.window_projection(window_features)
+        hidden = hidden + self.position_projection(position_features)
+        window_scores = torch.einsum(
+            "bswh,th->btsw", hidden, self.window_query
+        ) / math.sqrt(self.hidden_size)
+        window_mask = window_present.to(torch.bool).unsqueeze(1)
+        window_attention = self._masked_softmax(window_scores, window_mask)
+        slot_context = torch.einsum(
+            "btsw,bswh->btsh", window_attention, hidden
+        )
+        slot_hidden = self.slot_projection(slot_context)
+        slot_hidden = slot_hidden + self.slot_embedding.view(
+            1, 1, self.num_slots, self.hidden_size
+        )
+        slot_present = window_present.any(dim=-1).unsqueeze(1)
+        slot_scores = (
+            slot_hidden * self.slot_query.view(1, self.num_targets, 1, -1)
+        ).sum(dim=-1) / math.sqrt(self.hidden_size)
+        slot_attention = self._masked_softmax(slot_scores, slot_present)
+        study_context = self.dropout(
+            torch.einsum("bts,btsh->bth", slot_attention, slot_hidden)
+        )
+        logits = (
+            study_context * self.output_weight.unsqueeze(0)
+        ).sum(dim=-1) + self.output_bias
+        if return_attention:
+            return logits, window_attention, slot_attention
+        return logits
+
+
 def find_dinov2_source(input_root: str | Path, variant: str) -> Path:
     """Find exactly one mounted local DINOv2 model of the requested variant."""
     root = Path(input_root)
@@ -113,6 +208,7 @@ class KneeAbnormalityModel(nn.Module):
         unfreeze_last: int,
         dropout: float,
         num_slots: int,
+        window_count: int,
         slices_per_slot: int,
         attention_hidden_size: int,
     ) -> None:
@@ -123,6 +219,8 @@ class KneeAbnormalityModel(nn.Module):
             raise ValueError("Slices per slot must be positive")
         if slices_per_slot != 3:
             raise ValueError("2.5D input requires exactly three slices per slot")
+        if window_count <= 0:
+            raise ValueError("Window count must be positive")
         self.backbone = backbone
         layers = self._encoder_layers()
         if unfreeze_last > len(layers):
@@ -142,16 +240,19 @@ class KneeAbnormalityModel(nn.Module):
 
         hidden_size = int(self.backbone.config.hidden_size)
         feature_size = hidden_size * 2
-        self.head = TargetAttentionHead(
+        self.head = HierarchicalTargetAttentionHead(
             feature_size=feature_size,
+            hidden_size=attention_hidden_size,
             num_slots=num_slots,
             num_targets=num_targets,
-            hidden_size=attention_hidden_size,
+            position_size=3,
             dropout=dropout,
         )
         self.unfreeze_last = unfreeze_last
         self.feature_size = feature_size
         self.num_slots = num_slots
+        self.window_count = window_count
+        self.num_targets = num_targets
         self.slices_per_slot = slices_per_slot
         self.register_buffer(
             "image_mean", torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1)
@@ -167,31 +268,25 @@ class KneeAbnormalityModel(nn.Module):
             raise TypeError("DINOv2 backbone does not expose encoder.layer")
         return layers
 
-    def forward(self, images: torch.Tensor, present: torch.Tensor) -> torch.Tensor:
-        batch_size, num_views, channels, height, width = images.shape
-        if channels != 1:
-            raise ValueError(f"Expected one grayscale channel, received {channels}")
-        expected_views = self.num_slots * self.slices_per_slot
-        if num_views != expected_views:
-            raise ValueError(
-                f"Expected {expected_views} views, received {num_views}"
-            )
-        if present.shape != (batch_size, num_views):
-            raise ValueError(
-                f"Expected presence shape {(batch_size, num_views)}, "
-                f"received {tuple(present.shape)}"
-            )
-        slice_present = present.reshape(
-            batch_size, self.num_slots, self.slices_per_slot
-        ).to(dtype=torch.bool)
-        slot_present = slice_present.any(dim=2)
-        slot_images = images.reshape(
-            batch_size, self.num_slots, self.slices_per_slot, height, width
-        )
-        pixels = slot_images[slot_present]
+    def forward(
+        self,
+        images: torch.Tensor,
+        present: torch.Tensor,
+        positions: torch.Tensor,
+        return_attention: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if images.ndim != 6:
+            raise ValueError("Expected [batch, slots, windows, 3, height, width]")
+        batch_size, num_slots, windows, channels, height, width = images.shape
+        expected = (self.num_slots, self.window_count, self.slices_per_slot)
+        if (num_slots, windows, channels) != expected:
+            raise ValueError(f"Expected slot/window/channel shape {expected}")
+        if present.shape != (batch_size, self.num_slots, self.window_count):
+            raise ValueError("Window presence shape does not match images")
+        if positions.shape != (batch_size, self.num_slots, self.window_count, 3):
+            raise ValueError("Window position shape does not match images")
+        pixels = images[present.to(torch.bool)]
         pixels = (pixels - self.image_mean) / self.image_std
-        channel_present = slice_present[slot_present].to(pixels.dtype)
-        pixels = pixels * channel_present.view(-1, 3, 1, 1)
         if pixels.shape[0]:
             tokens = self.backbone(pixel_values=pixels).last_hidden_state
             if tokens.shape[1] < 2:
@@ -200,17 +295,22 @@ class KneeAbnormalityModel(nn.Module):
                 (tokens[:, 0], tokens[:, 1:].mean(dim=1)), dim=1
             )
             features = encoded.new_zeros(
-                (batch_size * self.num_slots, self.feature_size)
+                (batch_size * self.num_slots * self.window_count, self.feature_size)
             )
-            features[slot_present.reshape(-1)] = encoded
+            features[present.reshape(-1).to(torch.bool)] = encoded
         else:
+            dummy_tokens = self.backbone(
+                pixel_values=images.new_zeros((1, 3, height, width))
+            ).last_hidden_state
             features = images.new_zeros(
-                (batch_size * self.num_slots, self.feature_size)
-            )
-        slot_features = features.reshape(
-            batch_size, self.num_slots, self.feature_size
+                (batch_size * self.num_slots * self.window_count, self.feature_size)
+            ) + dummy_tokens.sum() * 0.0
+        window_features = features.reshape(
+            batch_size, self.num_slots, self.window_count, self.feature_size
         )
-        return self.head(slot_features, slot_present)
+        return self.head(
+            window_features, present, positions, return_attention=return_attention
+        )
 
 
 def build_dinov2_model(
@@ -220,8 +320,10 @@ def build_dinov2_model(
     unfreeze_last: int,
     dropout: float,
     num_slots: int,
+    window_count: int,
     slices_per_slot: int,
     attention_hidden_size: int,
+    gradient_checkpointing: bool,
 ) -> tuple[KneeAbnormalityModel, Path]:
     """Load a mounted DINOv2 model without any network access."""
     from transformers import AutoModel
@@ -230,12 +332,19 @@ def build_dinov2_model(
     source = find_dinov2_source(input_root, variant)
     transformers_logging.disable_progress_bar()
     backbone = AutoModel.from_pretrained(str(source), local_files_only=True)
+    checkpointing = getattr(backbone, "gradient_checkpointing_enable", None)
+    if gradient_checkpointing and callable(checkpointing):
+        try:
+            checkpointing({"use_reentrant": False})
+        except TypeError:
+            checkpointing()
     model = KneeAbnormalityModel(
         backbone=backbone,
         num_targets=num_targets,
         unfreeze_last=unfreeze_last,
         dropout=dropout,
         num_slots=num_slots,
+        window_count=window_count,
         slices_per_slot=slices_per_slot,
         attention_hidden_size=attention_hidden_size,
     )

@@ -10,7 +10,7 @@
   "resources": [
     {
       "path": "slice-selection.json.xz",
-      "description": "XZ-compressed, SHA-256-pinned v21 DICOM series and slice selections. Contains metadata and relative paths only; no image pixels."
+      "description": "XZ-compressed physical-coordinate adjacent-window selections. Contains metadata and relative paths only; no image pixels."
     }
   ]
 }

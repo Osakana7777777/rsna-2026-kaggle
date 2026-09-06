@@ -47,6 +47,7 @@ required_files=(
   "tests/test_study_records_cache.py"
   "tests/test_physical_crop.py"
   "tests/test_augmentation.py"
+  "tests/test_dense_windows.py"
   "submissions/README.md"
   "submissions/TEMPLATE.md"
 )

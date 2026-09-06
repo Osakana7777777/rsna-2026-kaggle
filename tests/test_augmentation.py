@@ -10,6 +10,7 @@ torch = pytest.importorskip("torch")
 from rsna2026.augmentation import (  # noqa: E402
     AugmentationConfig,
     augment_2_5d_slots,
+    augment_dense_windows,
 )
 
 
@@ -120,6 +121,28 @@ def test_augmentation_is_reproducible_for_a_fixed_seed() -> None:
     second = augment_2_5d_slots(images, present, 2, 3, config)
 
     assert torch.equal(first, second)
+
+
+def test_dense_windows_share_slot_transform_and_mask_missing_windows() -> None:
+    pattern = torch.zeros((12, 12))
+    pattern[2:7, 4:9] = 1.0
+    images = pattern.repeat(1, 2, 4, 3, 1, 1)
+    present = torch.tensor([[[True, True, False, True], [True] * 4]])
+    config = replace(
+        zero_probability_config(),
+        rotation_probability=1.0,
+        affine_probability=1.0,
+        noise_probability=1.0,
+        noise_std_max=0.02,
+    )
+
+    torch.manual_seed(31)
+    augmented = augment_dense_windows(images, present, config)
+
+    assert augmented.shape == images.shape
+    assert torch.count_nonzero(augmented[0, 0, 2]) == 0
+    assert torch.equal(augmented[0, 0, 0, 0], augmented[0, 0, 1, 0])
+    assert not torch.equal(augmented[0, 0, 0, 0], augmented[0, 1, 0, 0])
 
 
 @pytest.mark.parametrize(

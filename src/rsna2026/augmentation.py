@@ -318,3 +318,63 @@ def augment_2_5d_slots(
     augmented = _apply_blur(augmented, config).clamp(0.0, 1.0)
     augmented = augmented * slot_present
     return augmented.reshape(batch_size, num_views, 1, height, width)
+
+
+def augment_dense_windows(
+    images: torch.Tensor,
+    present: torch.Tensor,
+    config: AugmentationConfig,
+) -> torch.Tensor:
+    """Apply one synchronized transform to every window in an acquisition slot."""
+    if not config.is_active():
+        return images
+    if images.ndim != 6 or images.shape[3] != 3:
+        raise ValueError("Expected [batch, slots, windows, 3, height, width]")
+    batch_size, num_slots, window_count, channels, height, width = images.shape
+    if present.shape != (batch_size, num_slots, window_count):
+        raise ValueError("Window mask shape does not match dense windows")
+    if height <= max(config.blur_kernel_sizes) // 2 or width <= max(
+        config.blur_kernel_sizes
+    ) // 2:
+        raise ValueError("Images are too small for configured reflection padding")
+
+    slot_images = images.reshape(
+        batch_size * num_slots, window_count * channels, height, width
+    )
+    augmented = _apply_affine(slot_images, config)
+    count = len(augmented)
+    intensity_mask = torch.rand(count, device=images.device) < (
+        config.brightness_contrast_probability
+    )
+    brightness = _uniform(
+        count, -config.brightness_limit, config.brightness_limit, images
+    )
+    contrast = _uniform(
+        count, 1.0 - config.contrast_limit, 1.0 + config.contrast_limit, images
+    )
+    brightness = torch.where(intensity_mask, brightness, torch.zeros_like(brightness))
+    contrast = torch.where(intensity_mask, contrast, torch.ones_like(contrast))
+    augmented = (
+        (augmented - 0.5) * contrast[:, None, None, None]
+        + 0.5
+        + brightness[:, None, None, None]
+    ).clamp(0.0, 1.0)
+    gamma_mask = torch.rand(count, device=images.device) < config.gamma_probability
+    gamma = _uniform(count, config.gamma_min, config.gamma_max, images)
+    gamma = torch.where(gamma_mask, gamma, torch.ones_like(gamma))
+    augmented = augmented.pow(gamma[:, None, None, None])
+    noise_mask = torch.rand(count, device=images.device) < config.noise_probability
+    noise_std = _uniform(count, 0.0, config.noise_std_max, images)
+    noise_std = torch.where(noise_mask, noise_std, torch.zeros_like(noise_std))
+    shared_noise = torch.randn(
+        (count, 1, height, width), device=images.device, dtype=images.dtype
+    )
+    augmented = augmented + shared_noise * noise_std[:, None, None, None]
+    augmented = _apply_blur(augmented, config).clamp(0.0, 1.0)
+    window_mask = present.reshape(
+        batch_size * num_slots, window_count, 1, 1, 1
+    ).to(augmented.dtype)
+    augmented = augmented.reshape(
+        batch_size * num_slots, window_count, channels, height, width
+    )
+    return (augmented * window_mask).reshape_as(images)

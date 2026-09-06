@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gc
 import json
 import lzma
@@ -16,6 +17,7 @@ from collections import Counter
 from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from statistics import median
 
 import numpy as np
 import pandas as pd
@@ -27,7 +29,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler, Sampler
 
 from rsna2026.acquisition import CLASSIFICATION_METHOD, SLOT_NAMES
-from rsna2026.augmentation import AugmentationConfig, augment_2_5d_slots
+from rsna2026.augmentation import AugmentationConfig, augment_dense_windows
 from rsna2026.checkpoint import (
     file_sha256,
     resolve_input_file,
@@ -45,6 +47,7 @@ from rsna2026.cross_validation import (
 from rsna2026.data import competition_input
 from rsna2026.dataset import (
     PREPROCESSING_VERSION,
+    SLICE_SELECTION_METHOD,
     KneeStudyDataset,
     StudyRecord,
     build_study_records,
@@ -70,9 +73,29 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run an RSNA 2026 experiment")
     parser.add_argument("--config", required=True, help="Path to a TOML config")
     parser.add_argument(
-        "--mode", choices=("train", "inference"), required=True
+        "--mode",
+        choices=("train", "inference", "prepare-selection-cache"),
+        required=True,
     )
     return parser.parse_args(argv)
+
+
+def apply_study_records_cache_environment(config: dict[str, object]) -> None:
+    """Apply a cache prepared immediately before distributed training."""
+    cache_path = os.environ.get("RSNA2026_STUDY_RECORDS_CACHE_PATH", "")
+    cache_sha256 = os.environ.get("RSNA2026_STUDY_RECORDS_CACHE_SHA256", "")
+    if bool(cache_path) != bool(cache_sha256):
+        raise ValueError(
+            "Study-record cache path and SHA-256 environment variables must "
+            "be set together"
+        )
+    if not cache_path:
+        return
+    data_config = config.get("data")
+    if not isinstance(data_config, dict):
+        raise TypeError("Data configuration must be a table")
+    data_config["study_records_cache_path"] = cache_path
+    data_config["study_records_cache_sha256"] = cache_sha256
 
 
 def seed_everything(seed: int) -> None:
@@ -475,57 +498,61 @@ def train_epoch(
     scaler: torch.amp.GradScaler,
     device: torch.device,
     target_weights: torch.Tensor,
-    num_slots: int,
-    sampled_slices_per_slot: int,
-    window_size: int,
-    training_window_stride: int,
     augmentation: AugmentationConfig,
+    gradient_accumulation_steps: int,
     distributed: DistributedContext | None = None,
 ) -> float:
     model.train()
     total_loss = 0.0
     total_batches = 0
-    starts = slice_window_starts(
-        sampled_slices_per_slot, window_size, training_window_stride
-    )
-    for images, present, labels, label_weights in loader:
-        start_index = torch.randint(len(starts), (1,), device=device)
-        if distributed is not None and distributed.enabled:
-            dist.broadcast(start_index, src=0)
-        start = starts[int(start_index.item())]
-        images, present = select_slice_window(
-            images,
-            present,
-            num_slots,
-            sampled_slices_per_slot,
-            window_size,
-            start,
-        )
+    if gradient_accumulation_steps <= 0:
+        raise ValueError("Gradient accumulation steps must be positive")
+    optimizer.zero_grad(set_to_none=True)
+    for batch_index, (images, present, positions, labels, label_weights) in enumerate(
+        loader
+    ):
         images = images.to(device, non_blocking=True)
         present = present.to(device, non_blocking=True)
-        images = augment_2_5d_slots(
-            images,
-            present,
-            num_slots,
-            window_size,
-            augmentation,
-        )
+        positions = positions.to(device, non_blocking=True)
+        images = augment_dense_windows(images, present, augmentation)
         labels = labels.to(device, non_blocking=True)
         label_weights = label_weights.to(device, non_blocking=True)
         valid = torch.isfinite(labels) & torch.isfinite(label_weights)
         targets = torch.nan_to_num(labels, nan=0.0)
         weights = torch.where(valid, label_weights, 0.0)
-        optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
-            logits = model(images, present)
+        should_step = (
+            (batch_index + 1) % gradient_accumulation_steps == 0
+            or batch_index + 1 == len(loader)
+        )
+        sync_context = contextlib.nullcontext()
+        if (
+            distributed is not None
+            and distributed.enabled
+            and not should_step
+            and hasattr(model, "no_sync")
+        ):
+            sync_context = model.no_sync()
+        with sync_context, torch.autocast(
+            device_type=device.type, enabled=device.type == "cuda"
+        ):
+            logits = model(images, present, positions)
             losses = functional.binary_cross_entropy_with_logits(
                 logits, targets, reduction="none", pos_weight=target_weights
             )
             loss = (losses * weights).sum() / weights.sum().clamp_min(1.0)
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        scheduler.step()
+            group_start = (
+                batch_index // gradient_accumulation_steps
+            ) * gradient_accumulation_steps
+            group_size = min(
+                gradient_accumulation_steps, len(loader) - group_start
+            )
+            backward_loss = loss / group_size
+        scaler.scale(backward_loss).backward()
+        if should_step:
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
         total_loss += float(loss.detach().cpu())
         total_batches += 1
     totals = torch.tensor(
@@ -541,45 +568,24 @@ def predict(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
-    num_slots: int,
-    sampled_slices_per_slot: int,
-    window_size: int,
-    inference_window_stride: int,
-) -> tuple[np.ndarray, np.ndarray | None]:
-    """Average per-window probabilities over an ordered slice stack."""
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray, np.ndarray]:
+    """Predict once from all physical windows and return attention weights."""
     model.eval()
     predictions = []
     labels = []
-    starts = slice_window_starts(
-        sampled_slices_per_slot, window_size, inference_window_stride
-    )
-    for images, present, batch_labels, _ in loader:
-        probability_sum = None
-        for start in starts:
-            window_images, window_present = select_slice_window(
-                images,
-                present,
-                num_slots,
-                sampled_slices_per_slot,
-                window_size,
-                start,
+    window_attentions = []
+    slot_attentions = []
+    for images, present, positions, batch_labels, _ in loader:
+        with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
+            logits, window_attention, slot_attention = model(
+                images.to(device, non_blocking=True),
+                present.to(device, non_blocking=True),
+                positions.to(device, non_blocking=True),
+                return_attention=True,
             )
-            with torch.autocast(
-                device_type=device.type, enabled=device.type == "cuda"
-            ):
-                logits = model(
-                    window_images.to(device, non_blocking=True),
-                    window_present.to(device, non_blocking=True),
-                )
-            probabilities = torch.sigmoid(logits.float())
-            probability_sum = (
-                probabilities
-                if probability_sum is None
-                else probability_sum + probabilities
-            )
-        if probability_sum is None:
-            raise RuntimeError("No inference slice windows were generated")
-        predictions.append((probability_sum / len(starts)).cpu().numpy())
+        predictions.append(torch.sigmoid(logits.float()).cpu().numpy())
+        window_attentions.append(window_attention.float().cpu().numpy())
+        slot_attentions.append(slot_attention.float().cpu().numpy())
         if batch_labels.numel():
             labels.append(batch_labels.numpy())
     prediction_array = (
@@ -588,7 +594,12 @@ def predict(
         else np.empty((0, len(TARGETS)))
     )
     label_array = np.concatenate(labels) if labels else None
-    return prediction_array, label_array
+    return (
+        prediction_array,
+        label_array,
+        np.concatenate(window_attentions),
+        np.concatenate(slot_attentions),
+    )
 
 
 def predict_distributed(
@@ -597,88 +608,43 @@ def predict_distributed(
     sampler: DistributedEvaluationSampler,
     expected_size: int,
     device: torch.device,
-    num_slots: int,
-    sampled_slices_per_slot: int,
-    window_size: int,
-    inference_window_stride: int,
     distributed: DistributedContext,
-) -> tuple[np.ndarray | None, np.ndarray | None]:
+) -> tuple[
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+]:
     """Predict one non-overlapping shard and restore order on rank zero."""
-    predictions, labels = predict(
-        unwrap_model(model),
-        loader,
-        device,
-        num_slots,
-        sampled_slices_per_slot,
-        window_size,
-        inference_window_stride,
+    predictions, labels, window_attention, slot_attention = predict(
+        unwrap_model(model), loader, device
     )
-    local = (list(sampler), predictions, labels)
+    local = (list(sampler), predictions, labels, window_attention, slot_attention)
     gathered: list[
-        tuple[Sequence[int], np.ndarray, np.ndarray | None] | None
+        tuple[
+            Sequence[int], np.ndarray, np.ndarray | None, np.ndarray, np.ndarray
+        ]
+        | None
     ] = [None] * distributed.world_size
     dist.all_gather_object(gathered, local)
     if not distributed.primary:
-        return None, None
+        return None, None, None, None
     complete = [shard for shard in gathered if shard is not None]
-    return merge_prediction_shards(complete, expected_size)
-
-
-def slice_window_starts(
-    sampled_slices_per_slot: int, window_size: int, stride: int
-) -> tuple[int, ...]:
-    """Return valid starts for fixed-width ordered slice windows."""
-    if sampled_slices_per_slot <= 0:
-        raise ValueError("Sampled slices per slot must be positive")
-    if window_size <= 0 or window_size > sampled_slices_per_slot:
-        raise ValueError("Window size must be within the sampled slice count")
-    if stride <= 0:
-        raise ValueError("Window stride must be positive")
-    return tuple(
-        range(0, sampled_slices_per_slot - window_size + 1, stride)
+    merged_predictions, merged_labels = merge_prediction_shards(
+        [(indices, values, labels) for indices, values, labels, _, _ in complete],
+        expected_size,
     )
-
-
-def select_slice_window(
-    images: torch.Tensor,
-    present: torch.Tensor,
-    num_slots: int,
-    sampled_slices_per_slot: int,
-    window_size: int,
-    start: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Extract the same consecutive slice window from every acquisition slot."""
-    if images.ndim != 5:
-        raise ValueError(f"Expected five-dimensional images, received {images.shape}")
-    batch_size, num_views, channels, height, width = images.shape
-    expected_views = num_slots * sampled_slices_per_slot
-    if num_views != expected_views:
-        raise ValueError(
-            f"Expected {expected_views} sampled views, received {num_views}"
-        )
-    if present.shape != (batch_size, num_views):
-        raise ValueError(
-            f"Expected presence shape {(batch_size, num_views)}, "
-            f"received {tuple(present.shape)}"
-        )
-    if start < 0 or start + window_size > sampled_slices_per_slot:
-        raise ValueError("Slice window lies outside the sampled stack")
-    window_images = images.reshape(
-        batch_size,
-        num_slots,
-        sampled_slices_per_slot,
-        channels,
-        height,
-        width,
-    )[:, :, start : start + window_size]
-    window_present = present.reshape(
-        batch_size, num_slots, sampled_slices_per_slot
-    )[:, :, start : start + window_size]
+    indexed_window = {}
+    indexed_slot = {}
+    for indices, _, _, windows, slots in complete:
+        for offset, index in enumerate(indices):
+            indexed_window[int(index)] = windows[offset]
+            indexed_slot[int(index)] = slots[offset]
     return (
-        window_images.reshape(
-            batch_size, num_slots * window_size, channels, height, width
-        ),
-        window_present.reshape(batch_size, num_slots * window_size),
+        merged_predictions,
+        merged_labels,
+        np.stack([indexed_window[index] for index in range(expected_size)]),
+        np.stack([indexed_slot[index] for index in range(expected_size)]),
     )
 
 
@@ -705,18 +671,38 @@ def write_submission(
 
 def slice_selection_report(
     records_by_split: dict[str, Sequence[StudyRecord]],
-    sampled_slices_per_slot: int,
-    slice_band_start: float,
-    slice_band_end: float,
+    window_count: int,
 ) -> dict[str, object]:
     """Create an auditable record of every selected series and slice."""
     report: dict[str, object] = {
         "series_classification": CLASSIFICATION_METHOD,
+        "slice_selection_method": SLICE_SELECTION_METHOD,
         "slots": list(SLOT_NAMES),
-        "sampled_slices_per_slot": sampled_slices_per_slot,
-        "slice_band": [slice_band_start, slice_band_end],
+        "window_count": window_count,
+        "window_size": 3,
         "splits": {},
     }
+
+    def distributions(
+        records: Sequence[StudyRecord], attribute: str
+    ) -> dict[str, dict[str, float | int | None]]:
+        result = {}
+        for slot in SLOT_NAMES:
+            values = [
+                float(getattr(selection, attribute))
+                for record in records
+                for selection in record.selections
+                if selection.slot == slot
+                and selection.selected_windows
+                and float(getattr(selection, attribute)) > 0.0
+            ]
+            result[slot] = {
+                "series": len(values),
+                "minimum": min(values) if values else None,
+                "median": median(values) if values else None,
+                "maximum": max(values) if values else None,
+            }
+        return result
     split_reports: dict[str, object] = {}
     for split, records in records_by_split.items():
         methods = Counter(
@@ -728,7 +714,7 @@ def slice_selection_report(
             selection.slot
             for record in records
             for selection in record.selections
-            if selection.series_uid is not None
+            if selection.selected_windows
         )
         weighting_sources = Counter(
             classification.weighting_source
@@ -744,6 +730,18 @@ def slice_selection_report(
             not classification.matching_slots
             for record in records
             for classification in record.classifications
+        )
+        valid_windows = Counter(
+            selection.slot
+            for record in records
+            for selection in record.selections
+            for _ in selection.selected_windows
+        )
+        rejected_geometry = Counter(
+            selection.ordering_method
+            for record in records
+            for selection in record.selections
+            if selection.ordering_method.startswith("invalid-geometry:")
         )
         entries = [
             {
@@ -766,6 +764,29 @@ def slice_selection_report(
                 slot: len(records) - selected_slots.get(slot, 0)
                 for slot in SLOT_NAMES
             },
+            "valid_windows_by_slot": {
+                slot: valid_windows.get(slot, 0) for slot in SLOT_NAMES
+            },
+            "window_capacity_by_slot": {
+                slot: len(records) * window_count for slot in SLOT_NAMES
+            },
+            "geometry_rejections": dict(sorted(rejected_geometry.items())),
+            "large_gaps": sum(
+                selection.large_gaps
+                for record in records
+                for selection in record.selections
+            ),
+            "duplicate_positions": sum(
+                selection.duplicate_positions
+                for record in records
+                for selection in record.selections
+            ),
+            "physical_coverage_mm_by_slot": distributions(
+                records, "physical_coverage_mm"
+            ),
+            "median_spacing_mm_by_slot": distributions(
+                records, "median_spacing_mm"
+            ),
             "classified_series": sum(
                 len(record.classifications) for record in records
             ),
@@ -791,6 +812,9 @@ def model_artifact_metadata(config: dict[str, object]) -> dict[str, object]:
         "num_targets": len(TARGETS),
         "targets": list(TARGETS),
         "unfreeze_last": int(model_config["unfreeze_last"]),  # type: ignore[index]
+        "gradient_checkpointing": bool(  # type: ignore[index]
+            model_config["gradient_checkpointing"]
+        ),
         "dropout": float(model_config["dropout"]),  # type: ignore[index]
         "pooling": str(model_config["pooling"]),  # type: ignore[index]
         "aggregation": str(model_config["aggregation"]),  # type: ignore[index]
@@ -804,19 +828,14 @@ def model_artifact_metadata(config: dict[str, object]) -> dict[str, object]:
         ),
         "physical_crop_center": "image-center",
         "physical_crop_padding": "constant-zero",
-        "sampled_slices_per_slot": int(  # type: ignore[index]
-            data_config["sampled_slices_per_slot"]
-        ),
+        "slice_selection_method": SLICE_SELECTION_METHOD,
+        "window_count": int(data_config["window_count"]),  # type: ignore[index]
         "window_size": int(data_config["window_size"]),  # type: ignore[index]
-        "training_window_stride": int(  # type: ignore[index]
-            data_config["training_window_stride"]
-        ),
-        "inference_window_stride": int(  # type: ignore[index]
-            data_config["inference_window_stride"]
-        ),
-        "inference_window_pooling": str(  # type: ignore[index]
-            data_config["inference_window_pooling"]
-        ),
+        "position_features": [
+            "physical-relative-position",
+            "preceding-gap-over-median",
+            "following-gap-over-median",
+        ],
         "input_representation": str(  # type: ignore[index]
             model_config["input_representation"]
         ),
@@ -842,34 +861,32 @@ def build_configured_model(
         raise ValueError(f"Unsupported model: {model_name}")
     if image_size % 14:
         raise ValueError("DINOv2 image size must be divisible by its patch size 14")
-    if str(model_config["aggregation"]) != "target-attention":  # type: ignore[index]
-        raise ValueError("Only target-attention aggregation is supported")
+    aggregation = str(model_config["aggregation"])  # type: ignore[index]
+    if aggregation != "hierarchical-target-attention":
+        raise ValueError("Only hierarchical target attention is supported")
     input_representation = str(
         model_config["input_representation"]  # type: ignore[index]
     )
     if input_representation != "2.5d-slice-channels":
         raise ValueError("Only 2.5D slice-channel input is supported")
-    sampled_slices_per_slot = int(  # type: ignore[index]
-        data_config["sampled_slices_per_slot"]
-    )
+    legacy = {
+        "sampled_slices_per_slot",
+        "training_window_stride",
+        "inference_window_stride",
+        "inference_window_pooling",
+        "slice_band_start",
+        "slice_band_end",
+    }.intersection(data_config)
+    if legacy:
+        raise ValueError(
+            f"Legacy window configuration is not supported: {sorted(legacy)}"
+        )
+    window_count = int(data_config["window_count"])  # type: ignore[index]
+    if window_count <= 0:
+        raise ValueError("Window count must be positive")
     window_size = int(data_config["window_size"])  # type: ignore[index]
-    training_window_stride = int(  # type: ignore[index]
-        data_config["training_window_stride"]
-    )
-    inference_window_stride = int(  # type: ignore[index]
-        data_config["inference_window_stride"]
-    )
-    slice_window_starts(
-        sampled_slices_per_slot, window_size, training_window_stride
-    )
-    slice_window_starts(
-        sampled_slices_per_slot, window_size, inference_window_stride
-    )
-    inference_window_pooling = str(  # type: ignore[index]
-        data_config["inference_window_pooling"]
-    )
-    if inference_window_pooling != "probability-mean":
-        raise ValueError("Only probability-mean inference pooling is supported")
+    if window_size != 3:
+        raise ValueError("Physical 2.5D windows require exactly three slices")
     configured_slots = data_config["slots"]  # type: ignore[index]
     slot_names = tuple(str(name) for name in configured_slots)
     if slot_names != SLOT_NAMES:
@@ -881,9 +898,13 @@ def build_configured_model(
         unfreeze_last=int(model_config["unfreeze_last"]),  # type: ignore[index]
         dropout=float(model_config["dropout"]),  # type: ignore[index]
         num_slots=len(slot_names),
+        window_count=window_count,
         slices_per_slot=window_size,
         attention_hidden_size=int(  # type: ignore[index]
             model_config["attention_hidden_size"]
+        ),
+        gradient_checkpointing=bool(  # type: ignore[index]
+            model_config["gradient_checkpointing"]
         ),
     )
     model = model.to(device)
@@ -894,8 +915,9 @@ def build_configured_model(
         if parameter.requires_grad
     )
     if int(os.environ.get("RANK", "0")) == 0:
+        model_name = model_config["name"]  # type: ignore[index]
         print(
-            f"Loaded {model_config['name']} from {model_source}; "  # type: ignore[index]
+            f"Loaded {model_name} from {model_source}; "
             f"parameters={total_parameters}, trainable={trainable_parameters}",
             flush=True,
         )
@@ -951,6 +973,7 @@ def train_cv_fold(
     distributed: DistributedContext,
 ) -> tuple[dict[str, object] | None, pd.DataFrame | None, bool]:
     """Train one outer fold using only its weak inner validation for selection."""
+    fold_started_at = time.monotonic()
     run_seed = int(config["run"]["seed"]) + fold  # type: ignore[index]
     seed_everything(run_seed + distributed.rank)
     cv_config = config["cross_validation"]
@@ -980,14 +1003,10 @@ def train_cv_fold(
 
     image_size = int(data_config["image_size"])
     physical_fov_mm = float(data_config["physical_fov_mm"])
-    sampled_slices_per_slot = int(data_config["sampled_slices_per_slot"])
-    window_size = int(data_config["window_size"])
-    training_window_stride = int(data_config["training_window_stride"])
     augmentation = AugmentationConfig.from_mapping(config["augmentation"])
-    selection_window_stride = int(cv_config["selection_window_stride"])
-    inference_window_stride = int(data_config["inference_window_stride"])
     slot_names = list(data_config["slots"])
     batch_size = int(training_config["batch_size_per_device"])
+    accumulation_steps = int(training_config["gradient_accumulation_steps"])
     num_workers = int(training_config["num_workers"])
     cache_dir = data_config.get("dicom_cache_dir")
     training_sampler = DistributedSampler(
@@ -1078,11 +1097,13 @@ def train_cv_fold(
         optimizer,
         max_lr=[backbone_learning_rate, head_learning_rate],
         epochs=epochs,
-        steps_per_epoch=len(training_loader),
+        steps_per_epoch=math.ceil(len(training_loader) / accumulation_steps),
         pct_start=float(training_config["one_cycle_warmup_fraction"]),
     )
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     target_weights = positive_weights(train_labels, train_weights).to(device)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     max_runtime_seconds = float(training_config["max_runtime_hours"]) * 3600.0
     best_score = -math.inf
     best_epoch = 0
@@ -1091,6 +1112,7 @@ def train_cv_fold(
     time_limit_reached = False
     selection_targets = np.where(inner_weights > 0, inner_labels, np.nan)
     for epoch in range(epochs):
+        epoch_started_at = time.monotonic()
         training_sampler.set_epoch(epoch)
         loss = train_epoch(
             model,
@@ -1100,23 +1122,16 @@ def train_cv_fold(
             scaler,
             device,
             target_weights,
-            len(slot_names),
-            sampled_slices_per_slot,
-            window_size,
-            training_window_stride,
             augmentation,
+            accumulation_steps,
             distributed,
         )
-        inner_predictions, _ = predict_distributed(
+        inner_predictions, _, _, _ = predict_distributed(
             model,
             inner_loader,
             inner_sampler,
             len(inner_table),
             device,
-            len(slot_names),
-            sampled_slices_per_slot,
-            window_size,
-            selection_window_stride,
             distributed,
         )
         if distributed.primary:
@@ -1140,6 +1155,7 @@ def train_cv_fold(
                     "inner_validation_auc": auc,
                     "inner_validation_auc_by_target": per_target_auc,
                     "inner_validation_weighted_bce": weighted_bce,
+                    "elapsed_seconds": time.monotonic() - epoch_started_at,
                 }
             )
             print(
@@ -1169,22 +1185,28 @@ def train_cv_fold(
         raw_model.load_state_dict(best_state)
     for tensor in raw_model.state_dict().values():
         dist.broadcast(tensor, src=0)
-    outer_predictions, predicted_outer_labels = predict_distributed(
+    (
+        outer_predictions,
+        predicted_outer_labels,
+        outer_window_attention,
+        outer_slot_attention,
+    ) = predict_distributed(
         model,
         outer_loader,
         outer_sampler,
         len(outer_table),
         device,
-        len(slot_names),
-        sampled_slices_per_slot,
-        window_size,
-        inference_window_stride,
         distributed,
     )
     fold_summary: dict[str, object] | None = None
     oof: pd.DataFrame | None = None
     if distributed.primary:
-        if outer_predictions is None or predicted_outer_labels is None:
+        if (
+            outer_predictions is None
+            or predicted_outer_labels is None
+            or outer_window_attention is None
+            or outer_slot_attention is None
+        ):
             raise RuntimeError("Primary rank did not receive outer predictions")
         if not np.array_equal(predicted_outer_labels, outer_labels):
             raise RuntimeError(f"Fold {fold} outer labels changed during prediction")
@@ -1192,6 +1214,12 @@ def train_cv_fold(
         fold_dir.mkdir(parents=True, exist_ok=True)
         checkpoint_path = fold_dir / "best-model.pt"
         torch.save(best_state, checkpoint_path)
+        np.savez_compressed(
+            fold_dir / "attention-weights.npz",
+            study_uids=outer_table["StudyInstanceUID"].astype(str).to_numpy(),
+            window_attention=outer_window_attention,
+            slot_attention=outer_slot_attention,
+        )
         artifact_metadata = model_artifact_metadata(config)
         manifest = write_checkpoint_manifest(
             checkpoint_path,
@@ -1205,7 +1233,7 @@ def train_cv_fold(
                 "training_studies": len(train_table),
                 "inner_validation_studies": len(inner_table),
                 "outer_gold_studies": len(outer_table),
-                "selection_window_stride": selection_window_stride,
+                "attention_weights": "attention-weights.npz",
                 "augmentation": augmentation.metadata(),
             },
         )
@@ -1222,17 +1250,28 @@ def train_cv_fold(
             "best_inner_validation_auc": best_score,
             "completed_epochs": len(history),
             "time_limit_reached": time_limit_reached,
+            "elapsed_seconds": time.monotonic() - fold_started_at,
+            "peak_gpu_memory_bytes": (
+                torch.cuda.max_memory_allocated(device)
+                if device.type == "cuda"
+                else None
+            ),
             "history": history,
             "checkpoint": manifest,
             "model_source": str(model_source),
             "total_parameters": total_parameters,
             "trainable_parameters": trainable_parameters,
+            "attention_weights": "attention-weights.npz",
             "augmentation": augmentation.metadata(),
             "distributed": {
                 "backend": distributed.backend,
                 "world_size": distributed.world_size,
                 "batch_size_per_device": batch_size,
-                "global_batch_size": batch_size * distributed.world_size,
+                "gradient_accumulation_steps": accumulation_steps,
+                "microbatch_global_size": batch_size * distributed.world_size,
+                "effective_batch_size": (
+                    batch_size * distributed.world_size * accumulation_steps
+                ),
             },
         }
         write_json(fold_dir / "run-summary.json", fold_summary, allow_nan=False)
@@ -1358,32 +1397,49 @@ def run_cross_validation_training(
         f"/tmp/rsna2026-distributed-study-records-{run_id}.pkl"
     )
     if distributed.primary:
-        selection_cache_path = Path(str(data_config["study_records_cache_path"]))
-        all_records, selection_summary = load_study_records_cache(
-            selection_cache_path,
-            input_path / "train_series",
-            all_uids,
-            int(data_config["sampled_slices_per_slot"]),
-            float(data_config["slice_band_start"]),
-            float(data_config["slice_band_end"]),
-            list(data_config["slots"]),
-            str(data_config["series_classification"]),
-            str(data_config["study_records_cache_sha256"]),
-            str(data_config["study_records_cache_uids_sha256"]),
-        )
+        configured_cache = str(data_config.get("study_records_cache_path", ""))
+        configured_sha256 = str(data_config.get("study_records_cache_sha256", ""))
+        if configured_cache and configured_sha256:
+            selection_cache_path = Path(configured_cache)
+            all_records, selection_summary = load_study_records_cache(
+                selection_cache_path,
+                input_path / "train_series",
+                all_uids,
+                int(data_config["window_count"]),
+                list(data_config["slots"]),
+                str(data_config["series_classification"]),
+                configured_sha256,
+                str(data_config["study_records_cache_uids_sha256"]),
+            )
+            selection_output = output_dir / "slice-selection.json"
+            if selection_cache_path.suffix == ".xz":
+                with lzma.open(selection_cache_path, "rb") as source:
+                    with selection_output.open("wb") as destination:
+                        shutil.copyfileobj(source, destination)
+            else:
+                shutil.copyfile(selection_cache_path, selection_output)
+        else:
+            all_records = build_study_records(
+                train_series,
+                input_path / "train_series",
+                all_uids,
+                int(data_config["window_count"]),
+                list(data_config["slots"]),
+                str(data_config["series_classification"]),
+            )
+            report = slice_selection_report(
+                {"all-training-studies": all_records},
+                int(data_config["window_count"]),
+            )
+            selection_output = output_dir / "slice-selection.json"
+            write_json(selection_output, report)
+            selection_summary = report["splits"]["all-training-studies"]["summary"]
         temporary_records_cache = records_cache.with_suffix(".temporary")
         with temporary_records_cache.open("wb") as file:
             pickle.dump(all_records, file, protocol=pickle.HIGHEST_PROTOCOL)
         os.replace(temporary_records_cache, records_cache)
-        selection_output = output_dir / "slice-selection.json"
-        if selection_cache_path.suffix == ".xz":
-            with lzma.open(selection_cache_path, "rb") as source:
-                with selection_output.open("wb") as destination:
-                    shutil.copyfileobj(source, destination)
-        else:
-            shutil.copyfile(selection_cache_path, selection_output)
         print(
-            f"Loaded pinned study-record cache: {selection_summary}", flush=True
+            f"Prepared physical-window study records: {selection_summary}", flush=True
         )
     if not distributed.primary:
         deadline = time.monotonic() + 1800.0
@@ -1480,7 +1536,10 @@ def run_cross_validation_training(
         "fold_assignment_sha256": design.audit["assignment_sha256"],
         "inner_assignment_sha256": design.audit["inner_assignment_sha256"],
         "test_ensemble": str(cv_config["test_ensemble"]),
-        "within_model_pooling": str(data_config["inference_window_pooling"]),
+        "within_model_pooling": "hierarchical-target-attention",
+        "training_slice_selection_sha256": file_sha256(
+            output_dir / "slice-selection.json"
+        ),
     }
     write_json(output_dir / "ensemble-manifest.json", ensemble_manifest)
     elapsed = time.monotonic() - started_at
@@ -1495,10 +1554,20 @@ def run_cross_validation_training(
             "batch_size_per_device": int(
                 config["training"]["batch_size_per_device"]  # type: ignore[index]
             ),
-            "global_batch_size": int(
+            "microbatch_global_size": int(
                 config["training"]["batch_size_per_device"]  # type: ignore[index]
             )
             * distributed.world_size,
+            "gradient_accumulation_steps": int(
+                config["training"]["gradient_accumulation_steps"]  # type: ignore[index]
+            ),
+            "effective_batch_size": int(
+                config["training"]["batch_size_per_device"]  # type: ignore[index]
+            )
+            * distributed.world_size
+            * int(
+                config["training"]["gradient_accumulation_steps"]  # type: ignore[index]
+            ),
         },
         "optimization": {
             "epochs": int(config["training"]["epochs"]),  # type: ignore[index]
@@ -1527,7 +1596,8 @@ def run_cross_validation_training(
         "oof_predictions": "oof-predictions.csv",
         "label_source_validation": label_validation,
         "study_records_cache": {
-            "sha256": str(data_config["study_records_cache_sha256"]),
+            "configured_sha256": str(data_config["study_records_cache_sha256"]),
+            "artifact_sha256": file_sha256(output_dir / "slice-selection.json"),
             "study_uids_sha256": str(
                 data_config["study_records_cache_uids_sha256"]
             ),
@@ -1536,8 +1606,10 @@ def run_cross_validation_training(
         "pseudo_label_file": str(pseudo_config["file_name"]),
         "pseudo_labels_sha256": public.sha256,
         "model": artifact_metadata,
-        "selection_window_stride": int(cv_config["selection_window_stride"]),
-        "final_prediction_window_stride": int(data_config["inference_window_stride"]),
+        "window_count": int(data_config["window_count"]),
+        "gradient_accumulation_steps": int(
+            config["training"]["gradient_accumulation_steps"]  # type: ignore[index]
+        ),
     }
     write_json(output_dir / "run-summary.json", run_summary, allow_nan=False)
     print(
@@ -1564,15 +1636,7 @@ def run_inference(
     physical_fov_mm = float(  # type: ignore[index]
         data_config["physical_fov_mm"]
     )
-    sampled_slices_per_slot = int(  # type: ignore[index]
-        data_config["sampled_slices_per_slot"]
-    )
-    window_size = int(data_config["window_size"])  # type: ignore[index]
-    inference_window_stride = int(  # type: ignore[index]
-        data_config["inference_window_stride"]
-    )
-    slice_band_start = float(data_config["slice_band_start"])  # type: ignore[index]
-    slice_band_end = float(data_config["slice_band_end"])  # type: ignore[index]
+    window_count = int(data_config["window_count"])  # type: ignore[index]
     slot_names = list(data_config["slots"])  # type: ignore[index]
     classification_method = str(  # type: ignore[index]
         data_config["series_classification"]
@@ -1582,17 +1646,13 @@ def run_inference(
         test_series,
         input_path / "test_series",
         test_uids,
-        sampled_slices_per_slot,
-        slice_band_start,
-        slice_band_end,
+        window_count,
         slot_names,
         classification_method,
     )
     selection_report = slice_selection_report(
         {"test": test_records},
-        sampled_slices_per_slot,
-        slice_band_start,
-        slice_band_end,
+        window_count,
     )
     write_json(output_dir / "slice-selection.json", selection_report)
     test_loader = make_loader(
@@ -1629,16 +1689,16 @@ def run_inference(
             checkpoint_path, map_location="cpu", weights_only=True
         )
         model.load_state_dict(state_dict)
-        predictions, _ = predict(
-            model,
-            test_loader,
-            device,
-            len(slot_names),
-            sampled_slices_per_slot,
-            window_size,
-            inference_window_stride,
+        predictions, _, window_attention, slot_attention = predict(
+            model, test_loader, device
         )
         member_predictions.append(predictions)
+        np.savez_compressed(
+            output_dir / f"attention-weights-fold-{int(member['fold'])}.npz",
+            study_uids=np.asarray(test_uids),
+            window_attention=window_attention,
+            slot_attention=slot_attention,
+        )
     if manifest.get("test_ensemble") != "per-target-percentile-rank-mean":
         raise ValueError("Unsupported test ensemble method")
     predictions = percentile_rank_mean(member_predictions)
@@ -1658,8 +1718,14 @@ def run_inference(
             "total_parameters": total_parameters,
             "trainable_parameters": trainable_parameters,
         },
+        "attention_weights": [
+            f"attention-weights-fold-{int(member['fold'])}.npz"
+            for member in sorted(
+                manifest["members"], key=lambda value: value["fold"]
+            )
+        ],
         "slice_selection": {
-            "slice_band": selection_report["slice_band"],
+            "selection_method": selection_report["slice_selection_method"],
             "artifact": "slice-selection.json",
             "splits": {
                 split: values["summary"]
@@ -1678,10 +1744,50 @@ def run_inference(
     return 0
 
 
+def prepare_training_selection_cache(
+    config: dict[str, object], output_dir: Path
+) -> int:
+    """Build the physical-window selection report before GPU workers start."""
+    input_path = competition_input(
+        config["paths"]["input_root"],  # type: ignore[index]
+        config["competition"]["input_slug"],  # type: ignore[index]
+    )
+    train_table = pd.read_csv(input_path / "train.csv")
+    train_series = pd.read_csv(input_path / "train_series.csv")
+    study_uids = train_table["StudyInstanceUID"].astype(str).tolist()
+    data_config = config["data"]
+    print(
+        f"Preparing physical-window selection cache for {len(study_uids)} studies",
+        flush=True,
+    )
+    records = build_study_records(
+        train_series,
+        input_path / "train_series",
+        study_uids,
+        int(data_config["window_count"]),  # type: ignore[index]
+        list(data_config["slots"]),  # type: ignore[index]
+        str(data_config["series_classification"]),  # type: ignore[index]
+    )
+    report = slice_selection_report(
+        {"all-training-studies": records},
+        int(data_config["window_count"]),  # type: ignore[index]
+    )
+    selection_output = output_dir / "slice-selection.json"
+    write_json(selection_output, report)
+    print(
+        f"Prepared physical-window selection cache: {selection_output} "
+        f"sha256={file_sha256(selection_output)}",
+        flush=True,
+    )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     started_at = time.monotonic()
     args = parse_args(argv)
     config = load_config(args.config)
+    if args.mode == "train":
+        apply_study_records_cache_environment(config)
     distributed = initialize_distributed(config, args.mode)
     seed = int(config["run"]["seed"])
     seed_everything(seed + distributed.rank)
@@ -1689,6 +1795,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     output_dir = Path(config["paths"]["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.mode == "prepare-selection-cache":
+        return prepare_training_selection_cache(config, output_dir)
     if args.mode == "inference":
         return run_inference(config, output_dir, started_at)
 
@@ -1777,28 +1885,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     image_size = int(config["data"]["image_size"])
     physical_fov_mm = float(config["data"]["physical_fov_mm"])
-    sampled_slices_per_slot = int(
-        config["data"]["sampled_slices_per_slot"]
-    )
-    window_size = int(config["data"]["window_size"])
-    training_window_stride = int(
-        config["data"]["training_window_stride"]
-    )
+    window_count = int(config["data"]["window_count"])
     augmentation = AugmentationConfig.from_mapping(config["augmentation"])
-    inference_window_stride = int(
-        config["data"]["inference_window_stride"]
-    )
-    slice_band_start = float(config["data"]["slice_band_start"])
-    slice_band_end = float(config["data"]["slice_band_end"])
     slot_names = list(config["data"]["slots"])
     classification_method = str(config["data"]["series_classification"])
     training_records = build_study_records(
         train_series,
         input_path / "train_series",
         training_table["StudyInstanceUID"].astype(str).tolist(),
-        sampled_slices_per_slot,
-        slice_band_start,
-        slice_band_end,
+        window_count,
         slot_names,
         classification_method,
     )
@@ -1806,9 +1901,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         train_series,
         input_path / "train_series",
         validation_table["StudyInstanceUID"].astype(str).tolist(),
-        sampled_slices_per_slot,
-        slice_band_start,
-        slice_band_end,
+        window_count,
         slot_names,
         classification_method,
     )
@@ -1817,9 +1910,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "training": training_records,
             "validation": validation_records,
         },
-        sampled_slices_per_slot,
-        slice_band_start,
-        slice_band_end,
+        window_count,
     )
     (output_dir / "slice-selection.json").write_text(
         json.dumps(selection_report, indent=2, allow_nan=False) + "\n",
@@ -1882,15 +1973,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         weight_decay=float(config["training"]["weight_decay"]),
     )
     epochs = int(config["training"]["epochs"])
+    accumulation_steps = int(config["training"]["gradient_accumulation_steps"])
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=[backbone_learning_rate, head_learning_rate],
         epochs=epochs,
-        steps_per_epoch=len(training_loader),
+        steps_per_epoch=math.ceil(len(training_loader) / accumulation_steps),
         pct_start=float(config["training"]["one_cycle_warmup_fraction"]),
     )
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     target_weights = positive_weights(training_labels, training_weights).to(device)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     max_runtime_seconds = float(
         config["training"]["max_runtime_hours"]
     ) * 3600.0
@@ -1901,6 +1995,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     history = []
     time_limit_reached = False
     for epoch in range(epochs):
+        epoch_started_at = time.monotonic()
         loss = train_epoch(
             model,
             training_loader,
@@ -1909,21 +2004,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             scaler,
             device,
             target_weights,
-            len(slot_names),
-            sampled_slices_per_slot,
-            window_size,
-            training_window_stride,
             augmentation,
+            accumulation_steps,
         )
-        validation_predictions, validation_labels = predict(
-            model,
-            validation_loader,
-            device,
-            len(slot_names),
-            sampled_slices_per_slot,
-            window_size,
-            inference_window_stride,
-        )
+        (
+            validation_predictions,
+            validation_labels,
+            validation_window_attention,
+            validation_slot_attention,
+        ) = predict(model, validation_loader, device)
         if validation_labels is None:
             raise RuntimeError("Validation labels are unavailable")
         auc = macro_auc(validation_labels, validation_predictions)
@@ -1934,6 +2023,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "loss": loss,
                 "validation_auc": auc,
                 "validation_auc_by_target": per_target_auc,
+                "elapsed_seconds": time.monotonic() - epoch_started_at,
             }
         )
         print(
@@ -1961,6 +2051,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise RuntimeError("Training did not produce a model state")
     checkpoint_path = output_dir / "best-model.pt"
     torch.save(best_state, checkpoint_path)
+    np.savez_compressed(
+        output_dir / "attention-weights.npz",
+        study_uids=validation_table["StudyInstanceUID"].astype(str).to_numpy(),
+        window_attention=validation_window_attention,
+        slot_attention=validation_slot_attention,
+    )
     artifact_metadata = model_artifact_metadata(config)
     manifest = write_checkpoint_manifest(
         checkpoint_path,
@@ -1983,6 +2079,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "validation_studies": len(validation_records),
         "targets": TARGETS,
         "elapsed_seconds": elapsed_seconds,
+        "peak_gpu_memory_bytes": (
+            torch.cuda.max_memory_allocated(device)
+            if device.type == "cuda"
+            else None
+        ),
         "completed_epochs": len(history),
         "best_epoch": best_epoch,
         "time_limit_reached": time_limit_reached,
@@ -2005,7 +2106,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
         },
         "slice_selection": {
-            "slice_band": selection_report["slice_band"],
+            "selection_method": selection_report["slice_selection_method"],
             "artifact": "slice-selection.json",
             "splits": {
                 split: values["summary"]
@@ -2020,6 +2121,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         },
         "label_source_validation": label_source_validation,
         "history": history,
+        "attention_weights": "attention-weights.npz",
         **provenance,
     }
     write_json(output_dir / "run-summary.json", summary, allow_nan=True)

@@ -12,22 +12,17 @@ output_dir = "/kaggle/working/outputs"
 seed = 42
 
 [data]
-image_size = 336
+image_size = 224
 physical_fov_mm = 130.0
-sampled_slices_per_slot = 12
+window_count = 10
 window_size = 3
-training_window_stride = 3
-inference_window_stride = 1
-inference_window_pooling = "probability-mean"
 # Reuse decoded, windowed, and resized slices across epochs. This ephemeral path
 # is not included in the training notebook outputs.
 dicom_cache_dir = "/tmp/rsna2026-dicom-cache"
-slice_band_start = 0.20
-slice_band_end = 0.80
 series_classification = "dicom-header-v1"
-# Pinned v21 selection metadata is embedded into the generated training notebook.
+# Pinned physical-window selection emitted by training kernel version 14.
 study_records_cache_path = "/kaggle/input/rsna-2026-slice-selection-cache/slice-selection.json.xz"
-study_records_cache_sha256 = "8d691f5f58a19f9c0b4196103267844fdb65996b4c0ab29d3749328123b03a75"
+study_records_cache_sha256 = "aec60a548b1b0a4530c5e7df3acc9dad2041696ee29943c316183048694b3201"
 study_records_cache_uids_sha256 = "72bb18659cba9fc84f4f363c2585f1a99f84e6f03971e4d8313813ba647aa81e"
 slots = [
   "sagittal-fluid-fs",
@@ -61,9 +56,10 @@ blur_probability = 0.1
 
 [training]
 epochs = 20
-# Training uses this many studies on each GPU, for a global batch size of 8.
-batch_size_per_device = 4
-inference_batch_size = 4
+# One study per GPU with four-step accumulation preserves an effective batch of 8.
+batch_size_per_device = 1
+gradient_accumulation_steps = 4
+inference_batch_size = 1
 num_workers = 2
 distributed = true
 expected_gpu_count = 2
@@ -84,9 +80,6 @@ inner_seed = 1042
 inner_validation_fraction = 0.20
 gold_loss_weight = 3.0
 bootstrap_resamples = 5000
-# Epoch selection uses the same four non-overlapping windows seen in training.
-# Final gold OOF prediction and test inference retain the ten-window stride above.
-selection_window_stride = 3
 test_ensemble = "per-target-percentile-rank-mean"
 split_algorithm = "report-group-multilabel-v1"
 
@@ -106,8 +99,9 @@ name = "dinov2-small"
 variant = "small"
 input_representation = "2.5d-slice-channels"
 unfreeze_last = 6
+gradient_checkpointing = true
 pooling = "cls-patch-mean"
-aggregation = "target-attention"
+aggregation = "hierarchical-target-attention"
 attention_hidden_size = 256
 dropout = 0.25
 

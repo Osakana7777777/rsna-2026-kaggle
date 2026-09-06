@@ -7,7 +7,11 @@ torch = pytest.importorskip("torch")
 
 from torch import nn  # noqa: E402
 
-from rsna2026.model import KneeAbnormalityModel, TargetAttentionHead  # noqa: E402
+from rsna2026.model import (  # noqa: E402
+    HierarchicalTargetAttentionHead,
+    KneeAbnormalityModel,
+    TargetAttentionHead,
+)
 
 
 class DummyBackbone(nn.Module):
@@ -53,17 +57,19 @@ def test_model_stacks_three_ordered_slices_as_channels() -> None:
         unfreeze_last=1,
         dropout=0.0,
         num_slots=6,
+        window_count=10,
         slices_per_slot=3,
         attention_hidden_size=4,
     )
-    images = torch.zeros((1, 18, 1, 14, 14))
-    images[0, 0] = 0.1
-    images[0, 1] = 0.2
-    images[0, 2] = 0.3
-    present = torch.zeros((1, 18), dtype=torch.bool)
-    present[0, :3] = True
+    images = torch.zeros((1, 6, 10, 3, 14, 14))
+    images[0, 0, 0, 0] = 0.1
+    images[0, 0, 0, 1] = 0.2
+    images[0, 0, 0, 2] = 0.3
+    present = torch.zeros((1, 6, 10), dtype=torch.bool)
+    present[0, 0, 0] = True
+    positions = torch.zeros((1, 6, 10, 3))
 
-    logits = model(images, present)
+    logits = model(images, present, positions)
 
     expected = (torch.tensor([0.1, 0.2, 0.3]) - model.image_mean.flatten()) / (
         model.image_std.flatten()
@@ -81,6 +87,27 @@ def test_model_requires_three_slices_for_2_5d_input() -> None:
             unfreeze_last=1,
             dropout=0.0,
             num_slots=6,
+            window_count=10,
             slices_per_slot=1,
             attention_hidden_size=4,
         )
+
+
+def test_hierarchical_attention_masks_windows_and_slots() -> None:
+    head = HierarchicalTargetAttentionHead(8, 4, 2, 3, 3, 0.0)
+    features = torch.randn(1, 2, 4, 8)
+    present = torch.tensor([[[True, False, True, False], [False] * 4]])
+    positions = torch.zeros(1, 2, 4, 3)
+
+    logits, window_attention, slot_attention = head(
+        features, present, positions, return_attention=True
+    )
+
+    assert logits.shape == (1, 3)
+    assert window_attention.shape == (1, 3, 2, 4)
+    assert slot_attention.shape == (1, 3, 2)
+    assert torch.all(window_attention[:, :, 0, [1, 3]] == 0)
+    assert torch.all(window_attention[:, :, 1] == 0)
+    assert torch.all(slot_attention[:, :, 1] == 0)
+    assert torch.allclose(window_attention[:, :, 0].sum(-1), torch.ones(1, 3))
+    assert torch.allclose(slot_attention.sum(-1), torch.ones(1, 3))

@@ -117,17 +117,16 @@ Both stages embed the same source and configuration, but their generated run
 modes are fixed to `train` and `inference`. A configuration edit cannot make the
 submission notebook enter the training path.
 
-The model classifies series into six plane-and-acquisition slots and samples twelve
-ordered slices from the central 20--80% of each available series. Training draws one
-of four non-overlapping three-slice windows as the three input channels. Validation
-and inference average probabilities over all ten overlapping windows. The resulting
-six 2.5D features are combined with target-specific masked attention. Decoded,
-windowed, and resized DICOM tensors are cached under the ephemeral directory
-configured by `dicom_cache_dir`, so later epochs do not repeat DICOM preprocessing.
-Training applies synchronized, per-slot geometric and intensity augmentation to all
-three slice channels; validation and inference remain deterministic. The slot order,
-augmentation, image size, epoch count, batch size, learning rate, and public-label
-selection are set in `configs/baseline.toml`.
+The model classifies series into six plane-and-acquisition slots. It orders each
+series on the DICOM patient-coordinate axis, forms adjacent three-slice windows,
+and selects up to ten unique windows nearest equally spaced physical centers over
+the usable acquisition range. DINOv2 encodes every valid window in one model call.
+Target-specific masked attention first aggregates windows within each slot and then
+aggregates the six slots. Physical position and adjacent-spacing features accompany
+each window. Decoded and resized source images are cached once even when they occur
+in overlapping windows. Training augmentation is synchronized across every window
+in the same slot; validation and inference remain deterministic. All experiment
+settings are defined in `configs/baseline.toml`.
 
 The Kaggle image supplies PyTorch, pandas, NumPy, and pydicom. Internet access
 remains disabled during the run, and the baseline does not require downloaded

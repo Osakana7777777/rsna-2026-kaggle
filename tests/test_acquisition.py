@@ -6,6 +6,7 @@ from rsna2026.acquisition import (
     SLOT_NAMES,
     choose_largest_series,
     classify_acquisition,
+    rank_series_by_size,
     resolve_slots,
 )
 
@@ -74,6 +75,9 @@ def test_selects_largest_series_with_uid_tie_break() -> None:
         choose_largest_series([("series-a", 20), ("series-b", 21)])
         == "series-b"
     )
+    assert rank_series_by_size(
+        [("series-c", 20), ("series-b", 21), ("series-a", 20)]
+    ) == ("series-b", "series-a", "series-c")
 
 
 def test_rejects_changed_slot_order() -> None:

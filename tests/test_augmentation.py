@@ -126,8 +126,13 @@ def test_augmentation_is_reproducible_for_a_fixed_seed() -> None:
 def test_dense_windows_share_slot_transform_and_mask_missing_windows() -> None:
     pattern = torch.zeros((12, 12))
     pattern[2:7, 4:9] = 1.0
-    images = pattern.repeat(1, 2, 4, 3, 1, 1)
-    present = torch.tensor([[[True, True, False, True], [True] * 4]])
+    images = pattern.repeat(1, 2, 2, 4, 3, 1, 1)
+    present = torch.tensor(
+        [[
+            [[True, True, False, True], [True] * 4],
+            [[True] * 4, [True] * 4],
+        ]]
+    )
     config = replace(
         zero_probability_config(),
         rotation_probability=1.0,
@@ -140,9 +145,9 @@ def test_dense_windows_share_slot_transform_and_mask_missing_windows() -> None:
     augmented = augment_dense_windows(images, present, config)
 
     assert augmented.shape == images.shape
-    assert torch.count_nonzero(augmented[0, 0, 2]) == 0
-    assert torch.equal(augmented[0, 0, 0, 0], augmented[0, 0, 1, 0])
-    assert not torch.equal(augmented[0, 0, 0, 0], augmented[0, 1, 0, 0])
+    assert torch.count_nonzero(augmented[0, 0, 0, 2]) == 0
+    assert torch.equal(augmented[0, 0, 0, 0, 0], augmented[0, 0, 1, 0, 0])
+    assert not torch.equal(augmented[0, 0, 0, 0, 0], augmented[0, 1, 0, 0, 0])
 
 
 @pytest.mark.parametrize(

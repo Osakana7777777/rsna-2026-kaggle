@@ -14,6 +14,7 @@ pytest.importorskip("torch")
 
 from rsna2026.acquisition import CLASSIFICATION_METHOD, SLOT_NAMES  # noqa: E402
 from rsna2026.dataset import (  # noqa: E402
+    SERIES_SELECTION_METHOD,
     SLICE_SELECTION_METHOD,
     load_study_records_cache,
 )
@@ -62,7 +63,7 @@ def test_runtime_selection_cache_requires_path_and_hash(monkeypatch) -> None:
         apply_study_records_cache_environment(config)
 
 
-def _selection(slot: str, present: bool) -> dict[str, object]:
+def _selection(slot: str, series_rank: int, present: bool) -> dict[str, object]:
     series_uid = "series-1" if present else None
     selected_windows = (
         [[
@@ -75,6 +76,7 @@ def _selection(slot: str, present: bool) -> dict[str, object]:
     )
     return {
         "slot": slot,
+        "series_rank": series_rank,
         "plane": slot.split("-", 1)[0],
         "series_uid": series_uid,
         "weighting": "pd" if present else None,
@@ -100,8 +102,10 @@ def _selection(slot: str, present: bool) -> dict[str, object]:
 def test_loads_pinned_study_records_without_reading_dicom(tmp_path) -> None:
     report = {
         "series_classification": CLASSIFICATION_METHOD,
+        "series_selection_method": SERIES_SELECTION_METHOD,
         "slice_selection_method": SLICE_SELECTION_METHOD,
         "slots": list(SLOT_NAMES),
+        "max_series_per_slot": 2,
         "window_count": 2,
         "window_size": 3,
         "splits": {
@@ -109,11 +113,16 @@ def test_loads_pinned_study_records_without_reading_dicom(tmp_path) -> None:
                 "summary": {"studies": 1},
                 "studies": [
                     {
-                        "study_uid": "study-1",
-                        "series": [
-                            _selection(slot, index == 0)
-                            for index, slot in enumerate(SLOT_NAMES)
-                        ],
+                            "study_uid": "study-1",
+                            "series": [
+                                _selection(
+                                    slot,
+                                    series_rank,
+                                    slot_index == 0 and series_rank == 1,
+                                )
+                                for slot_index, slot in enumerate(SLOT_NAMES)
+                                for series_rank in (1, 2)
+                            ],
                         "series_classifications": [],
                     }
                 ],
@@ -130,6 +139,7 @@ def test_loads_pinned_study_records_without_reading_dicom(tmp_path) -> None:
         image_root=tmp_path / "images",
         study_uids=["study-1"],
         window_count=2,
+        max_series_per_slot=2,
         slot_names=SLOT_NAMES,
         classification_method=CLASSIFICATION_METHOD,
         expected_sha256=hashlib.sha256(raw).hexdigest(),
@@ -147,4 +157,22 @@ def test_loads_pinned_study_records_without_reading_dicom(tmp_path) -> None:
         ),
         (None, None, None),
     )
-    assert records[0].window_paths[2:] == ((None, None, None),) * 10
+    assert records[0].window_paths[2:] == ((None, None, None),) * 22
+    assert records[0].num_slots == 6
+    assert records[0].max_series_per_slot == 2
+
+    report.pop("series_selection_method")
+    legacy_raw = (json.dumps(report) + "\n").encode("utf-8")
+    cache_path.write_bytes(lzma.compress(legacy_raw))
+    with pytest.raises(ValueError, match="series selection method"):
+        load_study_records_cache(
+            cache_path=cache_path,
+            image_root=tmp_path / "images",
+            study_uids=["study-1"],
+            window_count=2,
+            max_series_per_slot=2,
+            slot_names=SLOT_NAMES,
+            classification_method=CLASSIFICATION_METHOD,
+            expected_sha256=hashlib.sha256(legacy_raw).hexdigest(),
+            expected_study_uids_sha256=uid_sha256,
+        )

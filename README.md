@@ -117,16 +117,17 @@ Both stages embed the same source and configuration, but their generated run
 modes are fixed to `train` and `inference`. A configuration edit cannot make the
 submission notebook enter the training path.
 
-The model classifies series into six plane-and-acquisition slots. It orders each
+The model classifies series into six plane-and-acquisition slots and retains the
+two series with the largest slice counts in each slot. It orders every retained
 series on the DICOM patient-coordinate axis, forms adjacent three-slice windows,
 and selects up to ten unique windows nearest equally spaced physical centers over
 the usable acquisition range. DINOv2 encodes every valid window in one model call.
-Target-specific masked attention first aggregates windows within each slot and then
-aggregates the six slots. Physical position and adjacent-spacing features accompany
-each window. Decoded and resized source images are cached once even when they occur
-in overlapping windows. Training augmentation is synchronized across every window
-in the same slot; validation and inference remain deterministic. All experiment
-settings are defined in `configs/baseline.toml`.
+Target-specific masked attention aggregates windows within each series, series
+within each slot, and finally the six slots. Physical position and adjacent-spacing
+features accompany each window. Decoded and resized source images are cached once
+even when they occur in overlapping windows. Training augmentation is synchronized
+across all series and windows in the same slot; validation and inference remain
+deterministic. All experiment settings are defined in `configs/baseline.toml`.
 
 The Kaggle image supplies PyTorch, pandas, NumPy, and pydicom. Internet access
 remains disabled during the run, and the baseline does not require downloaded

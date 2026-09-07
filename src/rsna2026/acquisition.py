@@ -186,6 +186,16 @@ def resolve_slots(names: Sequence[str]) -> tuple[AcquisitionSlot, ...]:
 
 def choose_largest_series(candidates: Sequence[tuple[str, int]]) -> str:
     """Choose the thickest series with a stable UID tie-break."""
+    return rank_series_by_size(candidates)[0]
+
+
+def rank_series_by_size(candidates: Sequence[tuple[str, int]]) -> tuple[str, ...]:
+    """Rank series by descending slice count with a stable UID tie-break."""
     if not candidates:
         raise ValueError("At least one candidate series is required")
-    return min(candidates, key=lambda item: (-item[1], item[0]))[0]
+    return tuple(
+        series_uid
+        for series_uid, _ in sorted(
+            candidates, key=lambda item: (-item[1], item[0])
+        )
+    )

@@ -87,6 +87,8 @@ def test_cache_identity_includes_physical_fov(tmp_path) -> None:
         "study",
         ((Path("a.dcm"), Path("slice.dcm"), Path("b.dcm")),),
         ((0.5, 1.0, 1.0),),
+        1,
+        1,
     )
     crop_130 = KneeStudyDataset(
         [record], 224, 130.0, cache_dir=tmp_path
@@ -105,6 +107,7 @@ def test_artifact_metadata_binds_physical_preprocessing() -> None:
             "physical_fov_mm": 130.0,
             "window_count": 10,
             "window_size": 3,
+            "max_series_per_slot": 2,
             "series_classification": "dicom-header-v1",
             "slots": ["slot"],
         },
@@ -115,7 +118,7 @@ def test_artifact_metadata_binds_physical_preprocessing() -> None:
             "gradient_checkpointing": True,
             "dropout": 0.25,
             "pooling": "cls-patch-mean",
-            "aggregation": "hierarchical-target-attention",
+            "aggregation": "hierarchical-target-series-attention",
             "attention_hidden_size": 256,
             "input_representation": "2.5d-slice-channels",
         },

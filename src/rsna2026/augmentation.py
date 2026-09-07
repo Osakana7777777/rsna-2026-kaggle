@@ -325,13 +325,23 @@ def augment_dense_windows(
     present: torch.Tensor,
     config: AugmentationConfig,
 ) -> torch.Tensor:
-    """Apply one synchronized transform to every window in an acquisition slot."""
+    """Apply one synchronized transform to all series and windows in a slot."""
     if not config.is_active():
         return images
-    if images.ndim != 6 or images.shape[3] != 3:
-        raise ValueError("Expected [batch, slots, windows, 3, height, width]")
-    batch_size, num_slots, window_count, channels, height, width = images.shape
-    if present.shape != (batch_size, num_slots, window_count):
+    if images.ndim != 7 or images.shape[4] != 3:
+        raise ValueError(
+            "Expected [batch, slots, series, windows, 3, height, width]"
+        )
+    (
+        batch_size,
+        num_slots,
+        max_series,
+        window_count,
+        channels,
+        height,
+        width,
+    ) = images.shape
+    if present.shape != (batch_size, num_slots, max_series, window_count):
         raise ValueError("Window mask shape does not match dense windows")
     if height <= max(config.blur_kernel_sizes) // 2 or width <= max(
         config.blur_kernel_sizes
@@ -339,7 +349,10 @@ def augment_dense_windows(
         raise ValueError("Images are too small for configured reflection padding")
 
     slot_images = images.reshape(
-        batch_size * num_slots, window_count * channels, height, width
+        batch_size * num_slots,
+        max_series * window_count * channels,
+        height,
+        width,
     )
     augmented = _apply_affine(slot_images, config)
     count = len(augmented)
@@ -372,9 +385,14 @@ def augment_dense_windows(
     augmented = augmented + shared_noise * noise_std[:, None, None, None]
     augmented = _apply_blur(augmented, config).clamp(0.0, 1.0)
     window_mask = present.reshape(
-        batch_size * num_slots, window_count, 1, 1, 1
+        batch_size * num_slots, max_series, window_count, 1, 1, 1
     ).to(augmented.dtype)
     augmented = augmented.reshape(
-        batch_size * num_slots, window_count, channels, height, width
+        batch_size * num_slots,
+        max_series,
+        window_count,
+        channels,
+        height,
+        width,
     )
     return (augmented * window_mask).reshape_as(images)

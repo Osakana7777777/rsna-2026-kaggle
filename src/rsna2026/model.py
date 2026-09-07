@@ -78,7 +78,7 @@ class TargetAttentionHead(nn.Module):
 
 
 class HierarchicalTargetAttentionHead(nn.Module):
-    """Attend to physical windows and acquisition slots for every target."""
+    """Attend to windows, series, and acquisition slots for every target."""
 
     def __init__(
         self,
@@ -99,6 +99,14 @@ class HierarchicalTargetAttentionHead(nn.Module):
             nn.Linear(position_size, hidden_size), nn.GELU()
         )
         self.window_query = nn.Parameter(
+            torch.randn(num_targets, hidden_size) * 0.02
+        )
+        self.series_projection = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+        )
+        self.series_query = nn.Parameter(
             torch.randn(num_targets, hidden_size) * 0.02
         )
         self.slot_projection = nn.Sequential(
@@ -134,29 +142,44 @@ class HierarchicalTargetAttentionHead(nn.Module):
         window_present: torch.Tensor,
         position_features: torch.Tensor,
         return_attention: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        batch_size, num_slots, _, _ = window_features.shape
+    ) -> torch.Tensor | tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
+        _, num_slots, _, _, _ = window_features.shape
         if num_slots != self.num_slots:
             raise ValueError(f"Expected {self.num_slots} slots, received {num_slots}")
-        if window_present.shape != window_features.shape[:3]:
+        if window_present.shape != window_features.shape[:4]:
             raise ValueError("Window mask shape does not match window features")
-        if position_features.shape != (*window_features.shape[:3], self.position_size):
+        if position_features.shape != (
+            *window_features.shape[:4],
+            self.position_size,
+        ):
             raise ValueError("Position feature shape does not match windows")
         hidden = self.window_projection(window_features)
         hidden = hidden + self.position_projection(position_features)
         window_scores = torch.einsum(
-            "bswh,th->btsw", hidden, self.window_query
+            "bsrwh,th->btsrw", hidden, self.window_query
         ) / math.sqrt(self.hidden_size)
         window_mask = window_present.to(torch.bool).unsqueeze(1)
         window_attention = self._masked_softmax(window_scores, window_mask)
+        series_context = torch.einsum(
+            "btsrw,bsrwh->btsrh", window_attention, hidden
+        )
+        series_hidden = self.series_projection(series_context)
+        series_present = window_present.any(dim=-1).unsqueeze(1)
+        series_scores = (
+            series_hidden
+            * self.series_query.view(1, self.num_targets, 1, 1, -1)
+        ).sum(dim=-1) / math.sqrt(self.hidden_size)
+        series_attention = self._masked_softmax(series_scores, series_present)
         slot_context = torch.einsum(
-            "btsw,bswh->btsh", window_attention, hidden
+            "btsr,btsrh->btsh", series_attention, series_hidden
         )
         slot_hidden = self.slot_projection(slot_context)
         slot_hidden = slot_hidden + self.slot_embedding.view(
             1, 1, self.num_slots, self.hidden_size
         )
-        slot_present = window_present.any(dim=-1).unsqueeze(1)
+        slot_present = series_present.any(dim=-1)
         slot_scores = (
             slot_hidden * self.slot_query.view(1, self.num_targets, 1, -1)
         ).sum(dim=-1) / math.sqrt(self.hidden_size)
@@ -168,7 +191,7 @@ class HierarchicalTargetAttentionHead(nn.Module):
             study_context * self.output_weight.unsqueeze(0)
         ).sum(dim=-1) + self.output_bias
         if return_attention:
-            return logits, window_attention, slot_attention
+            return logits, window_attention, series_attention, slot_attention
         return logits
 
 
@@ -208,6 +231,7 @@ class KneeAbnormalityModel(nn.Module):
         unfreeze_last: int,
         dropout: float,
         num_slots: int,
+        max_series_per_slot: int,
         window_count: int,
         slices_per_slot: int,
         attention_hidden_size: int,
@@ -221,6 +245,8 @@ class KneeAbnormalityModel(nn.Module):
             raise ValueError("2.5D input requires exactly three slices per slot")
         if window_count <= 0:
             raise ValueError("Window count must be positive")
+        if max_series_per_slot <= 0:
+            raise ValueError("Maximum series per slot must be positive")
         self.backbone = backbone
         layers = self._encoder_layers()
         if unfreeze_last > len(layers):
@@ -251,6 +277,7 @@ class KneeAbnormalityModel(nn.Module):
         self.unfreeze_last = unfreeze_last
         self.feature_size = feature_size
         self.num_slots = num_slots
+        self.max_series_per_slot = max_series_per_slot
         self.window_count = window_count
         self.num_targets = num_targets
         self.slices_per_slot = slices_per_slot
@@ -274,16 +301,38 @@ class KneeAbnormalityModel(nn.Module):
         present: torch.Tensor,
         positions: torch.Tensor,
         return_attention: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if images.ndim != 6:
-            raise ValueError("Expected [batch, slots, windows, 3, height, width]")
-        batch_size, num_slots, windows, channels, height, width = images.shape
-        expected = (self.num_slots, self.window_count, self.slices_per_slot)
-        if (num_slots, windows, channels) != expected:
-            raise ValueError(f"Expected slot/window/channel shape {expected}")
-        if present.shape != (batch_size, self.num_slots, self.window_count):
+    ) -> torch.Tensor | tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
+        if images.ndim != 7:
+            raise ValueError(
+                "Expected [batch, slots, series, windows, 3, height, width]"
+            )
+        (
+            batch_size,
+            num_slots,
+            max_series,
+            windows,
+            channels,
+            height,
+            width,
+        ) = images.shape
+        expected = (
+            self.num_slots,
+            self.max_series_per_slot,
+            self.window_count,
+            self.slices_per_slot,
+        )
+        if (num_slots, max_series, windows, channels) != expected:
+            raise ValueError(f"Expected slot/series/window/channel shape {expected}")
+        if present.shape != (
+            batch_size,
+            self.num_slots,
+            self.max_series_per_slot,
+            self.window_count,
+        ):
             raise ValueError("Window presence shape does not match images")
-        if positions.shape != (batch_size, self.num_slots, self.window_count, 3):
+        if positions.shape != (*present.shape, 3):
             raise ValueError("Window position shape does not match images")
         pixels = images[present.to(torch.bool)]
         pixels = (pixels - self.image_mean) / self.image_std
@@ -295,7 +344,13 @@ class KneeAbnormalityModel(nn.Module):
                 (tokens[:, 0], tokens[:, 1:].mean(dim=1)), dim=1
             )
             features = encoded.new_zeros(
-                (batch_size * self.num_slots * self.window_count, self.feature_size)
+                (
+                    batch_size
+                    * self.num_slots
+                    * self.max_series_per_slot
+                    * self.window_count,
+                    self.feature_size,
+                )
             )
             features[present.reshape(-1).to(torch.bool)] = encoded
         else:
@@ -303,10 +358,20 @@ class KneeAbnormalityModel(nn.Module):
                 pixel_values=images.new_zeros((1, 3, height, width))
             ).last_hidden_state
             features = images.new_zeros(
-                (batch_size * self.num_slots * self.window_count, self.feature_size)
+                (
+                    batch_size
+                    * self.num_slots
+                    * self.max_series_per_slot
+                    * self.window_count,
+                    self.feature_size,
+                )
             ) + dummy_tokens.sum() * 0.0
         window_features = features.reshape(
-            batch_size, self.num_slots, self.window_count, self.feature_size
+            batch_size,
+            self.num_slots,
+            self.max_series_per_slot,
+            self.window_count,
+            self.feature_size,
         )
         return self.head(
             window_features, present, positions, return_attention=return_attention
@@ -320,6 +385,7 @@ def build_dinov2_model(
     unfreeze_last: int,
     dropout: float,
     num_slots: int,
+    max_series_per_slot: int,
     window_count: int,
     slices_per_slot: int,
     attention_hidden_size: int,
@@ -344,6 +410,7 @@ def build_dinov2_model(
         unfreeze_last=unfreeze_last,
         dropout=dropout,
         num_slots=num_slots,
+        max_series_per_slot=max_series_per_slot,
         window_count=window_count,
         slices_per_slot=slices_per_slot,
         attention_hidden_size=attention_hidden_size,

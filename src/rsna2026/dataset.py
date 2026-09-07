@@ -22,7 +22,7 @@ from torch.utils.data import Dataset
 from rsna2026.acquisition import (
     CLASSIFICATION_METHOD,
     AcquisitionClass,
-    choose_largest_series,
+    rank_series_by_size,
     read_acquisition_header,
     resolve_slots,
 )
@@ -32,6 +32,7 @@ from rsna2026.slice_selection import select_physical_windows
 ORDERING_WORKERS = 16
 PREPROCESSING_VERSION = "dicom-physical-fov-window-uint8-v4"
 SLICE_SELECTION_METHOD = "physical-adjacent-three-window-v1"
+SERIES_SELECTION_METHOD = "top-k-slice-count-v1"
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,8 @@ class StudyRecord:
     study_uid: str
     window_paths: tuple[tuple[Path | None, Path | None, Path | None], ...]
     position_features: tuple[tuple[float, float, float], ...]
+    num_slots: int
+    max_series_per_slot: int
     selections: tuple["SeriesSelection", ...] = ()
     classifications: tuple["SeriesClassification", ...] = ()
 
@@ -66,6 +69,7 @@ class SeriesSelection:
     """Auditable slice selection metadata for one acquisition slot."""
 
     slot: str
+    series_rank: int
     plane: str
     series_uid: str | None
     weighting: str | None
@@ -104,12 +108,15 @@ def build_study_records(
     image_root: Path,
     study_uids: Sequence[str],
     window_count: int,
+    max_series_per_slot: int,
     slot_names: Sequence[str],
     classification_method: str,
 ) -> list[StudyRecord]:
     """Classify series, fill fixed acquisition slots, and sample each stack."""
     if window_count <= 0:
         raise ValueError("Window count must be positive")
+    if max_series_per_slot <= 0:
+        raise ValueError("Maximum series per slot must be positive")
     if classification_method != CLASSIFICATION_METHOD:
         raise ValueError(
             f"Unsupported series classification method: {classification_method}"
@@ -200,26 +207,28 @@ def build_study_records(
                 slot_name, []
             ).append(candidate)
 
-    chosen: dict[str, dict[str, _SeriesCandidate]] = {}
+    chosen: dict[str, dict[str, tuple[_SeriesCandidate, ...]]] = {}
     for study_uid, slots_for_study in candidates.items():
         for slot_name, slot_candidates in slots_for_study.items():
-            selected_uid = choose_largest_series(
+            selected_uids = rank_series_by_size(
                 [
                     (candidate.series_uid, len(candidate.paths))
                     for candidate in slot_candidates
                 ]
-            )
-            chosen.setdefault(study_uid, {})[slot_name] = next(
-                candidate
-                for candidate in slot_candidates
-                if candidate.series_uid == selected_uid
+            )[:max_series_per_slot]
+            by_uid = {
+                candidate.series_uid: candidate for candidate in slot_candidates
+            }
+            chosen.setdefault(study_uid, {})[slot_name] = tuple(
+                by_uid[series_uid] for series_uid in selected_uids
             )
 
     series_directories = sorted(
         {
             candidate.series_dir
             for slots_for_study in chosen.values()
-            for candidate in slots_for_study.values()
+            for slot_candidates in slots_for_study.values()
+            for candidate in slot_candidates
         }
     )
 
@@ -239,76 +248,93 @@ def build_study_records(
         position_features: list[tuple[float, float, float]] = []
         selections = []
         for slot in slots:
-            candidate = chosen.get(study_uid, {}).get(slot.name)
-            if candidate is None:
-                paths = []
-                sample = select_physical_windows([], window_count)
-            else:
-                paths, sample = sampled_series[candidate.series_dir]
-            padded_windows = list(sample.windows)
-            padded_features = list(sample.position_features)
-            padded_windows.extend(
-                [(None, None, None)] * (window_count - len(padded_windows))
-            )
-            padded_features.extend(
-                [(0.0, 0.0, 0.0)] * (window_count - len(padded_features))
-            )
-            selected.extend(padded_windows)
-            position_features.extend(padded_features)
-            series_uid = candidate.series_uid if candidate is not None else None
-            acquisition = candidate.acquisition if candidate is not None else None
-            selections.append(
-                SeriesSelection(
-                    slot=slot.name,
-                    plane=slot.plane,
-                    series_uid=series_uid,
-                    weighting=(acquisition.weighting if acquisition else None),
-                    fluid_sensitive=(
-                        acquisition.fluid_sensitive if acquisition else None
-                    ),
-                    fat_suppressed=(
-                        acquisition.fat_suppressed if acquisition else None
-                    ),
-                    weighting_source=(
-                        acquisition.weighting_source if acquisition else "missing"
-                    ),
-                    fat_suppression_source=(
-                        acquisition.fat_suppression_source
-                        if acquisition
-                        else "missing"
-                    ),
-                    representative_path=(
-                        f"{study_uid}/{series_uid}/"
-                        f"{candidate.representative_path.name}"
-                        if candidate is not None
-                        else None
-                    ),
-                    ordering_method=sample.method,
-                    total_slices=len(paths),
-                    physical_coverage_mm=sample.coverage_mm,
-                    median_spacing_mm=sample.median_spacing_mm,
-                    duplicate_positions=sample.duplicate_positions,
-                    large_gaps=sample.large_gaps,
-                    all_positions_mm=sample.all_positions_mm,
-                    target_positions_mm=sample.target_positions_mm,
-                    selected_center_positions_mm=sample.center_positions_mm,
-                    selected_windows=tuple(
-                        tuple(
-                            f"{study_uid}/{series_uid}/{path.name}"
-                            for path in window
-                        )
-                        for window in sample.windows
-                    ),
-                    position_features=sample.position_features,
+            slot_candidates = chosen.get(study_uid, {}).get(slot.name, ())
+            for series_index in range(max_series_per_slot):
+                candidate = (
+                    slot_candidates[series_index]
+                    if series_index < len(slot_candidates)
+                    else None
                 )
-            )
+                if candidate is None:
+                    paths = []
+                    sample = select_physical_windows([], window_count)
+                else:
+                    paths, sample = sampled_series[candidate.series_dir]
+                padded_windows = list(sample.windows)
+                padded_features = list(sample.position_features)
+                padded_windows.extend(
+                    [(None, None, None)] * (window_count - len(padded_windows))
+                )
+                padded_features.extend(
+                    [(0.0, 0.0, 0.0)] * (window_count - len(padded_features))
+                )
+                selected.extend(padded_windows)
+                position_features.extend(padded_features)
+                series_uid = (
+                    candidate.series_uid if candidate is not None else None
+                )
+                acquisition = (
+                    candidate.acquisition if candidate is not None else None
+                )
+                selections.append(
+                    SeriesSelection(
+                        slot=slot.name,
+                        series_rank=series_index + 1,
+                        plane=slot.plane,
+                        series_uid=series_uid,
+                        weighting=(
+                            acquisition.weighting if acquisition else None
+                        ),
+                        fluid_sensitive=(
+                            acquisition.fluid_sensitive if acquisition else None
+                        ),
+                        fat_suppressed=(
+                            acquisition.fat_suppressed if acquisition else None
+                        ),
+                        weighting_source=(
+                            acquisition.weighting_source
+                            if acquisition
+                            else "missing"
+                        ),
+                        fat_suppression_source=(
+                            acquisition.fat_suppression_source
+                            if acquisition
+                            else "missing"
+                        ),
+                        representative_path=(
+                            f"{study_uid}/{series_uid}/"
+                            f"{candidate.representative_path.name}"
+                            if candidate is not None
+                            else None
+                        ),
+                        ordering_method=sample.method,
+                        total_slices=len(paths),
+                        physical_coverage_mm=sample.coverage_mm,
+                        median_spacing_mm=sample.median_spacing_mm,
+                        duplicate_positions=sample.duplicate_positions,
+                        large_gaps=sample.large_gaps,
+                        all_positions_mm=sample.all_positions_mm,
+                        target_positions_mm=sample.target_positions_mm,
+                        selected_center_positions_mm=sample.center_positions_mm,
+                        selected_windows=tuple(
+                            tuple(
+                                f"{study_uid}/{series_uid}/{path.name}"
+                                for path in window
+                            )
+                            for window in sample.windows
+                        ),
+                        position_features=sample.position_features,
+                    )
+                )
         records.append(
             StudyRecord(
-                study_uid,
-                tuple(selected),
-                tuple(position_features),
-                tuple(selections),
-                tuple(
+                study_uid=study_uid,
+                window_paths=tuple(selected),
+                position_features=tuple(position_features),
+                num_slots=len(slots),
+                max_series_per_slot=max_series_per_slot,
+                selections=tuple(selections),
+                classifications=tuple(
                     sorted(
                         classifications.get(study_uid, []),
                         key=lambda item: item.series_uid,
@@ -324,6 +350,7 @@ def load_study_records_cache(
     image_root: Path,
     study_uids: Sequence[str],
     window_count: int,
+    max_series_per_slot: int,
     slot_names: Sequence[str],
     classification_method: str,
     expected_sha256: str,
@@ -340,8 +367,12 @@ def load_study_records_cache(
     report = json.loads(raw)
     if report.get("series_classification") != classification_method:
         raise ValueError("Study-record cache classification method changed")
+    if report.get("series_selection_method") != SERIES_SELECTION_METHOD:
+        raise ValueError("Study-record cache series selection method changed")
     if report.get("slots") != list(slot_names):
         raise ValueError("Study-record cache slot order changed")
+    if int(report.get("max_series_per_slot", -1)) != max_series_per_slot:
+        raise ValueError("Study-record cache maximum series per slot changed")
     if report.get("slice_selection_method") != SLICE_SELECTION_METHOD:
         raise ValueError("Study-record cache selection method changed")
     if int(report.get("window_count", -1)) != window_count:
@@ -370,8 +401,16 @@ def load_study_records_cache(
         window_paths: list[tuple[Path | None, Path | None, Path | None]] = []
         position_features: list[tuple[float, float, float]] = []
         series_rows = entry.get("series", [])
-        if [row.get("slot") for row in series_rows] != list(slot_names):
-            raise ValueError(f"Cached slot order changed for study {study_uid}")
+        expected_layout = [
+            (slot, rank)
+            for slot in slot_names
+            for rank in range(1, max_series_per_slot + 1)
+        ]
+        actual_layout = [
+            (row.get("slot"), row.get("series_rank")) for row in series_rows
+        ]
+        if actual_layout != expected_layout:
+            raise ValueError(f"Cached series layout changed for study {study_uid}")
         for row in series_rows:
             selected_windows = tuple(
                 tuple(str(path) for path in window)
@@ -403,6 +442,7 @@ def load_study_records_cache(
             selections.append(
                 SeriesSelection(
                     slot=str(row["slot"]),
+                    series_rank=int(row["series_rank"]),
                     plane=str(row["plane"]),
                     series_uid=(
                         str(row["series_uid"])
@@ -455,6 +495,8 @@ def load_study_records_cache(
                 study_uid=study_uid,
                 window_paths=tuple(window_paths),
                 position_features=tuple(position_features),
+                num_slots=len(slot_names),
+                max_series_per_slot=max_series_per_slot,
                 selections=tuple(selections),
                 classifications=classifications,
             )
@@ -615,16 +657,28 @@ class KneeStudyDataset(
     ]:
         record = self.records[index]
         images, present = self._load_images(record)
-        num_slots = len(record.selections)
-        if num_slots <= 0 or len(record.window_paths) % num_slots:
+        num_slots = record.num_slots
+        max_series = record.max_series_per_slot
+        series_count = num_slots * max_series
+        if (
+            num_slots <= 0
+            or max_series <= 0
+            or len(record.selections) != series_count
+            or len(record.window_paths) % series_count
+        ):
             raise ValueError("Study record has an invalid window layout")
-        window_count = len(record.window_paths) // num_slots
+        window_count = len(record.window_paths) // series_count
         images = images.reshape(
-            num_slots, window_count, 3, self.image_size, self.image_size
+            num_slots,
+            max_series,
+            window_count,
+            3,
+            self.image_size,
+            self.image_size,
         )
-        present = present.reshape(num_slots, window_count)
+        present = present.reshape(num_slots, max_series, window_count)
         positions = torch.tensor(record.position_features, dtype=torch.float32).reshape(
-            num_slots, window_count, 3
+            num_slots, max_series, window_count, 3
         )
 
         label = (

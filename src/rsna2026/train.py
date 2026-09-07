@@ -47,18 +47,19 @@ from rsna2026.cross_validation import (
 from rsna2026.data import competition_input
 from rsna2026.dataset import (
     PREPROCESSING_VERSION,
+    SERIES_SELECTION_METHOD,
     SLICE_SELECTION_METHOD,
     KneeStudyDataset,
     StudyRecord,
     build_study_records,
     load_study_records_cache,
 )
-from rsna2026.model import build_dinov2_model
 from rsna2026.ensemble import (
     ENSEMBLE_FORMAT_VERSION,
     load_ensemble_manifest,
     percentile_rank_mean,
 )
+from rsna2026.model import build_dinov2_model
 from rsna2026.public_labels import (
     confidence_weight,
     load_public_label_table,
@@ -568,16 +569,19 @@ def predict(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
-) -> tuple[np.ndarray, np.ndarray | None, np.ndarray, np.ndarray]:
-    """Predict once from all physical windows and return attention weights."""
+) -> tuple[
+    np.ndarray, np.ndarray | None, np.ndarray, np.ndarray, np.ndarray
+]:
+    """Predict once and return window, series, and slot attention weights."""
     model.eval()
     predictions = []
     labels = []
     window_attentions = []
+    series_attentions = []
     slot_attentions = []
     for images, present, positions, batch_labels, _ in loader:
         with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
-            logits, window_attention, slot_attention = model(
+            logits, window_attention, series_attention, slot_attention = model(
                 images.to(device, non_blocking=True),
                 present.to(device, non_blocking=True),
                 positions.to(device, non_blocking=True),
@@ -585,6 +589,7 @@ def predict(
             )
         predictions.append(torch.sigmoid(logits.float()).cpu().numpy())
         window_attentions.append(window_attention.float().cpu().numpy())
+        series_attentions.append(series_attention.float().cpu().numpy())
         slot_attentions.append(slot_attention.float().cpu().numpy())
         if batch_labels.numel():
             labels.append(batch_labels.numpy())
@@ -598,6 +603,7 @@ def predict(
         prediction_array,
         label_array,
         np.concatenate(window_attentions),
+        np.concatenate(series_attentions),
         np.concatenate(slot_attentions),
     )
 
@@ -614,36 +620,55 @@ def predict_distributed(
     np.ndarray | None,
     np.ndarray | None,
     np.ndarray | None,
+    np.ndarray | None,
 ]:
     """Predict one non-overlapping shard and restore order on rank zero."""
-    predictions, labels, window_attention, slot_attention = predict(
+    predictions, labels, window_attention, series_attention, slot_attention = predict(
         unwrap_model(model), loader, device
     )
-    local = (list(sampler), predictions, labels, window_attention, slot_attention)
+    local = (
+        list(sampler),
+        predictions,
+        labels,
+        window_attention,
+        series_attention,
+        slot_attention,
+    )
     gathered: list[
         tuple[
-            Sequence[int], np.ndarray, np.ndarray | None, np.ndarray, np.ndarray
+            Sequence[int],
+            np.ndarray,
+            np.ndarray | None,
+            np.ndarray,
+            np.ndarray,
+            np.ndarray,
         ]
         | None
     ] = [None] * distributed.world_size
     dist.all_gather_object(gathered, local)
     if not distributed.primary:
-        return None, None, None, None
+        return None, None, None, None, None
     complete = [shard for shard in gathered if shard is not None]
     merged_predictions, merged_labels = merge_prediction_shards(
-        [(indices, values, labels) for indices, values, labels, _, _ in complete],
+        [
+            (indices, values, labels)
+            for indices, values, labels, _, _, _ in complete
+        ],
         expected_size,
     )
     indexed_window = {}
+    indexed_series = {}
     indexed_slot = {}
-    for indices, _, _, windows, slots in complete:
+    for indices, _, _, windows, series, slots in complete:
         for offset, index in enumerate(indices):
             indexed_window[int(index)] = windows[offset]
+            indexed_series[int(index)] = series[offset]
             indexed_slot[int(index)] = slots[offset]
     return (
         merged_predictions,
         merged_labels,
         np.stack([indexed_window[index] for index in range(expected_size)]),
+        np.stack([indexed_series[index] for index in range(expected_size)]),
         np.stack([indexed_slot[index] for index in range(expected_size)]),
     )
 
@@ -672,12 +697,15 @@ def write_submission(
 def slice_selection_report(
     records_by_split: dict[str, Sequence[StudyRecord]],
     window_count: int,
+    max_series_per_slot: int,
 ) -> dict[str, object]:
     """Create an auditable record of every selected series and slice."""
     report: dict[str, object] = {
         "series_classification": CLASSIFICATION_METHOD,
+        "series_selection_method": SERIES_SELECTION_METHOD,
         "slice_selection_method": SLICE_SELECTION_METHOD,
         "slots": list(SLOT_NAMES),
+        "max_series_per_slot": max_series_per_slot,
         "window_count": window_count,
         "window_size": 3,
         "splits": {},
@@ -705,16 +733,24 @@ def slice_selection_report(
         return result
     split_reports: dict[str, object] = {}
     for split, records in records_by_split.items():
+        if any(
+            record.num_slots != len(SLOT_NAMES)
+            or record.max_series_per_slot != max_series_per_slot
+            or len(record.selections)
+            != len(SLOT_NAMES) * max_series_per_slot
+            for record in records
+        ):
+            raise ValueError(f"Invalid multi-series record layout in split {split}")
         methods = Counter(
             selection.ordering_method
             for record in records
             for selection in record.selections
         )
-        selected_slots = Counter(
-            selection.slot
+        selected_by_rank = Counter(
+            (selection.slot, selection.series_rank)
             for record in records
             for selection in record.selections
-            if selection.selected_windows
+            if selection.series_uid is not None
         )
         weighting_sources = Counter(
             classification.weighting_source
@@ -731,8 +767,8 @@ def slice_selection_report(
             for record in records
             for classification in record.classifications
         )
-        valid_windows = Counter(
-            selection.slot
+        valid_windows_by_rank = Counter(
+            (selection.slot, selection.series_rank)
             for record in records
             for selection in record.selections
             for _ in selection.selected_windows
@@ -757,18 +793,50 @@ def slice_selection_report(
         summary = {
             "studies": len(records),
             "series_by_ordering_method": dict(sorted(methods.items())),
+            "selected_series": sum(selected_by_rank.values()),
             "selected_series_by_slot": {
-                slot: selected_slots.get(slot, 0) for slot in SLOT_NAMES
+                slot: sum(
+                    selected_by_rank.get((slot, rank), 0)
+                    for rank in range(1, max_series_per_slot + 1)
+                )
+                for slot in SLOT_NAMES
+            },
+            "selected_series_by_slot_and_rank": {
+                slot: {
+                    str(rank): selected_by_rank.get((slot, rank), 0)
+                    for rank in range(1, max_series_per_slot + 1)
+                }
+                for slot in SLOT_NAMES
             },
             "missing_slots_by_slot": {
-                slot: len(records) - selected_slots.get(slot, 0)
+                slot: len(records) - selected_by_rank.get((slot, 1), 0)
+                for slot in SLOT_NAMES
+            },
+            "missing_series_by_slot_and_rank": {
+                slot: {
+                    str(rank): len(records)
+                    - selected_by_rank.get((slot, rank), 0)
+                    for rank in range(1, max_series_per_slot + 1)
+                }
                 for slot in SLOT_NAMES
             },
             "valid_windows_by_slot": {
-                slot: valid_windows.get(slot, 0) for slot in SLOT_NAMES
+                slot: sum(
+                    valid_windows_by_rank.get((slot, rank), 0)
+                    for rank in range(1, max_series_per_slot + 1)
+                )
+                for slot in SLOT_NAMES
+            },
+            "valid_windows_by_slot_and_rank": {
+                slot: {
+                    str(rank): valid_windows_by_rank.get((slot, rank), 0)
+                    for rank in range(1, max_series_per_slot + 1)
+                }
+                for slot in SLOT_NAMES
             },
             "window_capacity_by_slot": {
-                slot: len(records) * window_count for slot in SLOT_NAMES
+                slot: len(records) * max_series_per_slot * window_count
+                for slot in SLOT_NAMES
             },
             "geometry_rejections": dict(sorted(rejected_geometry.items())),
             "large_gaps": sum(
@@ -831,6 +899,10 @@ def model_artifact_metadata(config: dict[str, object]) -> dict[str, object]:
         "slice_selection_method": SLICE_SELECTION_METHOD,
         "window_count": int(data_config["window_count"]),  # type: ignore[index]
         "window_size": int(data_config["window_size"]),  # type: ignore[index]
+        "max_series_per_slot": int(  # type: ignore[index]
+            data_config["max_series_per_slot"]
+        ),
+        "input_layout": "study-slot-series-window-channel-height-width",
         "position_features": [
             "physical-relative-position",
             "preceding-gap-over-median",
@@ -862,8 +934,8 @@ def build_configured_model(
     if image_size % 14:
         raise ValueError("DINOv2 image size must be divisible by its patch size 14")
     aggregation = str(model_config["aggregation"])  # type: ignore[index]
-    if aggregation != "hierarchical-target-attention":
-        raise ValueError("Only hierarchical target attention is supported")
+    if aggregation != "hierarchical-target-series-attention":
+        raise ValueError("Only hierarchical target-series attention is supported")
     input_representation = str(
         model_config["input_representation"]  # type: ignore[index]
     )
@@ -887,6 +959,11 @@ def build_configured_model(
     window_size = int(data_config["window_size"])  # type: ignore[index]
     if window_size != 3:
         raise ValueError("Physical 2.5D windows require exactly three slices")
+    max_series_per_slot = int(  # type: ignore[index]
+        data_config["max_series_per_slot"]
+    )
+    if max_series_per_slot <= 0:
+        raise ValueError("Maximum series per slot must be positive")
     configured_slots = data_config["slots"]  # type: ignore[index]
     slot_names = tuple(str(name) for name in configured_slots)
     if slot_names != SLOT_NAMES:
@@ -898,6 +975,7 @@ def build_configured_model(
         unfreeze_last=int(model_config["unfreeze_last"]),  # type: ignore[index]
         dropout=float(model_config["dropout"]),  # type: ignore[index]
         num_slots=len(slot_names),
+        max_series_per_slot=max_series_per_slot,
         window_count=window_count,
         slices_per_slot=window_size,
         attention_hidden_size=int(  # type: ignore[index]
@@ -1004,7 +1082,6 @@ def train_cv_fold(
     image_size = int(data_config["image_size"])
     physical_fov_mm = float(data_config["physical_fov_mm"])
     augmentation = AugmentationConfig.from_mapping(config["augmentation"])
-    slot_names = list(data_config["slots"])
     batch_size = int(training_config["batch_size_per_device"])
     accumulation_steps = int(training_config["gradient_accumulation_steps"])
     num_workers = int(training_config["num_workers"])
@@ -1126,7 +1203,7 @@ def train_cv_fold(
             accumulation_steps,
             distributed,
         )
-        inner_predictions, _, _, _ = predict_distributed(
+        inner_predictions, _, _, _, _ = predict_distributed(
             model,
             inner_loader,
             inner_sampler,
@@ -1189,6 +1266,7 @@ def train_cv_fold(
         outer_predictions,
         predicted_outer_labels,
         outer_window_attention,
+        outer_series_attention,
         outer_slot_attention,
     ) = predict_distributed(
         model,
@@ -1205,6 +1283,7 @@ def train_cv_fold(
             outer_predictions is None
             or predicted_outer_labels is None
             or outer_window_attention is None
+            or outer_series_attention is None
             or outer_slot_attention is None
         ):
             raise RuntimeError("Primary rank did not receive outer predictions")
@@ -1218,6 +1297,7 @@ def train_cv_fold(
             fold_dir / "attention-weights.npz",
             study_uids=outer_table["StudyInstanceUID"].astype(str).to_numpy(),
             window_attention=outer_window_attention,
+            series_attention=outer_series_attention,
             slot_attention=outer_slot_attention,
         )
         artifact_metadata = model_artifact_metadata(config)
@@ -1406,6 +1486,7 @@ def run_cross_validation_training(
                 input_path / "train_series",
                 all_uids,
                 int(data_config["window_count"]),
+                int(data_config["max_series_per_slot"]),
                 list(data_config["slots"]),
                 str(data_config["series_classification"]),
                 configured_sha256,
@@ -1424,12 +1505,14 @@ def run_cross_validation_training(
                 input_path / "train_series",
                 all_uids,
                 int(data_config["window_count"]),
+                int(data_config["max_series_per_slot"]),
                 list(data_config["slots"]),
                 str(data_config["series_classification"]),
             )
             report = slice_selection_report(
                 {"all-training-studies": all_records},
                 int(data_config["window_count"]),
+                int(data_config["max_series_per_slot"]),
             )
             selection_output = output_dir / "slice-selection.json"
             write_json(selection_output, report)
@@ -1536,7 +1619,7 @@ def run_cross_validation_training(
         "fold_assignment_sha256": design.audit["assignment_sha256"],
         "inner_assignment_sha256": design.audit["inner_assignment_sha256"],
         "test_ensemble": str(cv_config["test_ensemble"]),
-        "within_model_pooling": "hierarchical-target-attention",
+        "within_model_pooling": "hierarchical-target-series-attention",
         "training_slice_selection_sha256": file_sha256(
             output_dir / "slice-selection.json"
         ),
@@ -1647,12 +1730,14 @@ def run_inference(
         input_path / "test_series",
         test_uids,
         window_count,
+        int(data_config["max_series_per_slot"]),
         slot_names,
         classification_method,
     )
     selection_report = slice_selection_report(
         {"test": test_records},
         window_count,
+        int(data_config["max_series_per_slot"]),
     )
     write_json(output_dir / "slice-selection.json", selection_report)
     test_loader = make_loader(
@@ -1689,7 +1774,7 @@ def run_inference(
             checkpoint_path, map_location="cpu", weights_only=True
         )
         model.load_state_dict(state_dict)
-        predictions, _, window_attention, slot_attention = predict(
+        predictions, _, window_attention, series_attention, slot_attention = predict(
             model, test_loader, device
         )
         member_predictions.append(predictions)
@@ -1697,6 +1782,7 @@ def run_inference(
             output_dir / f"attention-weights-fold-{int(member['fold'])}.npz",
             study_uids=np.asarray(test_uids),
             window_attention=window_attention,
+            series_attention=series_attention,
             slot_attention=slot_attention,
         )
     if manifest.get("test_ensemble") != "per-target-percentile-rank-mean":
@@ -1765,12 +1851,14 @@ def prepare_training_selection_cache(
         input_path / "train_series",
         study_uids,
         int(data_config["window_count"]),  # type: ignore[index]
+        int(data_config["max_series_per_slot"]),  # type: ignore[index]
         list(data_config["slots"]),  # type: ignore[index]
         str(data_config["series_classification"]),  # type: ignore[index]
     )
     report = slice_selection_report(
         {"all-training-studies": records},
         int(data_config["window_count"]),  # type: ignore[index]
+        int(data_config["max_series_per_slot"]),  # type: ignore[index]
     )
     selection_output = output_dir / "slice-selection.json"
     write_json(selection_output, report)
@@ -1894,6 +1982,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         input_path / "train_series",
         training_table["StudyInstanceUID"].astype(str).tolist(),
         window_count,
+        int(config["data"]["max_series_per_slot"]),
         slot_names,
         classification_method,
     )
@@ -1902,6 +1991,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         input_path / "train_series",
         validation_table["StudyInstanceUID"].astype(str).tolist(),
         window_count,
+        int(config["data"]["max_series_per_slot"]),
         slot_names,
         classification_method,
     )
@@ -1911,6 +2001,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "validation": validation_records,
         },
         window_count,
+        int(config["data"]["max_series_per_slot"]),
     )
     (output_dir / "slice-selection.json").write_text(
         json.dumps(selection_report, indent=2, allow_nan=False) + "\n",
@@ -2011,6 +2102,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             validation_predictions,
             validation_labels,
             validation_window_attention,
+            validation_series_attention,
             validation_slot_attention,
         ) = predict(model, validation_loader, device)
         if validation_labels is None:
@@ -2055,6 +2147,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_dir / "attention-weights.npz",
         study_uids=validation_table["StudyInstanceUID"].astype(str).to_numpy(),
         window_attention=validation_window_attention,
+        series_attention=validation_series_attention,
         slot_attention=validation_slot_attention,
     )
     artifact_metadata = model_artifact_metadata(config)
@@ -2095,8 +2188,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "total_parameters": total_parameters,
             "trainable_parameters": trainable_parameters,
             "grayscale_to_rgb": "three-ordered-slices-as-channels",
-            "slot_pooling": "none-2.5d-encoding",
-            "slot_aggregation": "per-target-masked-attention",
+            "window_pooling": "per-target-masked-attention",
+            "series_pooling": "per-target-masked-attention",
+            "slot_pooling": "per-target-masked-attention",
             "backbone_learning_rate": backbone_learning_rate,
             "head_learning_rate": head_learning_rate,
             "weight_decay": float(config["training"]["weight_decay"]),

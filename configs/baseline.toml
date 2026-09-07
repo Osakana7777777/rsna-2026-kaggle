@@ -16,13 +16,15 @@ image_size = 224
 physical_fov_mm = 130.0
 window_count = 10
 window_size = 3
+max_series_per_slot = 2
 # Reuse decoded, windowed, and resized slices across epochs. This ephemeral path
 # is not included in the training notebook outputs.
 dicom_cache_dir = "/tmp/rsna2026-dicom-cache"
 series_classification = "dicom-header-v1"
-# Pinned physical-window selection emitted by training kernel version 14.
-study_records_cache_path = "/kaggle/input/rsna-2026-slice-selection-cache/slice-selection.json.xz"
-study_records_cache_sha256 = "aec60a548b1b0a4530c5e7df3acc9dad2041696ee29943c316183048694b3201"
+# Leave these empty when the series-selection policy changes; the training
+# launcher builds and pins a matching runtime cache before GPU workers start.
+study_records_cache_path = ""
+study_records_cache_sha256 = ""
 study_records_cache_uids_sha256 = "72bb18659cba9fc84f4f363c2585f1a99f84e6f03971e4d8313813ba647aa81e"
 slots = [
   "sagittal-fluid-fs",
@@ -67,7 +69,7 @@ backbone_learning_rate = 0.000016
 head_learning_rate = 0.002
 weight_decay = 0.02
 one_cycle_warmup_fraction = 0.15
-max_runtime_hours = 8.0
+max_runtime_hours = 12.0
 validation_fraction = 0.2
 # Set to a positive value for a quicker diagnostic run; 0 uses every labeled study.
 max_train_studies = 0
@@ -101,7 +103,7 @@ input_representation = "2.5d-slice-channels"
 unfreeze_last = 6
 gradient_checkpointing = true
 pooling = "cls-patch-mean"
-aggregation = "hierarchical-target-attention"
+aggregation = "hierarchical-target-series-attention"
 attention_hidden_size = 256
 dropout = 0.25
 

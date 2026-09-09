@@ -1,7 +1,7 @@
 [project]
 name = "rsna-2026-kaggle"
 version = "0.1.0"
-description = "Kaggle-GPU workflow for RSNA 2026 experiments"
+description = "Kaggle and Runpod GPU workflow for RSNA 2026 experiments"
 requires-python = ">=3.10"
 dependencies = []
 

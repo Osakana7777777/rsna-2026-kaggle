@@ -78,7 +78,49 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=("train", "inference", "prepare-selection-cache"),
         required=True,
     )
+    parser.add_argument(
+        "--input-root",
+        help="Override paths.input_root for the current runtime",
+    )
+    parser.add_argument(
+        "--output-dir",
+        help="Override paths.output_dir for the current runtime",
+    )
+    parser.add_argument(
+        "--expected-gpu-count",
+        type=int,
+        help="Override training.expected_gpu_count for the current runtime",
+    )
+    parser.add_argument(
+        "--build-selection-cache",
+        action="store_true",
+        help="Build the study-record cache instead of using the configured mount",
+    )
     return parser.parse_args(argv)
+
+
+def apply_runtime_overrides(
+    config: dict[str, object], args: argparse.Namespace
+) -> None:
+    """Apply explicit host-specific paths and GPU topology."""
+    paths = config.get("paths")
+    training = config.get("training")
+    if not isinstance(paths, dict) or not isinstance(training, dict):
+        raise TypeError("paths and training configurations must be tables")
+    if args.input_root is not None:
+        paths["input_root"] = args.input_root
+    if args.output_dir is not None:
+        paths["output_dir"] = args.output_dir
+    if args.expected_gpu_count is not None:
+        if args.expected_gpu_count < 1:
+            raise ValueError("Expected GPU count must be positive")
+        training["expected_gpu_count"] = args.expected_gpu_count
+    if args.build_selection_cache:
+        data = config.get("data")
+        if not isinstance(data, dict):
+            raise TypeError("data configuration must be a table")
+        data["study_records_cache_path"] = ""
+        data["study_records_cache_sha256"] = ""
 
 
 def apply_study_records_cache_environment(config: dict[str, object]) -> None:
@@ -146,7 +188,7 @@ class DistributedEvaluationSampler(Sampler[int]):
 def initialize_distributed(
     config: dict[str, object], mode: str
 ) -> DistributedContext:
-    """Initialize the requested two-GPU NCCL process group."""
+    """Initialize the requested NCCL process group."""
     training_config = config.get("training", {})
     enabled = (
         mode == "train"
@@ -160,8 +202,8 @@ def initialize_distributed(
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    if expected != 2:
-        raise ValueError("This experiment requires exactly two GPUs")
+    if expected < 1:
+        raise ValueError("Expected GPU count must be positive")
     if world_size != expected:
         raise RuntimeError(
             f"Expected torchrun world size {expected}, received {world_size}"
@@ -1480,7 +1522,10 @@ def run_cross_validation_training(
         configured_cache = str(data_config.get("study_records_cache_path", ""))
         configured_sha256 = str(data_config.get("study_records_cache_sha256", ""))
         if configured_cache and configured_sha256:
-            selection_cache_path = Path(configured_cache)
+            selection_cache_path = resolve_input_file(
+                configured_cache,
+                config["paths"]["input_root"],  # type: ignore[index]
+            )
             all_records, selection_summary = load_study_records_cache(
                 selection_cache_path,
                 input_path / "train_series",
@@ -1874,6 +1919,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     started_at = time.monotonic()
     args = parse_args(argv)
     config = load_config(args.config)
+    apply_runtime_overrides(config, args)
     if args.mode == "train":
         apply_study_records_cache_environment(config)
     distributed = initialize_distributed(config, args.mode)
@@ -1892,7 +1938,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if isinstance(cv_config, dict) and bool(cv_config.get("enabled", False)):
         if not distributed.enabled:
             raise RuntimeError(
-                "Cross-validation experiment requires two-GPU distributed training"
+                "Cross-validation experiment requires distributed training"
             )
         try:
             return run_cross_validation_training(

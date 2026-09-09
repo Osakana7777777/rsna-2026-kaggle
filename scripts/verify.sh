@@ -35,6 +35,8 @@ required_files=(
   "scripts/status.sh"
   "scripts/output.sh"
   "scripts/wait.sh"
+  "scripts/runpod.sh"
+  "scripts/runpod-train.sh"
   "tests/test_public_labels.py"
   "tests/test_checkpoint.py"
   "tests/test_cross_validation.py"

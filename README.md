@@ -156,6 +156,69 @@ For a complete new training and inference cycle:
 ./scripts/push.sh submission && ./scripts/wait.sh submission && ./scripts/output.sh submission
 ```
 
+## Run training on Runpod
+
+Runpod is an alternative training host; Kaggle remains the submission host. Install
+and authenticate the current `runpodctl`, then inspect the GPU IDs currently in
+stock and create a Pod with an explicit GPU type and count:
+
+```bash
+runpodctl doctor
+./scripts/runpod.sh gpus
+./scripts/runpod.sh create \
+  --gpu-id "NVIDIA GeForce RTX 4090" \
+  --gpu-count 2 \
+  --network-volume-id YOUR_NETWORK_VOLUME_ID
+```
+
+Use `--dry-run` to inspect the complete creation command without renting a Pod.
+The default is Secure Cloud, two GPUs, a current Runpod PyTorch image, a 50 GB
+container disk, and `/workspace` as the persistent-volume mount. A disposable
+200 GB Pod volume is created when no network-volume ID is supplied. Pod billing
+continues until it is stopped or deleted:
+
+```bash
+./scripts/runpod.sh get POD_ID
+./scripts/runpod.sh stop POD_ID
+./scripts/runpod.sh delete POD_ID
+```
+
+The script does not copy competition data. Stage only data whose competition
+rules permit use on external compute. The default input layout on the persistent
+volume is:
+
+```text
+/workspace/input/
+├── rsna-knee-abnormality-detection/
+│   ├── train.csv
+│   ├── train_series.csv
+│   └── train_series/
+├── rsna-knee-llm-report-labels/
+│   └── llm_labels_v4_blend.csv
+├── rsna-2026-slice-selection-cache/
+│   └── slice-selection.json.xz
+└── dinov2-small/
+    ├── config.json
+    └── model.safetensors (or the equivalent local model-weight file)
+```
+
+After connecting to the Pod, place this repository under `/workspace`, install
+`uv`, and start training from the repository. The runner creates a uv virtual
+environment that can see the PyTorch image's system packages, installs `pydicom`
+and `transformers` if needed, validates CUDA, and uses all visible GPUs by default:
+
+```bash
+./scripts/runpod-train.sh \
+  --input-root /workspace/input \
+  --output-dir /workspace/outputs/experiment-name
+```
+
+Pass `--gpu-count 1` (or another count no larger than the Pod allocation) to use
+a subset of visible GPUs. Pass `--build-selection-cache` if the pinned selection
+cache was not staged; this rebuilds it from the staged DICOM headers before
+training. Host-specific paths and GPU count are runtime overrides, so
+`configs/baseline.toml` remains identical to the Kaggle experiment definition.
+
 ## 実験0002: 公開LLM混合ラベル
 
 学習ノートブックは公開データセット

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+
 import pytest
 
 
@@ -10,10 +12,38 @@ from torch import nn  # noqa: E402
 
 from rsna2026.train import (  # noqa: E402
     DistributedEvaluationSampler,
+    apply_runtime_overrides,
     checkpoint_state_dict,
     mean_loss_from_totals,
     merge_prediction_shards,
 )
+
+
+def test_runtime_overrides_preserve_portable_base_config() -> None:
+    config = {
+        "paths": {"input_root": "/kaggle/input", "output_dir": "/old"},
+        "training": {"expected_gpu_count": 2},
+        "data": {
+            "study_records_cache_path": "/kaggle/input/cache.json.xz",
+            "study_records_cache_sha256": "abc",
+        },
+    }
+    args = argparse.Namespace(
+        input_root="/workspace/input",
+        output_dir="/workspace/outputs",
+        expected_gpu_count=4,
+        build_selection_cache=True,
+    )
+
+    apply_runtime_overrides(config, args)
+
+    assert config["paths"] == {
+        "input_root": "/workspace/input",
+        "output_dir": "/workspace/outputs",
+    }
+    assert config["training"]["expected_gpu_count"] == 4
+    assert config["data"]["study_records_cache_path"] == ""
+    assert config["data"]["study_records_cache_sha256"] == ""
 
 
 def test_evaluation_sampler_partitions_without_padding() -> None:
@@ -71,4 +101,3 @@ def test_checkpoint_state_omits_distributed_module_prefix() -> None:
 
 def test_global_loss_uses_all_reduced_batch_totals() -> None:
     assert mean_loss_from_totals(6.0 + 10.0, 2.0 + 2.0) == 4.0
-

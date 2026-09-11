@@ -8,6 +8,35 @@ Competition data is never downloaded to this computer. Kaggle attaches it to the
 run as a read-only input below `/kaggle/input`, using `competition_sources` in
 `kaggle/kernel-metadata.json`.
 
+## Generate report-derived weak labels on Modal
+
+The private Modal application uses one RTX PRO 6000 and vLLM offline batching to
+run the pinned `google/gemma-4-26B-A4B-it` revision. Accept the model license,
+create a Modal secret named `huggingface` containing `HF_TOKEN`, and deploy
+the application:
+
+```bash
+uv sync --group labels
+./scripts/run-report-labels.sh deploy
+./scripts/run-report-labels.sh smoke
+```
+
+After the synthetic smoke test succeeds, run the frozen prompt once on an
+authorized local `train.csv`. The public-label file is used only for the final
+58-study audit and is never sent to Modal:
+
+```bash
+./scripts/run-report-labels.sh run \
+  --input-csv /authorized/path/train.csv \
+  --public-labels /authorized/path/llm_labels_v4_blend.csv
+```
+
+Only `StudyInstanceUID` and `Report` are transported. Normalized duplicate reports
+are inferred once, results are checkpointed every 128 unique reports, and reruns
+resume only when the input, prompt, model, and configuration hashes still match.
+Rich labels, compatible soft labels, hashes, failures, and audit metrics are
+written below ignored `label-outputs/`. No MRI image is read or transported.
+
 ## Layout
 
 ```text

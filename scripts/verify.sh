@@ -7,6 +7,7 @@ required_files=(
   "README.md"
   "pyproject.toml"
   "configs/baseline.toml"
+  "configs/report-labels.toml"
   "kaggle/kernel-metadata.json"
   "kaggle/train-kernel-metadata.json"
   "kaggle/eda-kernel-metadata.json"
@@ -23,6 +24,7 @@ required_files=(
   "src/rsna2026/model.py"
   "src/rsna2026/ensemble.py"
   "src/rsna2026/public_labels.py"
+  "src/rsna2026/report_labels.py"
   "src/rsna2026/slice_selection.py"
   "src/rsna2026/train.py"
   "scripts/prepare.sh"
@@ -30,6 +32,7 @@ required_files=(
   "scripts/build_selection_cache.py"
   "scripts/run_eda.py"
   "scripts/run-eda.sh"
+  "scripts/run-report-labels.sh"
   "scripts/prepare-selection-cache.sh"
   "scripts/push.sh"
   "scripts/status.sh"
@@ -50,6 +53,8 @@ required_files=(
   "tests/test_physical_crop.py"
   "tests/test_augmentation.py"
   "tests/test_dense_windows.py"
+  "tests/test_report_labels.py"
+  "modal/report_labels.py"
   "submissions/README.md"
   "submissions/TEMPLATE.md"
 )
@@ -73,9 +78,10 @@ if command -v uv >/dev/null 2>&1; then
   fi
   "${PROJECT_ROOT}/.venv/bin/python" -m compileall -q \
     "${PROJECT_ROOT}/src" "${PROJECT_ROOT}/kaggle/launcher.py" \
-    "${PROJECT_ROOT}/scripts/build_launcher.py" "${PROJECT_ROOT}/tests"
+    "${PROJECT_ROOT}/scripts/build_launcher.py" "${PROJECT_ROOT}/modal" \
+    "${PROJECT_ROOT}/tests"
   "${PROJECT_ROOT}/.venv/bin/python" -c \
-    'import json, pathlib, tomllib; root = pathlib.Path(__import__("sys").argv[1]); json.loads((root / "kaggle/kernel-metadata.json").read_text()); json.loads((root / "kaggle/train-kernel-metadata.json").read_text()); json.loads((root / "kaggle/eda-kernel-metadata.json").read_text()); tomllib.loads((root / "configs/baseline.toml").read_text())' \
+    'import json, pathlib, tomllib; root = pathlib.Path(__import__("sys").argv[1]); json.loads((root / "kaggle/kernel-metadata.json").read_text()); json.loads((root / "kaggle/train-kernel-metadata.json").read_text()); json.loads((root / "kaggle/eda-kernel-metadata.json").read_text()); [tomllib.loads((root / "configs" / name).read_text()) for name in ("baseline.toml", "report-labels.toml")]' \
     "${PROJECT_ROOT}"
 else
   echo "uv not installed; skipped Python syntax check." >&2

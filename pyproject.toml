@@ -7,6 +7,9 @@ dependencies = []
 
 [dependency-groups]
 dev = ["pytest>=8.0"]
+labels = [
+    "modal>=1.3,<2",
+]
 
 [build-system]
 requires = ["hatchling"]

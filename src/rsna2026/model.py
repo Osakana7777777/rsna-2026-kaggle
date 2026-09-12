@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 from pathlib import Path
@@ -221,6 +222,48 @@ def find_dinov2_source(input_root: str | Path, variant: str) -> Path:
     return candidates[0]
 
 
+def find_coatnet_source(
+    input_root: str | Path,
+    architecture: str,
+    weights_file: str = "model.safetensors",
+) -> Path:
+    """Find one mounted timm CoAtNet with the requested architecture and weights."""
+    root = Path(input_root)
+    if not root.is_dir():
+        raise FileNotFoundError(f"Model input root does not exist: {root}")
+    candidates = []
+    for directory, names, files in os.walk(root):
+        names[:] = [
+            name for name in names if name not in {"train_series", "test_series"}
+        ]
+        if "config.json" not in files or weights_file not in files:
+            continue
+        path = Path(directory)
+        try:
+            config = json.loads((path / "config.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        configured_architecture = str(config.get("architecture", ""))
+        pretrained_config = config.get("pretrained_cfg", {})
+        tag = (
+            str(pretrained_config.get("tag", ""))
+            if isinstance(pretrained_config, dict)
+            else ""
+        )
+        qualified_architecture = (
+            f"{configured_architecture}.{tag}" if tag else configured_architecture
+        )
+        if architecture in {configured_architecture, qualified_architecture}:
+            candidates.append(path)
+    candidates.sort()
+    if len(candidates) != 1:
+        raise FileNotFoundError(
+            f"Expected exactly one mounted CoAtNet {architecture} containing "
+            f"{weights_file}, found {candidates}"
+        )
+    return candidates[0]
+
+
 class KneeAbnormalityModel(nn.Module):
     """Encode three-slice 2.5D slots and attend to them by target."""
 
@@ -235,10 +278,11 @@ class KneeAbnormalityModel(nn.Module):
         window_count: int,
         slices_per_slot: int,
         attention_hidden_size: int,
+        backbone_family: str | None = None,
     ) -> None:
         super().__init__()
         if unfreeze_last <= 0:
-            raise ValueError("At least one DINOv2 encoder block must be trainable")
+            raise ValueError("At least one backbone block must be trainable")
         if slices_per_slot <= 0:
             raise ValueError("Slices per slot must be positive")
         if slices_per_slot != 3:
@@ -248,7 +292,8 @@ class KneeAbnormalityModel(nn.Module):
         if max_series_per_slot <= 0:
             raise ValueError("Maximum series per slot must be positive")
         self.backbone = backbone
-        layers = self._encoder_layers()
+        self.backbone_family = backbone_family or self._detect_backbone_family()
+        layers = self._backbone_blocks()
         if unfreeze_last > len(layers):
             raise ValueError(
                 f"Cannot unfreeze {unfreeze_last} of {len(layers)} encoder blocks"
@@ -258,14 +303,20 @@ class KneeAbnormalityModel(nn.Module):
         for layer in layers[-unfreeze_last:]:
             for parameter in layer.parameters():
                 parameter.requires_grad = True
-        layernorm = getattr(self.backbone, "layernorm", None)
-        if layernorm is None:
-            raise TypeError("DINOv2 backbone does not expose its final layernorm")
-        for parameter in layernorm.parameters():
+        final_norm = self._final_norm()
+        for parameter in final_norm.parameters():
             parameter.requires_grad = True
+        self._frozen_batch_norms = [
+            module
+            for module in self.backbone.modules()
+            if isinstance(module, nn.modules.batchnorm._BatchNorm)
+            and not any(parameter.requires_grad for parameter in module.parameters())
+        ]
 
-        hidden_size = int(self.backbone.config.hidden_size)
-        feature_size = hidden_size * 2
+        if self.backbone_family == "dinov2":
+            feature_size = int(self.backbone.config.hidden_size) * 2
+        else:
+            feature_size = int(getattr(self.backbone, "num_features"))
         self.head = HierarchicalTargetAttentionHead(
             feature_size=feature_size,
             hidden_size=attention_hidden_size,
@@ -288,12 +339,63 @@ class KneeAbnormalityModel(nn.Module):
             "image_std", torch.tensor(IMAGENET_STD).view(1, 3, 1, 1)
         )
 
-    def _encoder_layers(self) -> nn.ModuleList:
+    def _detect_backbone_family(self) -> str:
+        encoder = getattr(self.backbone, "encoder", None)
+        if isinstance(getattr(encoder, "layer", None), nn.ModuleList):
+            return "dinov2"
+        if hasattr(self.backbone, "stages") and hasattr(
+            self.backbone, "num_features"
+        ):
+            return "coatnet"
+        raise TypeError("Cannot determine the backbone family")
+
+    def _backbone_blocks(self) -> list[nn.Module]:
+        if self.backbone_family == "coatnet":
+            stages = getattr(self.backbone, "stages", None)
+            if not isinstance(stages, nn.Sequential):
+                raise TypeError("CoAtNet backbone does not expose sequential stages")
+            blocks = []
+            for stage in stages:
+                stage_blocks = getattr(stage, "blocks", None)
+                if not isinstance(stage_blocks, nn.Sequential):
+                    raise TypeError("CoAtNet stage does not expose sequential blocks")
+                blocks.extend(stage_blocks)
+            return blocks
+        if self.backbone_family != "dinov2":
+            raise ValueError(f"Unsupported backbone family: {self.backbone_family}")
         encoder = getattr(self.backbone, "encoder", None)
         layers = getattr(encoder, "layer", None)
         if not isinstance(layers, nn.ModuleList):
             raise TypeError("DINOv2 backbone does not expose encoder.layer")
-        return layers
+        return list(layers)
+
+    def _final_norm(self) -> nn.Module:
+        name = "layernorm" if self.backbone_family == "dinov2" else "norm"
+        final_norm = getattr(self.backbone, name, None)
+        if not isinstance(final_norm, nn.Module):
+            raise TypeError(
+                f"{self.backbone_family} backbone does not expose its final norm"
+            )
+        return final_norm
+
+    def _encode(self, pixels: torch.Tensor) -> torch.Tensor:
+        if self.backbone_family == "coatnet":
+            encoded = self.backbone(pixels)
+            if encoded.ndim != 2 or encoded.shape[1] != self.feature_size:
+                raise ValueError("CoAtNet backbone returned an invalid embedding shape")
+            return encoded
+        tokens = self.backbone(pixel_values=pixels).last_hidden_state
+        if tokens.shape[1] < 2:
+            raise ValueError("DINOv2 output did not contain patch tokens")
+        return torch.cat((tokens[:, 0], tokens[:, 1:].mean(dim=1)), dim=1)
+
+    def train(self, mode: bool = True) -> KneeAbnormalityModel:
+        """Keep running statistics fixed in frozen CoAtNet batch norms."""
+        super().train(mode)
+        if mode:
+            for module in self._frozen_batch_norms:
+                module.eval()
+        return self
 
     def forward(
         self,
@@ -337,12 +439,7 @@ class KneeAbnormalityModel(nn.Module):
         pixels = images[present.to(torch.bool)]
         pixels = (pixels - self.image_mean) / self.image_std
         if pixels.shape[0]:
-            tokens = self.backbone(pixel_values=pixels).last_hidden_state
-            if tokens.shape[1] < 2:
-                raise ValueError("DINOv2 output did not contain patch tokens")
-            encoded = torch.cat(
-                (tokens[:, 0], tokens[:, 1:].mean(dim=1)), dim=1
-            )
+            encoded = self._encode(pixels)
             features = encoded.new_zeros(
                 (
                     batch_size
@@ -354,9 +451,9 @@ class KneeAbnormalityModel(nn.Module):
             )
             features[present.reshape(-1).to(torch.bool)] = encoded
         else:
-            dummy_tokens = self.backbone(
-                pixel_values=images.new_zeros((1, 3, height, width))
-            ).last_hidden_state
+            dummy_features = self._encode(
+                images.new_zeros((1, 3, height, width))
+            )
             features = images.new_zeros(
                 (
                     batch_size
@@ -365,7 +462,7 @@ class KneeAbnormalityModel(nn.Module):
                     * self.window_count,
                     self.feature_size,
                 )
-            ) + dummy_tokens.sum() * 0.0
+            ) + dummy_features.sum() * 0.0
         window_features = features.reshape(
             batch_size,
             self.num_slots,
@@ -414,5 +511,57 @@ def build_dinov2_model(
         window_count=window_count,
         slices_per_slot=slices_per_slot,
         attention_hidden_size=attention_hidden_size,
+    )
+    return model, source
+
+
+def build_coatnet_model(
+    input_root: str | Path,
+    architecture: str,
+    weights_file: str,
+    num_targets: int,
+    unfreeze_last: int,
+    dropout: float,
+    num_slots: int,
+    max_series_per_slot: int,
+    window_count: int,
+    slices_per_slot: int,
+    attention_hidden_size: int,
+    gradient_checkpointing: bool,
+) -> tuple[KneeAbnormalityModel, Path]:
+    """Load a mounted timm CoAtNet checkpoint without network access."""
+    import timm
+    from timm.models import load_checkpoint
+
+    source = find_coatnet_source(input_root, architecture, weights_file)
+    backbone = timm.create_model(
+        architecture,
+        pretrained=False,
+        num_classes=1000,
+        in_chans=3,
+    )
+    load_checkpoint(backbone, str(source / weights_file), strict=True)
+    backbone.reset_classifier(0, global_pool="avg")
+    if int(backbone.num_features) != 768:
+        raise ValueError(
+            f"Expected a 768-dimensional CoAtNet embedding, got "
+            f"{backbone.num_features}"
+        )
+    if gradient_checkpointing:
+        checkpointing = getattr(backbone, "set_grad_checkpointing", None)
+        if not callable(checkpointing):
+            raise TypeError("CoAtNet backbone does not support gradient checkpointing")
+        checkpointing(True)
+    model = KneeAbnormalityModel(
+        backbone=backbone,
+        num_targets=num_targets,
+        unfreeze_last=unfreeze_last,
+        dropout=dropout,
+        num_slots=num_slots,
+        max_series_per_slot=max_series_per_slot,
+        window_count=window_count,
+        slices_per_slot=slices_per_slot,
+        attention_hidden_size=attention_hidden_size,
+        backbone_family="coatnet",
     )
     return model, source

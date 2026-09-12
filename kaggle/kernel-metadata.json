@@ -16,6 +16,7 @@
     "osakanateishoku/rsna-2026-training"
   ],
   "model_sources": [
-    "metaresearch/dinov2/PyTorch/small/1"
+    "metaresearch/dinov2/PyTorch/small/1",
+    "yeoyunsianggeremie/timm-models/PyTorch/coatnet_0_rw_224.sw_in1k/1"
   ]
 }

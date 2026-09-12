@@ -48,7 +48,25 @@ kernel_id() {
 }
 
 require_configured_metadata() {
-  if grep -q 'YOUR_' "${METADATA_FILE}" "${PROJECT_ROOT}/configs/baseline.toml"; then
+  local requested_config="${1:-configs/baseline.toml}"
+  local config_path
+  if [[ "${requested_config}" = /* ]]; then
+    config_path="${requested_config}"
+  else
+    config_path="${PROJECT_ROOT}/${requested_config}"
+  fi
+  if [[ ! -f "${config_path}" ]]; then
+    echo "Configuration not found: ${config_path}" >&2
+    exit 1
+  fi
+  local config_parent
+  config_parent="$(cd "$(dirname "${config_path}")" && pwd -P)"
+  if [[ "${config_parent}" != "${PROJECT_ROOT}/configs" ]] || \
+      [[ "${config_path}" != *.toml ]]; then
+    echo "Configuration must be a TOML file directly below configs/: ${config_path}" >&2
+    exit 1
+  fi
+  if grep -q 'YOUR_' "${METADATA_FILE}" "${config_path}"; then
     echo "Replace every YOUR_... placeholder in kernel metadata and config first." >&2
     exit 1
   fi

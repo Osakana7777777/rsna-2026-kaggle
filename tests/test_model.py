@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+import sys
+import types
+
 import pytest
 
 
@@ -11,6 +15,8 @@ from rsna2026.model import (  # noqa: E402
     HierarchicalTargetAttentionHead,
     KneeAbnormalityModel,
     TargetAttentionHead,
+    build_coatnet_model,
+    find_coatnet_source,
 )
 
 
@@ -27,6 +33,48 @@ class DummyBackbone(nn.Module):
         self.received = pixel_values.detach().clone()
         tokens = pixel_values.new_zeros((len(pixel_values), 2, 2))
         return type("Output", (), {"last_hidden_state": tokens})()
+
+
+class DummyCoAtNet(nn.Module):
+    def __init__(self, feature_size: int = 4) -> None:
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, feature_size, 1), nn.BatchNorm2d(feature_size)
+        )
+        self.stages = nn.Sequential(
+            *(self._stage(count, feature_size) for count in (2, 3, 7, 2))
+        )
+        self.norm = nn.BatchNorm2d(feature_size)
+        self.num_features = feature_size
+        self.checkpointing = False
+
+    @staticmethod
+    def _stage(count: int, feature_size: int) -> nn.Module:
+        stage = nn.Module()
+        stage.blocks = nn.Sequential(
+            *(
+                nn.Sequential(
+                    nn.BatchNorm2d(feature_size),
+                    nn.Conv2d(feature_size, feature_size, 1),
+                )
+                for _ in range(count)
+            )
+        )
+        return stage
+
+    def reset_classifier(self, num_classes: int, global_pool: str) -> None:
+        assert num_classes == 0
+        assert global_pool == "avg"
+
+    def set_grad_checkpointing(self, enabled: bool) -> None:
+        self.checkpointing = enabled
+
+    def forward(self, pixels):
+        values = self.stem(pixels)
+        for stage in self.stages:
+            values = stage.blocks(values)
+        values = self.norm(values)
+        return values.mean(dim=(2, 3))
 
 
 def test_target_attention_masks_missing_slots_and_renormalizes() -> None:
@@ -93,6 +141,172 @@ def test_model_requires_three_slices_for_2_5d_input() -> None:
             slices_per_slot=1,
             attention_hidden_size=4,
         )
+
+
+def test_coatnet_unfreezes_last_six_blocks_and_keeps_frozen_bn_fixed() -> None:
+    backbone = DummyCoAtNet()
+    model = KneeAbnormalityModel(
+        backbone=backbone,
+        backbone_family="coatnet",
+        num_targets=12,
+        unfreeze_last=6,
+        dropout=0.0,
+        num_slots=1,
+        max_series_per_slot=1,
+        window_count=1,
+        slices_per_slot=3,
+        attention_hidden_size=4,
+    )
+    blocks = [block for stage in backbone.stages for block in stage.blocks]
+
+    assert all(not any(p.requires_grad for p in block.parameters()) for block in blocks[:8])
+    assert all(any(p.requires_grad for p in block.parameters()) for block in blocks[8:])
+    assert all(parameter.requires_grad for parameter in backbone.norm.parameters())
+
+    model.train()
+    assert backbone.stem[1].training is False
+    assert blocks[0][0].training is False
+    assert blocks[-1][0].training is True
+    assert backbone.norm.training is True
+
+
+def test_coatnet_connects_embeddings_to_hierarchical_attention() -> None:
+    backbone = DummyCoAtNet()
+    model = KneeAbnormalityModel(
+        backbone=backbone,
+        backbone_family="coatnet",
+        num_targets=12,
+        unfreeze_last=6,
+        dropout=0.0,
+        num_slots=2,
+        max_series_per_slot=1,
+        window_count=2,
+        slices_per_slot=3,
+        attention_hidden_size=4,
+    )
+    images = torch.rand(1, 2, 1, 2, 3, 8, 8)
+    present = torch.tensor([[[[True, False]], [[True, True]]]])
+    positions = torch.zeros(1, 2, 1, 2, 3)
+
+    logits, window_attention, series_attention, slot_attention = model(
+        images, present, positions, return_attention=True
+    )
+
+    assert logits.shape == (1, 12)
+    assert window_attention.shape == (1, 12, 2, 1, 2)
+    assert series_attention.shape == (1, 12, 2, 1)
+    assert slot_attention.shape == (1, 12, 2)
+
+
+def test_coatnet_empty_windows_preserve_backbone_gradient_path() -> None:
+    backbone = DummyCoAtNet()
+    model = KneeAbnormalityModel(
+        backbone=backbone,
+        backbone_family="coatnet",
+        num_targets=2,
+        unfreeze_last=6,
+        dropout=0.0,
+        num_slots=1,
+        max_series_per_slot=1,
+        window_count=1,
+        slices_per_slot=3,
+        attention_hidden_size=4,
+    )
+    images = torch.zeros(1, 1, 1, 1, 3, 8, 8)
+    present = torch.zeros(1, 1, 1, 1, dtype=torch.bool)
+    positions = torch.zeros(1, 1, 1, 1, 3)
+
+    model(images, present, positions).sum().backward()
+
+    trainable = [
+        parameter
+        for parameter in backbone.parameters()
+        if parameter.requires_grad
+    ]
+    assert trainable
+    assert all(parameter.grad is not None for parameter in trainable)
+
+
+def test_find_coatnet_source_requires_matching_config_and_weights(tmp_path) -> None:
+    source = tmp_path / "mounted-model"
+    source.mkdir()
+    (source / "config.json").write_text(
+        json.dumps(
+            {
+                "architecture": "coatnet_0_rw_224",
+                "pretrained_cfg": {"tag": "sw_in1k"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (source / "model.safetensors").write_bytes(b"weights")
+
+    assert find_coatnet_source(
+        tmp_path, "coatnet_0_rw_224.sw_in1k"
+    ) == source
+
+    duplicate = tmp_path / "duplicate"
+    duplicate.mkdir()
+    (duplicate / "config.json").write_text(
+        (source / "config.json").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (duplicate / "model.safetensors").write_bytes(b"weights")
+    with pytest.raises(FileNotFoundError, match="exactly one"):
+        find_coatnet_source(tmp_path, "coatnet_0_rw_224.sw_in1k")
+
+
+def test_build_coatnet_uses_strict_offline_checkpoint_loading(
+    tmp_path, monkeypatch
+) -> None:
+    source = tmp_path / "mounted-model"
+    source.mkdir()
+    (source / "config.json").write_text(
+        json.dumps(
+            {
+                "architecture": "coatnet_0_rw_224",
+                "pretrained_cfg": {"tag": "sw_in1k"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (source / "model.safetensors").write_bytes(b"weights")
+    backbone = DummyCoAtNet(feature_size=768)
+    calls = {}
+
+    timm = types.ModuleType("timm")
+    timm.create_model = lambda *args, **kwargs: backbone
+    timm_models = types.ModuleType("timm.models")
+
+    def fake_load_checkpoint(model, path, strict):
+        calls.update(model=model, path=path, strict=strict)
+
+    timm_models.load_checkpoint = fake_load_checkpoint
+    monkeypatch.setitem(sys.modules, "timm", timm)
+    monkeypatch.setitem(sys.modules, "timm.models", timm_models)
+
+    model, found_source = build_coatnet_model(
+        input_root=tmp_path,
+        architecture="coatnet_0_rw_224.sw_in1k",
+        weights_file="model.safetensors",
+        num_targets=12,
+        unfreeze_last=6,
+        dropout=0.0,
+        num_slots=1,
+        max_series_per_slot=1,
+        window_count=1,
+        slices_per_slot=3,
+        attention_hidden_size=4,
+        gradient_checkpointing=True,
+    )
+
+    assert found_source == source
+    assert model.backbone is backbone
+    assert calls == {
+        "model": backbone,
+        "path": str(source / "model.safetensors"),
+        "strict": True,
+    }
+    assert backbone.checkpointing is True
 
 
 def test_hierarchical_attention_masks_windows_and_slots() -> None:

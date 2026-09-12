@@ -1,0 +1,141 @@
+[competition]
+# The competition folder name. Both /kaggle/input/<slug> and
+# /kaggle/input/competitions/<slug> are supported.
+input_slug = "rsna-knee-abnormality-detection"
+
+[paths]
+input_root = "/kaggle/input"
+working_root = "/kaggle/working"
+output_dir = "/kaggle/working/outputs"
+
+[run]
+seed = 42
+
+[data]
+image_size = 224
+physical_fov_mm = 130.0
+window_count = 10
+window_size = 3
+max_series_per_slot = 1
+# Reuse decoded, windowed, and resized slices across epochs. This ephemeral path
+# is not included in the training notebook outputs.
+dicom_cache_dir = "/tmp/rsna2026-dicom-cache"
+series_classification = "competition-series-table-v1"
+# The legacy selection-record cache is deliberately disabled. Selection records
+# are rebuilt from the pinned image-cache manifests and the competition table.
+study_records_cache_path = ""
+study_records_cache_sha256 = ""
+study_records_cache_uids_sha256 = "72bb18659cba9fc84f4f363c2585f1a99f84e6f03971e4d8313813ba647aa81e"
+slots = [
+  "sagittal-fluid",
+  "coronal-fluid",
+  "axial-fluid",
+  "sagittal-structural",
+  "coronal-structural",
+  "axial-structural",
+]
+
+[image_cache]
+enabled = true
+manifest_paths = [
+  "/kaggle/input/rsna-2026-preprocess-shard-0/outputs/image-cache/cache-manifest.json",
+  "/kaggle/input/rsna-2026-preprocess-shard-1/outputs/image-cache/cache-manifest.json",
+  "/kaggle/input/rsna-2026-preprocess-shard-2/outputs/image-cache/cache-manifest.json",
+  "/kaggle/input/rsna-2026-preprocess-shard-3/outputs/image-cache/cache-manifest.json",
+]
+manifest_sha256 = [
+  "13437172941ca71c12a556a763a46d7dbb185c96457573e752abaabf3f22346a",
+  "beaa99b55409dc3a706477039c2b07bf3cc5306d36d8e96a8e4e4fb929fe611b",
+  "e7c2d8c9f122fede187d96674170a516a1939d722c88361985377ff303b155b9",
+  "e590c0f51175f88b8a6e542e4e21d36f6231e865bd856404091822b38b6dd647",
+]
+expected_studies = 4407
+expected_series = 24371
+expected_images = 665954
+expected_failed_images = 2
+expected_selected_series = 21334
+
+[image_cache.expected_missing_by_slot]
+sagittal-fluid = 257
+coronal-fluid = 159
+axial-fluid = 0
+sagittal-structural = 141
+coronal-structural = 1001
+axial-structural = 3550
+
+[augmentation]
+enabled = true
+rotation_degrees = 8.0
+rotation_probability = 0.5
+translation_fraction = 0.05
+scale_min = 0.92
+scale_max = 1.08
+affine_probability = 0.5
+brightness_limit = 0.10
+contrast_limit = 0.10
+brightness_contrast_probability = 0.4
+gamma_min = 0.85
+gamma_max = 1.15
+gamma_probability = 0.3
+noise_std_max = 0.02
+noise_probability = 0.2
+blur_kernel_sizes = [3, 5]
+blur_sigma_min = 0.1
+blur_sigma_max = 1.0
+blur_probability = 0.1
+
+[training]
+epochs = 20
+# One study per GPU with four-step accumulation preserves an effective batch of 8.
+batch_size_per_device = 1
+gradient_accumulation_steps = 4
+inference_batch_size = 1
+num_workers = 2
+distributed = true
+expected_gpu_count = 2
+backbone_learning_rate = 0.000016
+head_learning_rate = 0.002
+weight_decay = 0.02
+one_cycle_warmup_fraction = 0.15
+max_runtime_hours = 8.5
+validation_fraction = 0.2
+# Set to a positive value for a quicker diagnostic run; 0 uses every labeled study.
+max_train_studies = 0
+
+[cross_validation]
+enabled = true
+folds = 4
+outer_seed = 42
+inner_seed = 1042
+inner_validation_fraction = 0.20
+gold_loss_weight = 3.0
+bootstrap_resamples = 5000
+test_ensemble = "per-target-percentile-rank-mean"
+split_algorithm = "report-group-multilabel-v1"
+
+[pseudo_labels]
+enabled = true
+dataset = "stevenleehans/rsna-knee-llm-report-labels"
+file_name = "llm_labels_v4_blend.csv"
+source_path = "/kaggle/input/rsna-knee-llm-report-labels/llm_labels_v4_blend.csv"
+sha256 = "eb4c2b29e7e84adbb4b5ccee825ca20ade6a43dbe295f13be442d549e4f5dca4"
+expected_rows = 4407
+max_studies = 4345
+expected_validation_studies = 58
+minimum_source_macro_auc = 0.88
+
+[model]
+name = "coatnet-0"
+variant = "coatnet_0_rw_224.sw_in1k"
+weights_file = "model.safetensors"
+input_representation = "2.5d-slice-channels"
+unfreeze_last = 6
+gradient_checkpointing = true
+pooling = "global-average"
+aggregation = "hierarchical-target-series-attention"
+attention_hidden_size = 256
+dropout = 0.25
+
+[inference]
+# Training-notebook outputs are mounted below /kaggle/input using the notebook slug.
+ensemble_manifest_path = "/kaggle/input/rsna-2026-training/outputs/ensemble-manifest.json"

@@ -23,8 +23,15 @@ case "${RUN_KIND}" in
     OUTPUT_DIR="${PROJECT_ROOT}/outputs/eda"
     RUN_MODE="eda"
     ;;
+  preprocess-[0-3])
+    shard_index="${RUN_KIND#preprocess-}"
+    METADATA_FILE="${PROJECT_ROOT}/kaggle/preprocess-${shard_index}-kernel-metadata.json"
+    BUILD_DIR="${PROJECT_ROOT}/.kaggle-build/preprocess-${shard_index}"
+    OUTPUT_DIR="${PROJECT_ROOT}/outputs/preprocess-${shard_index}"
+    RUN_MODE="preprocess-${shard_index}"
+    ;;
   *)
-    echo "Usage: $0 [train|submission|eda]" >&2
+    echo "Usage: $0 [train|submission|eda|preprocess-{0..3}]" >&2
     exit 2
     ;;
 esac

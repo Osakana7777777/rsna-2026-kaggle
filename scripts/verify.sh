@@ -10,6 +10,10 @@ required_files=(
   "kaggle/kernel-metadata.json"
   "kaggle/train-kernel-metadata.json"
   "kaggle/eda-kernel-metadata.json"
+  "kaggle/preprocess-0-kernel-metadata.json"
+  "kaggle/preprocess-1-kernel-metadata.json"
+  "kaggle/preprocess-2-kernel-metadata.json"
+  "kaggle/preprocess-3-kernel-metadata.json"
   "kaggle/selection-cache-dataset-metadata.json"
   "kaggle/launcher.py"
   "src/rsna2026/checkpoint.py"
@@ -20,6 +24,7 @@ required_files=(
   "src/rsna2026/cross_validation.py"
   "src/rsna2026/data.py"
   "src/rsna2026/dataset.py"
+  "src/rsna2026/image_cache.py"
   "src/rsna2026/model.py"
   "src/rsna2026/ensemble.py"
   "src/rsna2026/public_labels.py"
@@ -30,6 +35,7 @@ required_files=(
   "scripts/build_selection_cache.py"
   "scripts/run_eda.py"
   "scripts/run-eda.sh"
+  "scripts/run-image-cache.sh"
   "scripts/prepare-selection-cache.sh"
   "scripts/push.sh"
   "scripts/status.sh"
@@ -50,6 +56,7 @@ required_files=(
   "tests/test_physical_crop.py"
   "tests/test_augmentation.py"
   "tests/test_dense_windows.py"
+  "tests/test_image_cache.py"
   "submissions/README.md"
   "submissions/TEMPLATE.md"
 )
@@ -75,7 +82,7 @@ if command -v uv >/dev/null 2>&1; then
     "${PROJECT_ROOT}/src" "${PROJECT_ROOT}/kaggle/launcher.py" \
     "${PROJECT_ROOT}/scripts/build_launcher.py" "${PROJECT_ROOT}/tests"
   "${PROJECT_ROOT}/.venv/bin/python" -c \
-    'import json, pathlib, tomllib; root = pathlib.Path(__import__("sys").argv[1]); json.loads((root / "kaggle/kernel-metadata.json").read_text()); json.loads((root / "kaggle/train-kernel-metadata.json").read_text()); json.loads((root / "kaggle/eda-kernel-metadata.json").read_text()); tomllib.loads((root / "configs/baseline.toml").read_text())' \
+    'import json, pathlib, tomllib; root = pathlib.Path(__import__("sys").argv[1]); files = ["kernel-metadata.json", "train-kernel-metadata.json", "eda-kernel-metadata.json", *[f"preprocess-{index}-kernel-metadata.json" for index in range(4)]]; [json.loads((root / "kaggle" / name).read_text()) for name in files]; tomllib.loads((root / "configs/baseline.toml").read_text())' \
     "${PROJECT_ROOT}"
 else
   echo "uv not installed; skipped Python syntax check." >&2

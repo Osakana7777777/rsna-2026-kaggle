@@ -6,6 +6,7 @@ from rsna2026.acquisition import (
     SLOT_NAMES,
     choose_largest_series,
     classify_acquisition,
+    match_series_table_slot,
     rank_series_by_size,
     resolve_slots,
 )
@@ -55,15 +56,28 @@ def test_classifies_acquisition_from_header(
     assert result.weighting_source == source
 
 
-def test_maps_acquisitions_to_fixed_slots_without_fallback() -> None:
+def test_maps_competition_attributes_to_fixed_slots_without_fallback() -> None:
     slots = resolve_slots(SLOT_NAMES)
-    t1 = classify_acquisition({"SeriesDescription": "T1 COR"})
-    unknown = classify_acquisition({})
 
-    assert [slot.name for slot in slots if slot.matches("coronal", t1)] == [
-        "coronal-t1"
+    assert match_series_table_slot("coronal", 1, 1) == (
+        "coronal-fluid",
+        None,
+    )
+    assert match_series_table_slot("sagittal", 0, 0) == (
+        "sagittal-structural",
+        None,
+    )
+    assert match_series_table_slot("axial", 1, 0) == (
+        None,
+        "mixed-series-attributes",
+    )
+    assert match_series_table_slot("oblique", 1, 1) == (
+        None,
+        "unsupported-plane",
+    )
+    assert [slot.name for slot in slots if slot.matches("axial", True, True)] == [
+        "axial-fluid"
     ]
-    assert not any(slot.matches("coronal", unknown) for slot in slots)
 
 
 def test_selects_largest_series_with_uid_tie_break() -> None:

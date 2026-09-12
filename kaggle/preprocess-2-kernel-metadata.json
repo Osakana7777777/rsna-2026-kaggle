@@ -1,0 +1,16 @@
+{
+  "id": "osakanateishoku/rsna-2026-preprocess-shard-2",
+  "title": "RSNA 2026 Preprocess Shard 2",
+  "code_file": "launcher.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": false,
+  "dataset_sources": [],
+  "competition_sources": [
+    "rsna-knee-abnormality-detection"
+  ],
+  "kernel_sources": [],
+  "model_sources": []
+}

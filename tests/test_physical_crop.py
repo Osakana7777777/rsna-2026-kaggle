@@ -108,7 +108,7 @@ def test_artifact_metadata_binds_physical_preprocessing() -> None:
             "window_count": 10,
             "window_size": 3,
             "max_series_per_slot": 2,
-            "series_classification": "dicom-header-v1",
+            "series_classification": "competition-series-table-v1",
             "slots": ["slot"],
         },
         "model": {

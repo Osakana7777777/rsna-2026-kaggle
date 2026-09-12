@@ -68,25 +68,45 @@ def run_payload() -> int:
             "/kaggle/working/outputs/eda",
         ])
 
+    image_cache_modes = {
+        f"preprocess-{index}": index for index in range(4)
+    }
+    selected_mode = (
+        "prepare-image-cache" if RUN_MODE in image_cache_modes else RUN_MODE
+    )
     arguments = [
         "--config",
         str(PAYLOAD_ROOT / "configs" / "baseline.toml"),
         "--mode",
-        RUN_MODE,
+        selected_mode,
     ]
+    if RUN_MODE in image_cache_modes:
+        arguments.extend(
+            [
+                "--cache-shard-index",
+                str(image_cache_modes[RUN_MODE]),
+                "--cache-shard-count",
+                str(len(image_cache_modes)),
+            ]
+        )
     if RUN_MODE != "train":
         return train_main(arguments)
 
     environment = os.environ.copy()
     config = load_config(arguments[1])
     data_config = config["data"]
+    image_cache_config = config.get("image_cache", {})
+    persistent_image_cache = (
+        isinstance(image_cache_config, dict)
+        and bool(image_cache_config.get("enabled", False))
+    )
     configured_cache = str(data_config.get("study_records_cache_path", ""))
     configured_sha256 = str(data_config.get("study_records_cache_sha256", ""))
     if bool(configured_cache) != bool(configured_sha256):
         raise ValueError(
             "Configured study-record cache path and SHA-256 must be set together"
         )
-    if not configured_cache:
+    if not configured_cache and not persistent_image_cache:
         preparation_arguments = [
             "--config",
             arguments[1],
@@ -105,6 +125,11 @@ def run_payload() -> int:
         print(
             "Starting two-GPU training with the newly prepared physical-window "
             f"selection cache: sha256={cache_sha256}",
+            flush=True,
+        )
+    elif persistent_image_cache:
+        print(
+            "Starting two-GPU training from the pinned persistent image cache",
             flush=True,
         )
     source_root = str(PAYLOAD_ROOT / "src")

@@ -11,6 +11,7 @@ from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
@@ -20,13 +21,20 @@ from torch.nn import functional
 from torch.utils.data import Dataset
 
 from rsna2026.acquisition import (
+    CLASSIFICATION_SOURCE,
     CLASSIFICATION_METHOD,
     AcquisitionClass,
+    binary_series_attribute,
+    classify_acquisition,
+    match_series_table_slot,
     rank_series_by_size,
     read_acquisition_header,
     resolve_slots,
 )
 from rsna2026.slice_selection import select_physical_windows
+
+if TYPE_CHECKING:
+    from rsna2026.image_cache import ImageCacheReader
 
 
 ORDERING_WORKERS = 16
@@ -56,8 +64,12 @@ class SeriesClassification:
     plane: str
     total_slices: int
     weighting: str
-    fluid_sensitive: bool
-    fat_suppressed: bool
+    fluid_sensitive: bool | None
+    fat_suppressed: bool | None
+    classification_source: str
+    unassigned_reason: str | None
+    dicom_fluid_sensitive: bool | None
+    dicom_fat_suppressed: bool | None
     weighting_source: str
     fat_suppression_source: str
     representative_path: str
@@ -75,6 +87,10 @@ class SeriesSelection:
     weighting: str | None
     fluid_sensitive: bool | None
     fat_suppressed: bool | None
+    classification_source: str
+    unassigned_reason: str | None
+    dicom_fluid_sensitive: bool | None
+    dicom_fat_suppressed: bool | None
     weighting_source: str
     fat_suppression_source: str
     representative_path: str | None
@@ -99,6 +115,9 @@ class _SeriesCandidate:
     series_dir: Path
     paths: tuple[Path, ...]
     acquisition: AcquisitionClass
+    fluid_sensitive: bool | None
+    fat_suppressed: bool | None
+    unassigned_reason: str | None
     representative_path: Path
     matching_slots: tuple[str, ...]
 
@@ -122,20 +141,26 @@ def build_study_records(
             f"Unsupported series classification method: {classification_method}"
         )
     slots = resolve_slots(slot_names)
-    required = {"StudyInstanceUID", "SeriesInstanceUID", "Anatomical_Plane"}
+    required = {
+        "StudyInstanceUID",
+        "SeriesInstanceUID",
+        "Anatomical_Plane",
+        "Fluid_Sensitive",
+        "Fat_Suppression",
+    }
     missing = required.difference(series_table.columns)
     if missing:
         raise ValueError(f"Series table is missing columns: {sorted(missing)}")
 
     wanted = {str(uid) for uid in study_uids}
-    series_inputs: dict[tuple[str, str], tuple[str, Path, tuple[Path, ...]]] = {}
+    series_inputs: dict[
+        tuple[str, str], tuple[str, object, object, Path, tuple[Path, ...]]
+    ] = {}
     for row in series_table.itertuples(index=False):
         study_uid = str(row.StudyInstanceUID)
         if study_uid not in wanted:
             continue
         plane = str(row.Anatomical_Plane).strip().lower()
-        if plane not in {slot.plane for slot in slots}:
-            continue
         series_uid = str(row.SeriesInstanceUID)
         series_dir = image_root / study_uid / series_uid
         paths = (
@@ -144,12 +169,22 @@ def build_study_records(
             else ()
         )
         if paths:
-            series_inputs[(study_uid, series_uid)] = (plane, series_dir, paths)
+            series_inputs[(study_uid, series_uid)] = (
+                plane,
+                row.Fluid_Sensitive,
+                row.Fat_Suppression,
+                series_dir,
+                paths,
+            )
 
     def classify_series(
-        item: tuple[tuple[str, str], tuple[str, Path, tuple[Path, ...]]]
+        item: tuple[
+            tuple[str, str],
+            tuple[str, object, object, Path, tuple[Path, ...]],
+        ]
     ) -> _SeriesCandidate:
-        (study_uid, series_uid), (plane, series_dir, paths) = item
+        (study_uid, series_uid), values = item
+        plane, raw_fluid, raw_fat, series_dir, paths = values
         representative = paths[len(paths) // 2]
         try:
             acquisition = read_acquisition_header(representative)
@@ -161,9 +196,20 @@ def build_study_records(
                 weighting_source=f"read-error:{type(error).__name__}",
                 fat_suppression_source=f"read-error:{type(error).__name__}",
             )
-        matching = tuple(
-            slot.name for slot in slots if slot.matches(plane, acquisition)
+        slot_name, unassigned_reason = match_series_table_slot(
+            plane, raw_fluid, raw_fat
         )
+        try:
+            fluid_sensitive = binary_series_attribute(
+                raw_fluid, "Fluid_Sensitive"
+            )
+            fat_suppressed = binary_series_attribute(
+                raw_fat, "Fat_Suppression"
+            )
+        except ValueError:
+            fluid_sensitive = None
+            fat_suppressed = None
+        matching = (slot_name,) if slot_name in {slot.name for slot in slots} else ()
         return _SeriesCandidate(
             study_uid=study_uid,
             series_uid=series_uid,
@@ -171,6 +217,9 @@ def build_study_records(
             series_dir=series_dir,
             paths=paths,
             acquisition=acquisition,
+            fluid_sensitive=fluid_sensitive,
+            fat_suppressed=fat_suppressed,
+            unassigned_reason=unassigned_reason,
             representative_path=representative,
             matching_slots=matching,
         )
@@ -192,8 +241,12 @@ def build_study_records(
                 plane=candidate.plane,
                 total_slices=len(candidate.paths),
                 weighting=candidate.acquisition.weighting,
-                fluid_sensitive=candidate.acquisition.fluid_sensitive,
-                fat_suppressed=candidate.acquisition.fat_suppressed,
+                fluid_sensitive=candidate.fluid_sensitive,
+                fat_suppressed=candidate.fat_suppressed,
+                classification_source=CLASSIFICATION_SOURCE,
+                unassigned_reason=candidate.unassigned_reason,
+                dicom_fluid_sensitive=candidate.acquisition.fluid_sensitive,
+                dicom_fat_suppressed=candidate.acquisition.fat_suppressed,
                 weighting_source=candidate.acquisition.weighting_source,
                 fat_suppression_source=(
                     candidate.acquisition.fat_suppression_source
@@ -286,9 +339,21 @@ def build_study_records(
                             acquisition.weighting if acquisition else None
                         ),
                         fluid_sensitive=(
-                            acquisition.fluid_sensitive if acquisition else None
+                            candidate.fluid_sensitive if candidate else None
                         ),
                         fat_suppressed=(
+                            candidate.fat_suppressed if candidate else None
+                        ),
+                        classification_source=(
+                            CLASSIFICATION_SOURCE if candidate else "missing"
+                        ),
+                        unassigned_reason=(
+                            candidate.unassigned_reason if candidate else "missing"
+                        ),
+                        dicom_fluid_sensitive=(
+                            acquisition.fluid_sensitive if acquisition else None
+                        ),
+                        dicom_fat_suppressed=(
                             acquisition.fat_suppressed if acquisition else None
                         ),
                         weighting_source=(
@@ -340,6 +405,290 @@ def build_study_records(
                         key=lambda item: item.series_uid,
                     )
                 ),
+            )
+        )
+    return records
+
+
+def build_cached_study_records(
+    series_table: pd.DataFrame,
+    cache_reader: "ImageCacheReader",
+    study_uids: Sequence[str],
+    window_count: int,
+    max_series_per_slot: int,
+    slot_names: Sequence[str],
+    classification_method: str,
+) -> list[StudyRecord]:
+    """Build slot selections from competition rows and cached physical windows."""
+    if classification_method != CLASSIFICATION_METHOD:
+        raise ValueError(
+            f"Unsupported series classification method: {classification_method}"
+        )
+    if window_count <= 0 or max_series_per_slot <= 0:
+        raise ValueError("Window and maximum-series counts must be positive")
+    slots = resolve_slots(slot_names)
+    required = {
+        "StudyInstanceUID",
+        "SeriesInstanceUID",
+        "Anatomical_Plane",
+        "Fluid_Sensitive",
+        "Fat_Suppression",
+    }
+    missing = required.difference(series_table.columns)
+    if missing:
+        raise ValueError(f"Series table is missing columns: {sorted(missing)}")
+
+    wanted = {str(uid) for uid in study_uids}
+    table_rows: dict[tuple[str, str], object] = {}
+    for row in series_table.itertuples(index=False):
+        key = (str(row.StudyInstanceUID), str(row.SeriesInstanceUID))
+        if key[0] not in wanted:
+            continue
+        if key in table_rows:
+            raise ValueError(f"Duplicate series-table row: {key}")
+        table_rows[key] = row
+
+    records = []
+    for uid in study_uids:
+        study_uid = str(uid)
+        study_metadata = cache_reader.study_metadata(study_uid)
+        cached_series = {
+            str(series["series_uid"]): series
+            for series in study_metadata["series"]  # type: ignore[index]
+        }
+        expected_keys = {
+            series_uid
+            for row_study_uid, series_uid in table_rows
+            if row_study_uid == study_uid
+        }
+        if set(cached_series) != expected_keys:
+            raise ValueError(f"Cached series set changed for study {study_uid}")
+        cached_paths = {
+            str(path) for path in study_metadata["relative_paths"]  # type: ignore[index]
+        }
+
+        classifications = []
+        candidates: dict[str, list[tuple[str, Mapping[str, object], object]]] = {}
+        classified_values: dict[
+            str, tuple[object, AcquisitionClass, str | None, bool | None, bool | None]
+        ] = {}
+        for series_uid, metadata in sorted(cached_series.items()):
+            row = table_rows[(study_uid, series_uid)]
+            slot_name, unassigned_reason = match_series_table_slot(
+                row.Anatomical_Plane,
+                row.Fluid_Sensitive,
+                row.Fat_Suppression,
+            )
+            try:
+                fluid_sensitive = binary_series_attribute(
+                    row.Fluid_Sensitive, "Fluid_Sensitive"
+                )
+                fat_suppressed = binary_series_attribute(
+                    row.Fat_Suppression, "Fat_Suppression"
+                )
+            except ValueError:
+                fluid_sensitive = None
+                fat_suppressed = None
+            acquisition = classify_acquisition(metadata["acquisition_header"])
+            matching_slots = (
+                (slot_name,)
+                if slot_name in {slot.name for slot in slots}
+                else ()
+            )
+            classified_values[series_uid] = (
+                row,
+                acquisition,
+                unassigned_reason,
+                fluid_sensitive,
+                fat_suppressed,
+            )
+            classifications.append(
+                SeriesClassification(
+                    series_uid=series_uid,
+                    plane=str(row.Anatomical_Plane).strip().lower(),
+                    total_slices=int(metadata["total_slices"]),
+                    weighting=acquisition.weighting,
+                    fluid_sensitive=fluid_sensitive,
+                    fat_suppressed=fat_suppressed,
+                    classification_source=CLASSIFICATION_SOURCE,
+                    unassigned_reason=unassigned_reason,
+                    dicom_fluid_sensitive=acquisition.fluid_sensitive,
+                    dicom_fat_suppressed=acquisition.fat_suppressed,
+                    weighting_source=acquisition.weighting_source,
+                    fat_suppression_source=acquisition.fat_suppression_source,
+                    representative_path=str(metadata["representative_path"]),
+                    matching_slots=matching_slots,
+                )
+            )
+            if slot_name in matching_slots:
+                candidates.setdefault(slot_name, []).append(
+                    (series_uid, metadata, row)
+                )
+
+        selected_windows: list[
+            tuple[Path | None, Path | None, Path | None]
+        ] = []
+        position_features: list[tuple[float, float, float]] = []
+        selections = []
+        for slot in slots:
+            slot_candidates = candidates.get(slot.name, [])
+            ordered_uids = rank_series_by_size(
+                [
+                    (series_uid, int(metadata["total_slices"]))
+                    for series_uid, metadata, _ in slot_candidates
+                ]
+            ) if slot_candidates else ()
+            by_uid = {
+                series_uid: (metadata, row)
+                for series_uid, metadata, row in slot_candidates
+            }
+            chosen_uids = ordered_uids[:max_series_per_slot]
+            for series_index in range(max_series_per_slot):
+                if series_index < len(chosen_uids):
+                    series_uid = chosen_uids[series_index]
+                    metadata, row = by_uid[series_uid]
+                    (
+                        _,
+                        acquisition,
+                        unassigned_reason,
+                        fluid_sensitive,
+                        fat_suppressed,
+                    ) = classified_values[series_uid]
+                    windows = tuple(
+                        tuple(Path(str(path)) for path in window)
+                        for window in metadata["selected_windows"]
+                    )
+                    features = tuple(
+                        tuple(float(value) for value in feature)
+                        for feature in metadata["position_features"]
+                    )
+                    if len(windows) > window_count or len(features) != len(windows):
+                        raise ValueError(
+                            f"Cached physical-window layout changed for {series_uid}"
+                        )
+                    referenced_paths = {
+                        path.as_posix() for window in windows for path in window
+                    }
+                    if any(len(window) != 3 for window in windows):
+                        raise ValueError(
+                            f"Cached window size changed for {series_uid}"
+                        )
+                    if not referenced_paths.issubset(cached_paths):
+                        raise ValueError(
+                            f"Cached window paths changed for {series_uid}"
+                        )
+                else:
+                    series_uid = None
+                    metadata = None
+                    acquisition = None
+                    unassigned_reason = "missing"
+                    fluid_sensitive = None
+                    fat_suppressed = None
+                    windows = ()
+                    features = ()
+                selected_windows.extend(windows)
+                selected_windows.extend(
+                    [(None, None, None)] * (window_count - len(windows))
+                )
+                position_features.extend(features)
+                position_features.extend(
+                    [(0.0, 0.0, 0.0)] * (window_count - len(features))
+                )
+                selections.append(
+                    SeriesSelection(
+                        slot=slot.name,
+                        series_rank=series_index + 1,
+                        plane=slot.plane,
+                        series_uid=series_uid,
+                        weighting=(acquisition.weighting if acquisition else None),
+                        fluid_sensitive=fluid_sensitive,
+                        fat_suppressed=fat_suppressed,
+                        classification_source=(
+                            CLASSIFICATION_SOURCE if metadata else "missing"
+                        ),
+                        unassigned_reason=unassigned_reason,
+                        dicom_fluid_sensitive=(
+                            acquisition.fluid_sensitive if acquisition else None
+                        ),
+                        dicom_fat_suppressed=(
+                            acquisition.fat_suppressed if acquisition else None
+                        ),
+                        weighting_source=(
+                            acquisition.weighting_source if acquisition else "missing"
+                        ),
+                        fat_suppression_source=(
+                            acquisition.fat_suppression_source
+                            if acquisition
+                            else "missing"
+                        ),
+                        representative_path=(
+                            str(metadata["representative_path"])
+                            if metadata
+                            else None
+                        ),
+                        ordering_method=(
+                            str(metadata["ordering_method"])
+                            if metadata
+                            else "missing"
+                        ),
+                        total_slices=(
+                            int(metadata["total_slices"]) if metadata else 0
+                        ),
+                        physical_coverage_mm=(
+                            float(metadata["physical_coverage_mm"])
+                            if metadata
+                            else 0.0
+                        ),
+                        median_spacing_mm=(
+                            float(metadata["median_spacing_mm"])
+                            if metadata
+                            else 0.0
+                        ),
+                        duplicate_positions=(
+                            int(metadata["duplicate_positions"])
+                            if metadata
+                            else 0
+                        ),
+                        large_gaps=(
+                            int(metadata["large_gaps"]) if metadata else 0
+                        ),
+                        all_positions_mm=(
+                            tuple(float(value) for value in metadata["all_positions_mm"])
+                            if metadata
+                            else ()
+                        ),
+                        target_positions_mm=(
+                            tuple(
+                                float(value)
+                                for value in metadata["target_positions_mm"]
+                            )
+                            if metadata
+                            else ()
+                        ),
+                        selected_center_positions_mm=(
+                            tuple(
+                                float(value)
+                                for value in metadata["selected_center_positions_mm"]
+                            )
+                            if metadata
+                            else ()
+                        ),
+                        selected_windows=tuple(
+                            tuple(path.as_posix() for path in window)
+                            for window in windows
+                        ),
+                        position_features=features,
+                    )
+                )
+        records.append(
+            StudyRecord(
+                study_uid=study_uid,
+                window_paths=tuple(selected_windows),
+                position_features=tuple(position_features),
+                num_slots=len(slots),
+                max_series_per_slot=max_series_per_slot,
+                selections=tuple(selections),
+                classifications=tuple(classifications),
             )
         )
     return records
@@ -452,6 +801,12 @@ def load_study_records_cache(
                     weighting=row["weighting"],
                     fluid_sensitive=row["fluid_sensitive"],
                     fat_suppressed=row["fat_suppressed"],
+                    classification_source=str(
+                        row.get("classification_source", CLASSIFICATION_SOURCE)
+                    ),
+                    unassigned_reason=row.get("unassigned_reason"),
+                    dicom_fluid_sensitive=row.get("dicom_fluid_sensitive"),
+                    dicom_fat_suppressed=row.get("dicom_fat_suppressed"),
                     weighting_source=str(row["weighting_source"]),
                     fat_suppression_source=str(row["fat_suppression_source"]),
                     representative_path=row["representative_path"],
@@ -483,6 +838,12 @@ def load_study_records_cache(
                 weighting=str(row["weighting"]),
                 fluid_sensitive=bool(row["fluid_sensitive"]),
                 fat_suppressed=bool(row["fat_suppressed"]),
+                classification_source=str(
+                    row.get("classification_source", CLASSIFICATION_SOURCE)
+                ),
+                unassigned_reason=row.get("unassigned_reason"),
+                dicom_fluid_sensitive=row.get("dicom_fluid_sensitive"),
+                dicom_fat_suppressed=row.get("dicom_fat_suppressed"),
                 weighting_source=str(row["weighting_source"]),
                 fat_suppression_source=str(row["fat_suppression_source"]),
                 representative_path=str(row["representative_path"]),
@@ -631,6 +992,7 @@ class KneeStudyDataset(
         labels: np.ndarray | None = None,
         label_weights: np.ndarray | None = None,
         cache_dir: str | Path | None = None,
+        image_cache: "ImageCacheReader | None" = None,
     ) -> None:
         self.records = list(records)
         self.image_size = image_size
@@ -638,6 +1000,9 @@ class KneeStudyDataset(
         self.labels = labels
         self.label_weights = label_weights
         self.cache_dir = Path(cache_dir) if cache_dir else None
+        self.image_cache = image_cache
+        if self.cache_dir is not None and self.image_cache is not None:
+            raise ValueError("Ephemeral and persistent image caches are exclusive")
         if self.cache_dir is not None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
         if (labels is None) != (label_weights is None):
@@ -695,6 +1060,8 @@ class KneeStudyDataset(
 
     def _load_images(self, record: StudyRecord) -> tuple[torch.Tensor, torch.Tensor]:
         """Load one study, reusing an ephemeral preprocessed cache when enabled."""
+        if self.image_cache is not None:
+            return self._load_persistent_images(record)
         flat_paths = [path for window in record.window_paths for path in window]
         unique_paths = tuple(
             dict.fromkeys(path for path in flat_paths if path is not None)
@@ -746,6 +1113,47 @@ class KneeStudyDataset(
         present_tensor = torch.tensor(present)
         if cache_path is not None:
             self._write_cache(cache_path, image_tensor, present_tensor)
+        return self._assemble_windows(image_tensor, present_tensor, inverse)
+
+    def _load_persistent_images(
+        self, record: StudyRecord
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Load selected paths strictly from one persistent study archive."""
+        if self.image_cache is None:
+            raise RuntimeError("Persistent image cache is unavailable")
+        flat_paths = [path for window in record.window_paths for path in window]
+        unique_paths = tuple(
+            dict.fromkeys(
+                path.as_posix() for path in flat_paths if path is not None
+            )
+        )
+        inverse_by_path = {path: index for index, path in enumerate(unique_paths)}
+        inverse = tuple(
+            inverse_by_path[path.as_posix()] if path is not None else -1
+            for path in flat_paths
+        )
+        cached_images, cached_present, cached_paths = self.image_cache.load_study(
+            record.study_uid
+        )
+        cached_indices = {path: index for index, path in enumerate(cached_paths)}
+        missing = [path for path in unique_paths if path not in cached_indices]
+        if missing:
+            raise ValueError(
+                f"Selected paths are absent from persistent image cache: {missing[:3]}"
+            )
+        selected_indices = [cached_indices[path] for path in unique_paths]
+        if selected_indices:
+            image_tensor = torch.from_numpy(
+                np.ascontiguousarray(cached_images[selected_indices])
+            ).unsqueeze(1).float().div_(255.0)
+            present_tensor = torch.from_numpy(
+                np.ascontiguousarray(cached_present[selected_indices])
+            )
+        else:
+            image_tensor = torch.empty(
+                (0, 1, self.image_size, self.image_size), dtype=torch.float32
+            )
+            present_tensor = torch.empty(0, dtype=torch.bool)
         return self._assemble_windows(image_tensor, present_tensor, inverse)
 
     def _assemble_windows(

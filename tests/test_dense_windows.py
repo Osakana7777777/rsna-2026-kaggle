@@ -101,6 +101,8 @@ def test_build_records_retains_two_largest_series_and_pads_slots(
                 "StudyInstanceUID": "study",
                 "SeriesInstanceUID": series_uid,
                 "Anatomical_Plane": "Sagittal",
+                "Fluid_Sensitive": 1,
+                "Fat_Suppression": 1,
             }
         )
 

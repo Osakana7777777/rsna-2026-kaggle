@@ -16,24 +16,52 @@ image_size = 224
 physical_fov_mm = 130.0
 window_count = 10
 window_size = 3
-max_series_per_slot = 2
+max_series_per_slot = 1
 # Reuse decoded, windowed, and resized slices across epochs. This ephemeral path
 # is not included in the training notebook outputs.
 dicom_cache_dir = "/tmp/rsna2026-dicom-cache"
-series_classification = "dicom-header-v1"
-# Leave these empty when the series-selection policy changes; the training
-# launcher builds and pins a matching runtime cache before GPU workers start.
+series_classification = "competition-series-table-v1"
+# The legacy selection-record cache is deliberately disabled. Selection records
+# are rebuilt from the pinned image-cache manifests and the competition table.
 study_records_cache_path = ""
 study_records_cache_sha256 = ""
 study_records_cache_uids_sha256 = "72bb18659cba9fc84f4f363c2585f1a99f84e6f03971e4d8313813ba647aa81e"
 slots = [
-  "sagittal-fluid-fs",
-  "coronal-fluid-fs",
-  "axial-fluid-fs",
-  "sagittal-fluid-nofs",
-  "coronal-t1",
-  "sagittal-t1",
+  "sagittal-fluid",
+  "coronal-fluid",
+  "axial-fluid",
+  "sagittal-structural",
+  "coronal-structural",
+  "axial-structural",
 ]
+
+[image_cache]
+enabled = true
+manifest_paths = [
+  "/kaggle/input/rsna-2026-preprocess-shard-0/outputs/image-cache/cache-manifest.json",
+  "/kaggle/input/rsna-2026-preprocess-shard-1/outputs/image-cache/cache-manifest.json",
+  "/kaggle/input/rsna-2026-preprocess-shard-2/outputs/image-cache/cache-manifest.json",
+  "/kaggle/input/rsna-2026-preprocess-shard-3/outputs/image-cache/cache-manifest.json",
+]
+manifest_sha256 = [
+  "13437172941ca71c12a556a763a46d7dbb185c96457573e752abaabf3f22346a",
+  "beaa99b55409dc3a706477039c2b07bf3cc5306d36d8e96a8e4e4fb929fe611b",
+  "e7c2d8c9f122fede187d96674170a516a1939d722c88361985377ff303b155b9",
+  "e590c0f51175f88b8a6e542e4e21d36f6231e865bd856404091822b38b6dd647",
+]
+expected_studies = 4407
+expected_series = 24371
+expected_images = 665954
+expected_failed_images = 2
+expected_selected_series = 21334
+
+[image_cache.expected_missing_by_slot]
+sagittal-fluid = 257
+coronal-fluid = 159
+axial-fluid = 0
+sagittal-structural = 141
+coronal-structural = 1001
+axial-structural = 3550
 
 [augmentation]
 enabled = true

@@ -14,7 +14,12 @@
   "competition_sources": [
     "rsna-knee-abnormality-detection"
   ],
-  "kernel_sources": [],
+  "kernel_sources": [
+    "osakanateishoku/rsna-2026-preprocess-shard-0",
+    "osakanateishoku/rsna-2026-preprocess-shard-1",
+    "osakanateishoku/rsna-2026-preprocess-shard-2",
+    "osakanateishoku/rsna-2026-preprocess-shard-3"
+  ],
   "model_sources": [
     "metaresearch/dinov2/PyTorch/small/1"
   ]

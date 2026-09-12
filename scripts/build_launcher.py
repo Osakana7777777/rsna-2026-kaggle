@@ -10,7 +10,15 @@ from typing import Sequence
 
 EMBEDDED_FILES_MARKER = "EMBEDDED_FILES: dict[str, str] = {}"
 RUN_MODE_MARKER = 'RUN_MODE = "__RUN_MODE__"'
-RUN_MODES = ("train", "inference", "eda")
+RUN_MODES = (
+    "train",
+    "inference",
+    "eda",
+    "preprocess-0",
+    "preprocess-1",
+    "preprocess-2",
+    "preprocess-3",
+)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:

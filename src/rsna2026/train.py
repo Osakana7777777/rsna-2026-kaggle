@@ -51,6 +51,7 @@ from rsna2026.dataset import (
     SLICE_SELECTION_METHOD,
     KneeStudyDataset,
     StudyRecord,
+    build_cached_study_records,
     build_study_records,
     load_study_records_cache,
 )
@@ -58,6 +59,11 @@ from rsna2026.ensemble import (
     ENSEMBLE_FORMAT_VERSION,
     load_ensemble_manifest,
     percentile_rank_mean,
+)
+from rsna2026.image_cache import (
+    DEFAULT_CACHE_SHARD_COUNT,
+    ImageCacheReader,
+    build_image_cache_shard,
 )
 from rsna2026.model import build_dinov2_model
 from rsna2026.public_labels import (
@@ -75,8 +81,25 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--config", required=True, help="Path to a TOML config")
     parser.add_argument(
         "--mode",
-        choices=("train", "inference", "prepare-selection-cache"),
+        choices=(
+            "train",
+            "inference",
+            "prepare-selection-cache",
+            "prepare-image-cache",
+        ),
         required=True,
+    )
+    parser.add_argument(
+        "--cache-shard-index",
+        type=int,
+        default=0,
+        help="Zero-based persistent image-cache shard index",
+    )
+    parser.add_argument(
+        "--cache-shard-count",
+        type=int,
+        default=DEFAULT_CACHE_SHARD_COUNT,
+        help="Total number of persistent image-cache shards",
     )
     parser.add_argument(
         "--input-root",
@@ -499,6 +522,7 @@ def make_loader(
     shuffle: bool,
     cache_dir: str | Path | None,
     sampler: Sampler[int] | None = None,
+    image_cache: ImageCacheReader | None = None,
 ) -> DataLoader:
     dataset = KneeStudyDataset(
         records,
@@ -507,6 +531,7 @@ def make_loader(
         labels,
         label_weights,
         cache_dir,
+        image_cache,
     )
     return DataLoader(
         dataset,
@@ -809,6 +834,30 @@ def slice_selection_report(
             for record in records
             for classification in record.classifications
         )
+        classification_sources = Counter(
+            classification.classification_source
+            for record in records
+            for classification in record.classifications
+        )
+        unassigned_reasons = Counter(
+            classification.unassigned_reason
+            for record in records
+            for classification in record.classifications
+            if not classification.matching_slots
+        )
+        candidate_series_by_slot = Counter(
+            slot
+            for record in records
+            for classification in record.classifications
+            for slot in classification.matching_slots
+        )
+        selected_relative_paths = {
+            path
+            for record in records
+            for selection in record.selections
+            for window in selection.selected_windows
+            for path in window
+        }
         valid_windows_by_rank = Counter(
             (selection.slot, selection.series_rank)
             for record in records
@@ -901,6 +950,12 @@ def slice_selection_report(
                 len(record.classifications) for record in records
             ),
             "unassigned_series": unassigned_series,
+            "unassigned_reasons": dict(sorted(unassigned_reasons.items())),
+            "classification_sources": dict(sorted(classification_sources.items())),
+            "candidate_series_by_slot": {
+                slot: candidate_series_by_slot.get(slot, 0) for slot in SLOT_NAMES
+            },
+            "selected_unique_cache_paths": len(selected_relative_paths),
             "weighting_sources": dict(sorted(weighting_sources.items())),
             "fat_suppression_sources": dict(
                 sorted(fat_suppression_sources.items())
@@ -1091,6 +1146,7 @@ def train_cv_fold(
     records_by_uid: dict[str, StudyRecord],
     device: torch.device,
     distributed: DistributedContext,
+    image_cache: ImageCacheReader | None = None,
 ) -> tuple[dict[str, object] | None, pd.DataFrame | None, bool]:
     """Train one outer fold using only its weak inner validation for selection."""
     fold_started_at = time.monotonic()
@@ -1127,7 +1183,7 @@ def train_cv_fold(
     batch_size = int(training_config["batch_size_per_device"])
     accumulation_steps = int(training_config["gradient_accumulation_steps"])
     num_workers = int(training_config["num_workers"])
-    cache_dir = data_config.get("dicom_cache_dir")
+    cache_dir = None if image_cache is not None else data_config.get("dicom_cache_dir")
     training_sampler = DistributedSampler(
         range(len(train_table)),
         num_replicas=distributed.world_size,
@@ -1153,6 +1209,7 @@ def train_cv_fold(
         True,
         cache_dir,
         training_sampler,
+        image_cache,
     )
     inner_loader = make_loader(
         _records_for(inner_table, records_by_uid),
@@ -1165,6 +1222,7 @@ def train_cv_fold(
         False,
         cache_dir,
         inner_sampler,
+        image_cache,
     )
     outer_loader = make_loader(
         _records_for(outer_table, records_by_uid),
@@ -1177,6 +1235,7 @@ def train_cv_fold(
         False,
         cache_dir,
         outer_sampler,
+        image_cache,
     )
     if distributed.primary:
         print(
@@ -1518,10 +1577,95 @@ def run_cross_validation_training(
     records_cache = Path(
         f"/tmp/rsna2026-distributed-study-records-{run_id}.pkl"
     )
+    image_cache: ImageCacheReader | None = None
+    image_cache_config = config.get("image_cache", {})
+    persistent_cache_enabled = (
+        isinstance(image_cache_config, dict)
+        and bool(image_cache_config.get("enabled", False))
+    )
+    manifest_paths: list[Path] = []
+    manifest_sha256: list[str] = []
+    if persistent_cache_enabled:
+        manifest_paths = [
+            resolve_input_file(path, config["paths"]["input_root"])  # type: ignore[index]
+            for path in image_cache_config["manifest_paths"]
+        ]
+        manifest_sha256 = [
+            str(value) for value in image_cache_config["manifest_sha256"]
+        ]
     if distributed.primary:
         configured_cache = str(data_config.get("study_records_cache_path", ""))
         configured_sha256 = str(data_config.get("study_records_cache_sha256", ""))
-        if configured_cache and configured_sha256:
+        if persistent_cache_enabled:
+            image_cache = ImageCacheReader(
+                manifest_paths,
+                expected_study_uids=all_uids,
+                expected_manifest_sha256=manifest_sha256,
+                verify_files=True,
+            )
+            cache_summary = {
+                key: sum(int(summary[key]) for summary in image_cache.summaries)
+                for key in (
+                    "studies",
+                    "series",
+                    "images",
+                    "decoded_images",
+                    "failed_images",
+                    "archive_bytes",
+                )
+            }
+            expected_cache = {
+                "studies": int(image_cache_config["expected_studies"]),
+                "series": int(image_cache_config["expected_series"]),
+                "images": int(image_cache_config["expected_images"]),
+                "failed_images": int(
+                    image_cache_config["expected_failed_images"]
+                ),
+            }
+            for key, expected in expected_cache.items():
+                if cache_summary[key] != expected:
+                    raise ValueError(
+                        f"Persistent image-cache {key} changed: "
+                        f"{cache_summary[key]} != {expected}"
+                    )
+            all_records = build_cached_study_records(
+                train_series,
+                image_cache,
+                all_uids,
+                int(data_config["window_count"]),
+                int(data_config["max_series_per_slot"]),
+                list(data_config["slots"]),
+                str(data_config["series_classification"]),
+            )
+            report = slice_selection_report(
+                {"all-training-studies": all_records},
+                int(data_config["window_count"]),
+                int(data_config["max_series_per_slot"]),
+            )
+            selection_summary = report["splits"]["all-training-studies"][
+                "summary"
+            ]
+            expected_missing = {
+                str(key): int(value)
+                for key, value in image_cache_config[
+                    "expected_missing_by_slot"
+                ].items()
+            }
+            if selection_summary["missing_slots_by_slot"] != expected_missing:
+                raise ValueError(
+                    "Reclassified acquisition-slot missing counts changed: "
+                    f"{selection_summary['missing_slots_by_slot']}"
+                )
+            if int(selection_summary["selected_series"]) != int(
+                image_cache_config["expected_selected_series"]
+            ):
+                raise ValueError("Reclassified selected-series count changed")
+            if int(selection_summary["unassigned_series"]) != 0:
+                raise ValueError("Reclassified series contain unassigned entries")
+            selection_summary["persistent_image_cache"] = cache_summary
+            selection_output = output_dir / "slice-selection.json"
+            write_json(selection_output, report)
+        elif configured_cache and configured_sha256:
             selection_cache_path = resolve_input_file(
                 configured_cache,
                 config["paths"]["input_root"],  # type: ignore[index]
@@ -1577,6 +1721,13 @@ def run_cross_validation_training(
             time.sleep(1.0)
         with records_cache.open("rb") as file:
             all_records = pickle.load(file)
+    if persistent_cache_enabled and image_cache is None:
+        image_cache = ImageCacheReader(
+            manifest_paths,
+            expected_study_uids=all_uids,
+            expected_manifest_sha256=manifest_sha256,
+            verify_files=False,
+        )
     if len(all_records) != len(all_uids):
         raise RuntimeError("Distributed study-record cache is incomplete")
     records_by_uid = {record.study_uid: record for record in all_records}
@@ -1606,6 +1757,7 @@ def run_cross_validation_training(
             records_by_uid,
             device,
             distributed,
+            image_cache,
         )
         if distributed.primary:
             if summary is None or oof is None:
@@ -1731,6 +1883,19 @@ def run_cross_validation_training(
             ),
             "artifact": "slice-selection.json",
         },
+        "persistent_image_cache": (
+            {
+                "enabled": True,
+                "manifest_files": [str(path) for path in manifest_paths],
+                "manifest_sha256": manifest_sha256,
+                "summary": cache_summary,
+                "selection_artifact_sha256": file_sha256(
+                    output_dir / "slice-selection.json"
+                ),
+            }
+            if persistent_cache_enabled
+            else {"enabled": False}
+        ),
         "pseudo_label_file": str(pseudo_config["file_name"]),
         "pseudo_labels_sha256": public.sha256,
         "model": artifact_metadata,
@@ -1915,6 +2080,43 @@ def prepare_training_selection_cache(
     return 0
 
 
+def prepare_training_image_cache(
+    config: dict[str, object],
+    output_dir: Path,
+    shard_index: int,
+    shard_count: int,
+) -> int:
+    """Preprocess one deterministic shard of every training series on CPU."""
+    input_path = competition_input(
+        config["paths"]["input_root"],  # type: ignore[index]
+        config["competition"]["input_slug"],  # type: ignore[index]
+    )
+    train_table = pd.read_csv(input_path / "train.csv")
+    train_series = pd.read_csv(input_path / "train_series.csv")
+    study_uids = train_table["StudyInstanceUID"].astype(str).tolist()
+    data_config = config["data"]
+    image_size = int(data_config["image_size"])  # type: ignore[index]
+    physical_fov_mm = float(data_config["physical_fov_mm"])  # type: ignore[index]
+    window_count = int(data_config["window_count"])  # type: ignore[index]
+    print(
+        f"Preparing persistent image-cache shard {shard_index}/{shard_count} "
+        f"for {len(study_uids)} training studies",
+        flush=True,
+    )
+    build_image_cache_shard(
+        train_series,
+        input_path / "train_series",
+        study_uids,
+        output_dir,
+        shard_index=shard_index,
+        shard_count=shard_count,
+        image_size=image_size,
+        physical_fov_mm=physical_fov_mm,
+        window_count=window_count,
+    )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     started_at = time.monotonic()
     args = parse_args(argv)
@@ -1931,6 +2133,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.mode == "prepare-selection-cache":
         return prepare_training_selection_cache(config, output_dir)
+    if args.mode == "prepare-image-cache":
+        return prepare_training_image_cache(
+            config,
+            output_dir,
+            args.cache_shard_index,
+            args.cache_shard_count,
+        )
     if args.mode == "inference":
         return run_inference(config, output_dir, started_at)
 

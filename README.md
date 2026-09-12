@@ -8,6 +8,22 @@ Competition data is never downloaded to this computer. Kaggle attaches it to the
 run as a read-only input below `/kaggle/input`, using `competition_sources` in
 `kaggle/kernel-metadata.json`.
 
+## Build the persistent training-image cache
+
+Before changing acquisition-slot classification, preprocess every candidate
+training series into four private CPU-notebook outputs:
+
+```bash
+./scripts/verify.sh
+./scripts/run-image-cache.sh
+```
+
+Each notebook receives one deterministic study shard, selects the source images
+needed by up to ten physical three-slice windows per series, and stores 224-pixel
+lossless `uint8` study archives. The outputs also retain raw acquisition fields
+and physical-window metadata for later reclassification. These private notebook
+outputs are intended to be mounted directly by a later training notebook; do not
+download or commit the derived medical images locally.
 ## Layout
 
 ```text

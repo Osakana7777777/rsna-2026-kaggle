@@ -9,7 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-CLASSIFICATION_METHOD = "dicom-header-v1"
+CLASSIFICATION_METHOD = "competition-series-table-v1"
+CLASSIFICATION_SOURCE = "competition-series-table"
 
 
 @dataclass(frozen=True)
@@ -31,25 +32,28 @@ class AcquisitionSlot:
     plane: str
     fluid_sensitive: bool | None
     fat_suppressed: bool
-    weighting: str | None = None
 
-    def matches(self, plane: str, acquisition: AcquisitionClass) -> bool:
+    def matches(
+        self,
+        plane: str,
+        fluid_sensitive: bool,
+        fat_suppressed: bool,
+    ) -> bool:
         if plane != self.plane:
             return False
-        if acquisition.fat_suppressed != self.fat_suppressed:
-            return False
-        if self.weighting is not None:
-            return acquisition.weighting == self.weighting
-        return acquisition.fluid_sensitive == self.fluid_sensitive
+        return (
+            fluid_sensitive == self.fluid_sensitive
+            and fat_suppressed == self.fat_suppressed
+        )
 
 
 ACQUISITION_SLOTS = (
-    AcquisitionSlot("sagittal-fluid-fs", "sagittal", True, True),
-    AcquisitionSlot("coronal-fluid-fs", "coronal", True, True),
-    AcquisitionSlot("axial-fluid-fs", "axial", True, True),
-    AcquisitionSlot("sagittal-fluid-nofs", "sagittal", True, False),
-    AcquisitionSlot("coronal-t1", "coronal", False, False, "t1"),
-    AcquisitionSlot("sagittal-t1", "sagittal", False, False, "t1"),
+    AcquisitionSlot("sagittal-fluid", "sagittal", True, True),
+    AcquisitionSlot("coronal-fluid", "coronal", True, True),
+    AcquisitionSlot("axial-fluid", "axial", True, True),
+    AcquisitionSlot("sagittal-structural", "sagittal", False, False),
+    AcquisitionSlot("coronal-structural", "coronal", False, False),
+    AcquisitionSlot("axial-structural", "axial", False, False),
 )
 SLOT_NAMES = tuple(slot.name for slot in ACQUISITION_SLOTS)
 SLOTS_BY_NAME = {slot.name: slot for slot in ACQUISITION_SLOTS}
@@ -171,6 +175,45 @@ def read_acquisition_header(path: Path) -> AcquisitionClass:
     return classify_acquisition(
         {name: getattr(dataset, name, None) for name in tags}
     )
+
+
+def binary_series_attribute(value: object, name: str) -> bool:
+    """Normalize one competition-series binary attribute without guessing."""
+    if isinstance(value, bool):
+        return value
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"Invalid {name}: {value!r}") from error
+    if not math.isfinite(number) or number not in {0.0, 1.0}:
+        raise ValueError(f"Invalid {name}: {value!r}")
+    return bool(number)
+
+
+def match_series_table_slot(
+    plane: str,
+    fluid_sensitive: object,
+    fat_suppression: object,
+) -> tuple[str | None, str | None]:
+    """Map the competition table's 11/00 acquisition values to one slot."""
+    normalized_plane = str(plane).strip().lower()
+    if normalized_plane not in {slot.plane for slot in ACQUISITION_SLOTS}:
+        return None, "unsupported-plane"
+    try:
+        fluid = binary_series_attribute(fluid_sensitive, "Fluid_Sensitive")
+        fat = binary_series_attribute(fat_suppression, "Fat_Suppression")
+    except ValueError:
+        return None, "invalid-series-attributes"
+    if fluid != fat:
+        return None, "mixed-series-attributes"
+    matching = [
+        slot.name
+        for slot in ACQUISITION_SLOTS
+        if slot.matches(normalized_plane, fluid, fat)
+    ]
+    if len(matching) != 1:
+        return None, "unmapped-series-attributes"
+    return matching[0], None
 
 
 def resolve_slots(names: Sequence[str]) -> tuple[AcquisitionSlot, ...]:

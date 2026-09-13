@@ -18,6 +18,7 @@ from rsna2026.dataset import (  # noqa: E402
     SLICE_SELECTION_METHOD,
     load_study_records_cache,
 )
+from rsna2026.orientation import ORIENTATION_NORMALIZATION_METHOD  # noqa: E402
 from rsna2026.train import (  # noqa: E402
     apply_study_records_cache_environment,
     parse_args,
@@ -108,6 +109,8 @@ def test_loads_pinned_study_records_without_reading_dicom(tmp_path) -> None:
         "max_series_per_slot": 2,
         "window_count": 2,
         "window_size": 3,
+        "orientation_normalization": ORIENTATION_NORMALIZATION_METHOD,
+        "medial_side": "image-right",
         "splits": {
             "all-training-studies": {
                 "summary": {"studies": 1},

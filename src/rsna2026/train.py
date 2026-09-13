@@ -65,6 +65,8 @@ from rsna2026.image_cache import (
     ImageCacheReader,
     build_image_cache_shard,
 )
+from rsna2026.model import build_dinov2_model
+from rsna2026.orientation import ORIENTATION_NORMALIZATION_METHOD
 from rsna2026.model import build_coatnet_model, build_dinov2_model
 from rsna2026.public_labels import (
     confidence_weight,
@@ -775,6 +777,8 @@ def slice_selection_report(
         "max_series_per_slot": max_series_per_slot,
         "window_count": window_count,
         "window_size": 3,
+        "orientation_normalization": ORIENTATION_NORMALIZATION_METHOD,
+        "medial_side": "image-right",
         "splits": {},
     }
 
@@ -878,9 +882,26 @@ def slice_selection_report(
                     asdict(classification)
                     for classification in record.classifications
                 ],
+                "orientation_audits": [
+                    asdict(audit) for audit in record.orientation_audits
+                ],
             }
             for record in records
         ]
+        disagreement_studies = sorted(
+            record.study_uid
+            for record in records
+            if any(
+                audit.tag_geometry_disagreement
+                for audit in record.orientation_audits
+            )
+        )
+        orientation_audit_reasons = Counter(
+            audit.audit_reason
+            for record in records
+            for audit in record.orientation_audits
+            if audit.audit_reason is not None
+        )
         summary = {
             "studies": len(records),
             "series_by_ordering_method": dict(sorted(methods.items())),
@@ -960,6 +981,14 @@ def slice_selection_report(
             "fat_suppression_sources": dict(
                 sorted(fat_suppression_sources.items())
             ),
+            "orientation_audited_series": sum(
+                len(record.orientation_audits) for record in records
+            ),
+            "orientation_audit_reasons": dict(
+                sorted(orientation_audit_reasons.items())
+            ),
+            "laterality_disagreement_studies": disagreement_studies,
+            "laterality_disagreement_study_count": len(disagreement_studies),
         }
         split_reports[split] = {"summary": summary, "studies": entries}
         print(f"{split} slice selection: {summary}", flush=True)
@@ -993,6 +1022,8 @@ def model_artifact_metadata(config: dict[str, object]) -> dict[str, object]:
         ),
         "physical_crop_center": "image-center",
         "physical_crop_padding": "constant-zero",
+        "orientation_normalization": ORIENTATION_NORMALIZATION_METHOD,
+        "medial_side": "image-right",
         "slice_selection_method": SLICE_SELECTION_METHOD,
         "window_count": int(data_config["window_count"]),  # type: ignore[index]
         "window_size": int(data_config["window_size"]),  # type: ignore[index]

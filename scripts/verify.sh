@@ -7,6 +7,7 @@ required_files=(
   "README.md"
   "pyproject.toml"
   "configs/baseline.toml"
+  "configs/coatnet-0-224.toml"
   "kaggle/kernel-metadata.json"
   "kaggle/train-kernel-metadata.json"
   "kaggle/eda-kernel-metadata.json"
@@ -57,6 +58,7 @@ required_files=(
   "tests/test_augmentation.py"
   "tests/test_dense_windows.py"
   "tests/test_image_cache.py"
+  "tests/test_build_launcher.py"
   "submissions/README.md"
   "submissions/TEMPLATE.md"
 )
@@ -82,7 +84,7 @@ if command -v uv >/dev/null 2>&1; then
     "${PROJECT_ROOT}/src" "${PROJECT_ROOT}/kaggle/launcher.py" \
     "${PROJECT_ROOT}/scripts/build_launcher.py" "${PROJECT_ROOT}/tests"
   "${PROJECT_ROOT}/.venv/bin/python" -c \
-    'import json, pathlib, tomllib; root = pathlib.Path(__import__("sys").argv[1]); files = ["kernel-metadata.json", "train-kernel-metadata.json", "eda-kernel-metadata.json", *[f"preprocess-{index}-kernel-metadata.json" for index in range(4)]]; [json.loads((root / "kaggle" / name).read_text()) for name in files]; tomllib.loads((root / "configs/baseline.toml").read_text())' \
+    'import json, pathlib, tomllib; root = pathlib.Path(__import__("sys").argv[1]); files = ["kernel-metadata.json", "train-kernel-metadata.json", "eda-kernel-metadata.json", *[f"preprocess-{index}-kernel-metadata.json" for index in range(4)]]; [json.loads((root / "kaggle" / name).read_text()) for name in files]; [tomllib.loads(path.read_text()) for path in sorted((root / "configs").glob("*.toml"))]' \
     "${PROJECT_ROOT}"
 else
   echo "uv not installed; skipped Python syntax check." >&2
@@ -96,6 +98,6 @@ if grep -R -nE "${download_pattern}" \
 fi
 
 echo "Structure, shell syntax, Python syntax, and no-local-data policy verified."
-if grep -q 'YOUR_' "${METADATA_FILE}" "${PROJECT_ROOT}/configs/baseline.toml"; then
+if grep -q 'YOUR_' "${METADATA_FILE}" "${PROJECT_ROOT}"/configs/*.toml; then
   echo "Configuration placeholders remain, as expected for the initial template."
 fi

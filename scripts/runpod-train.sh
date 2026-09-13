@@ -71,12 +71,14 @@ if [[ ! -x "${venv_path}/bin/python" ]]; then
   uv venv --system-site-packages "${venv_path}"
 fi
 if ! "${venv_path}/bin/python" -c \
-  'import numpy, pandas, pydicom, transformers' >/dev/null 2>&1; then
+  'import numpy, pandas, pydicom, safetensors, timm, transformers' \
+  >/dev/null 2>&1; then
   uv pip install --python "${venv_path}/bin/python" \
-    'numpy<3' 'pandas<4' 'pydicom<4' 'transformers>=4.40,<6'
+    'numpy<3' 'pandas<4' 'pydicom<4' 'safetensors<1' \
+    'timm>=1.0,<2' 'transformers>=4.40,<6'
 fi
 "${venv_path}/bin/python" -c \
-  'import numpy, pandas, pydicom, torch, transformers; assert torch.cuda.is_available()'
+  'import numpy, pandas, pydicom, safetensors, timm, torch, transformers; assert torch.cuda.is_available()'
 
 export PYTHONPATH="${PROJECT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 export PYTHONUNBUFFERED=1

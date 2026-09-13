@@ -67,6 +67,7 @@ from rsna2026.image_cache import (
 )
 from rsna2026.model import build_dinov2_model
 from rsna2026.orientation import ORIENTATION_NORMALIZATION_METHOD
+from rsna2026.model import build_coatnet_model, build_dinov2_model
 from rsna2026.public_labels import (
     confidence_weight,
     load_public_label_table,
@@ -999,7 +1000,7 @@ def model_artifact_metadata(config: dict[str, object]) -> dict[str, object]:
     """Return architecture fields that must match across both notebook stages."""
     model_config = config["model"]
     data_config = config["data"]
-    return {
+    metadata = {
         "name": str(model_config["name"]),  # type: ignore[index]
         "variant": str(model_config["variant"]),  # type: ignore[index]
         "num_targets": len(TARGETS),
@@ -1043,6 +1044,11 @@ def model_artifact_metadata(config: dict[str, object]) -> dict[str, object]:
         ),
         "slots": list(data_config["slots"]),  # type: ignore[index]
     }
+    if "weights_file" in model_config:  # type: ignore[operator]
+        metadata["weights_file"] = str(  # type: ignore[index]
+            model_config["weights_file"]  # type: ignore[index]
+        )
+    return metadata
 
 
 def build_configured_model(
@@ -1055,11 +1061,14 @@ def build_configured_model(
     physical_fov_mm = float(data_config["physical_fov_mm"])  # type: ignore[index]
     if not math.isfinite(physical_fov_mm) or physical_fov_mm <= 0:
         raise ValueError("Physical FOV must be finite and positive")
-    if str(model_config["name"]) != "dinov2-small":  # type: ignore[index]
+    model_name = str(model_config["name"])  # type: ignore[index]
+    if model_name not in {"dinov2-small", "coatnet-0"}:
         model_name = model_config["name"]  # type: ignore[index]
         raise ValueError(f"Unsupported model: {model_name}")
-    if image_size % 14:
+    if model_name == "dinov2-small" and image_size % 14:
         raise ValueError("DINOv2 image size must be divisible by its patch size 14")
+    if model_name == "coatnet-0" and image_size != 224:
+        raise ValueError("CoAtNet-0 requires a 224-pixel input")
     aggregation = str(model_config["aggregation"])  # type: ignore[index]
     if aggregation != "hierarchical-target-series-attention":
         raise ValueError("Only hierarchical target-series attention is supported")
@@ -1095,23 +1104,41 @@ def build_configured_model(
     slot_names = tuple(str(name) for name in configured_slots)
     if slot_names != SLOT_NAMES:
         raise ValueError(f"Configured slots must be {list(SLOT_NAMES)}")
-    model, model_source = build_dinov2_model(
-        input_root=config["paths"]["input_root"],  # type: ignore[index]
-        variant=str(model_config["variant"]),  # type: ignore[index]
-        num_targets=len(TARGETS),
-        unfreeze_last=int(model_config["unfreeze_last"]),  # type: ignore[index]
-        dropout=float(model_config["dropout"]),  # type: ignore[index]
-        num_slots=len(slot_names),
-        max_series_per_slot=max_series_per_slot,
-        window_count=window_count,
-        slices_per_slot=window_size,
-        attention_hidden_size=int(  # type: ignore[index]
+    shared_model_arguments = {
+        "input_root": config["paths"]["input_root"],  # type: ignore[index]
+        "num_targets": len(TARGETS),
+        "unfreeze_last": int(model_config["unfreeze_last"]),  # type: ignore[index]
+        "dropout": float(model_config["dropout"]),  # type: ignore[index]
+        "num_slots": len(slot_names),
+        "max_series_per_slot": max_series_per_slot,
+        "window_count": window_count,
+        "slices_per_slot": window_size,
+        "attention_hidden_size": int(  # type: ignore[index]
             model_config["attention_hidden_size"]
         ),
-        gradient_checkpointing=bool(  # type: ignore[index]
+        "gradient_checkpointing": bool(  # type: ignore[index]
             model_config["gradient_checkpointing"]
         ),
-    )
+    }
+    pooling = str(model_config["pooling"])  # type: ignore[index]
+    if model_name == "dinov2-small":
+        if pooling != "cls-patch-mean":
+            raise ValueError("DINOv2 requires cls-patch-mean pooling")
+        model, model_source = build_dinov2_model(
+            variant=str(model_config["variant"]),  # type: ignore[index]
+            **shared_model_arguments,
+        )
+    else:
+        if pooling != "global-average":
+            raise ValueError("CoAtNet-0 requires global-average pooling")
+        weights_file = str(model_config.get("weights_file", ""))  # type: ignore[union-attr]
+        if not weights_file:
+            raise ValueError("CoAtNet-0 requires model.weights_file")
+        model, model_source = build_coatnet_model(
+            architecture=str(model_config["variant"]),  # type: ignore[index]
+            weights_file=weights_file,
+            **shared_model_arguments,
+        )
     model = model.to(device)
     total_parameters = sum(parameter.numel() for parameter in model.parameters())
     trainable_parameters = sum(

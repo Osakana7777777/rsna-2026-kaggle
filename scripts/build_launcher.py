@@ -10,6 +10,7 @@ from typing import Sequence
 
 EMBEDDED_FILES_MARKER = "EMBEDDED_FILES: dict[str, str] = {}"
 RUN_MODE_MARKER = 'RUN_MODE = "__RUN_MODE__"'
+CONFIG_PATH_MARKER = 'CONFIG_RELATIVE_PATH = "configs/baseline.toml"'
 RUN_MODES = (
     "train",
     "inference",
@@ -26,16 +27,34 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--project-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--mode", choices=RUN_MODES, required=True)
+    parser.add_argument(
+        "--config", type=Path, default=Path("configs/baseline.toml")
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     project_root = args.project_root.resolve()
+    config_root = (project_root / "configs").resolve()
+    config_path = (
+        args.config.resolve()
+        if args.config.is_absolute()
+        else (project_root / args.config).resolve()
+    )
+    try:
+        config_path.relative_to(config_root)
+    except ValueError as error:
+        raise ValueError(
+            f"Configuration must be below {config_root}: {config_path}"
+        ) from error
+    if config_path.suffix != ".toml" or not config_path.is_file():
+        raise FileNotFoundError(f"Configuration TOML not found: {config_path}")
+    config_relative_path = config_path.relative_to(project_root).as_posix()
     launcher = (project_root / "kaggle" / "launcher.py").read_text(encoding="utf-8")
 
     source_files = sorted((project_root / "src" / "rsna2026").rglob("*.py"))
-    files = source_files + [project_root / "configs" / "baseline.toml"]
+    files = source_files + [config_path]
     embedded_files = {
         path.relative_to(project_root).as_posix(): path.read_text(encoding="utf-8")
         for path in files
@@ -48,11 +67,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("Launcher must contain exactly one embedded-files marker")
     if launcher.count(RUN_MODE_MARKER) != 1:
         raise ValueError("Launcher must contain exactly one run-mode marker")
+    if launcher.count(CONFIG_PATH_MARKER) != 1:
+        raise ValueError("Launcher must contain exactly one config-path marker")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     generated_source = launcher.replace(EMBEDDED_FILES_MARKER, replacement)
     generated_source = generated_source.replace(
         RUN_MODE_MARKER, f'RUN_MODE = "{args.mode}"'
+    )
+    generated_source = generated_source.replace(
+        CONFIG_PATH_MARKER,
+        f'CONFIG_RELATIVE_PATH = "{config_relative_path}"',
     )
     if args.output.suffix == ".ipynb":
         notebook = {

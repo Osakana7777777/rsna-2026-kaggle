@@ -15,6 +15,7 @@ from typing import TextIO
 
 EMBEDDED_FILES: dict[str, str] = {}
 RUN_MODE = "__RUN_MODE__"
+CONFIG_RELATIVE_PATH = "configs/baseline.toml"
 
 
 def prepare_payload() -> Path:
@@ -76,7 +77,7 @@ def run_payload() -> int:
     )
     arguments = [
         "--config",
-        str(PAYLOAD_ROOT / "configs" / "baseline.toml"),
+        str(PAYLOAD_ROOT / CONFIG_RELATIVE_PATH),
         "--mode",
         selected_mode,
     ]

@@ -28,7 +28,9 @@ download or commit the derived medical images locally.
 
 ```text
 rsna-2026-kaggle/
-├── configs/baseline.toml       # experiment and mount placeholders
+├── configs/
+│   ├── baseline.toml           # submitted DINOv2 baseline
+│   └── coatnet-0-224.toml      # isolated CoAtNet-0 experiment
 ├── kaggle/
 │   ├── train-kernel-metadata.json # training notebook and inputs
 │   ├── kernel-metadata.json    # inference/submission notebook and inputs
@@ -89,6 +91,16 @@ From this directory:
 ./scripts/output.sh train
 ```
 
+Pass a repository-relative TOML below `configs/` as the second argument to build
+or push a different experiment without modifying the baseline. For example:
+
+```bash
+./scripts/prepare.sh train configs/coatnet-0-224.toml
+./scripts/push.sh train configs/coatnet-0-224.toml
+```
+
+Omitting the second argument continues to use `configs/baseline.toml`.
+
 ## Run EDA and download its outputs
 
 The EDA notebook uses the competition mount only, requires no GPU, and saves
@@ -129,7 +141,7 @@ then reads only the test tables and writes `/kaggle/working/submission.csv`.
 After creating a new training version, always push a new submission-notebook
 version so that its notebook input is pinned to the new training output.
 
-Both stages embed the same source and configuration, but their generated run
+Both stages embed the explicitly selected configuration, but their generated run
 modes are fixed to `train` and `inference`. A configuration edit cannot make the
 submission notebook enter the training path.
 
@@ -137,17 +149,22 @@ The model classifies series into six plane-and-acquisition slots and retains the
 two series with the largest slice counts in each slot. It orders every retained
 series on the DICOM patient-coordinate axis, forms adjacent three-slice windows,
 and selects up to ten unique windows nearest equally spaced physical centers over
-the usable acquisition range. DINOv2 encodes every valid window in one model call.
+the usable acquisition range. The configured DINOv2 or CoAtNet backbone encodes
+every valid window in one model call.
 Target-specific masked attention aggregates windows within each series, series
 within each slot, and finally the six slots. Physical position and adjacent-spacing
 features accompany each window. Decoded and resized source images are cached once
 even when they occur in overlapping windows. Training augmentation is synchronized
 across all series and windows in the same slot; validation and inference remain
-deterministic. All experiment settings are defined in `configs/baseline.toml`.
+deterministic. Experiment settings are stored as independent TOML files in `configs/`.
+The CoAtNet experiment deliberately retains the baseline ImageNet channel mean and
+standard deviation for a controlled backbone comparison. This differs from the
+pretrained CoAtNet checkpoint's recommended mean and standard deviation of 0.5 and
+is a known limitation of the experiment.
 
-The Kaggle image supplies PyTorch, pandas, NumPy, and pydicom. Internet access
-remains disabled during the run, and the baseline does not require downloaded
-weights.
+The Kaggle image supplies PyTorch, pandas, NumPy, pydicom, timm, and safetensors.
+Internet access remains disabled during the run; pretrained weights are attached
+through `model_sources`.
 
 After a successful inference run, submit its version number:
 
@@ -220,8 +237,9 @@ volume is:
 
 After connecting to the Pod, place this repository under `/workspace`, install
 `uv`, and start training from the repository. The runner creates a uv virtual
-environment that can see the PyTorch image's system packages, installs `pydicom`
-and `transformers` if needed, validates CUDA, and uses all visible GPUs by default:
+environment that can see the PyTorch image's system packages, installs `pydicom`,
+`transformers`, `timm`, and `safetensors` if needed, validates CUDA, and uses all
+visible GPUs by default:
 
 ```bash
 ./scripts/runpod-train.sh \

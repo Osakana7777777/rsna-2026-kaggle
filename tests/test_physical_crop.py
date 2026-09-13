@@ -136,3 +136,45 @@ def test_configured_model_rejects_legacy_window_settings() -> None:
 
     with pytest.raises(ValueError, match="Legacy window configuration"):
         build_configured_model(config, torch.device("cpu"))
+
+
+def test_coatnet_artifact_metadata_includes_weights_file() -> None:
+    config = load_config("configs/coatnet-0-224.toml")
+
+    metadata = model_artifact_metadata(config)
+
+    assert metadata["name"] == "coatnet-0"
+    assert metadata["variant"] == "coatnet_0_rw_224.sw_in1k"
+    assert metadata["weights_file"] == "model.safetensors"
+    assert metadata["pooling"] == "global-average"
+    assert metadata["unfreeze_last"] == 6
+
+
+def test_configured_coatnet_routes_all_model_settings(monkeypatch) -> None:
+    config = load_config("configs/coatnet-0-224.toml")
+    received = {}
+
+    def fake_build_coatnet_model(**kwargs):
+        received.update(kwargs)
+        return torch.nn.Linear(1, 1), Path("/mounted/coatnet")
+
+    monkeypatch.setattr(
+        "rsna2026.train.build_coatnet_model", fake_build_coatnet_model
+    )
+
+    _, source, _, _ = build_configured_model(config, torch.device("cpu"))
+
+    assert source == Path("/mounted/coatnet")
+    assert received["architecture"] == "coatnet_0_rw_224.sw_in1k"
+    assert received["weights_file"] == "model.safetensors"
+    assert received["unfreeze_last"] == 6
+    assert received["gradient_checkpointing"] is True
+    assert received["num_targets"] == 12
+
+
+def test_configured_coatnet_rejects_non_224_input() -> None:
+    config = deepcopy(load_config("configs/coatnet-0-224.toml"))
+    config["data"]["image_size"] = 384
+
+    with pytest.raises(ValueError, match="224-pixel"):
+        build_configured_model(config, torch.device("cpu"))

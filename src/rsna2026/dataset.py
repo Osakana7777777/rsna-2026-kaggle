@@ -31,6 +31,12 @@ from rsna2026.acquisition import (
     read_acquisition_header,
     resolve_slots,
 )
+from rsna2026.orientation import (
+    ORIENTATION_NORMALIZATION_METHOD,
+    OrientationDecision,
+    decide_orientation,
+    read_orientation_header,
+)
 from rsna2026.slice_selection import select_physical_windows
 
 if TYPE_CHECKING:
@@ -38,7 +44,7 @@ if TYPE_CHECKING:
 
 
 ORDERING_WORKERS = 16
-PREPROCESSING_VERSION = "dicom-physical-fov-window-uint8-v4"
+PREPROCESSING_VERSION = "dicom-physical-fov-window-orientation-uint8-v5"
 SLICE_SELECTION_METHOD = "physical-adjacent-three-window-v1"
 SERIES_SELECTION_METHOD = "top-k-slice-count-v1"
 
@@ -54,6 +60,23 @@ class StudyRecord:
     max_series_per_slot: int
     selections: tuple["SeriesSelection", ...] = ()
     classifications: tuple["SeriesClassification", ...] = ()
+    orientation_audits: tuple["SeriesOrientationAudit", ...] = ()
+
+
+@dataclass(frozen=True)
+class SeriesOrientationAudit:
+    """Patient-coordinate orientation decision for one candidate series."""
+
+    series_uid: str
+    representative_path: str
+    plane: str
+    laterality_tag: str | None
+    geometry_laterality: str | None
+    resolved_laterality: str | None
+    laterality_source: str
+    horizontal_flip: bool
+    tag_geometry_disagreement: bool
+    audit_reason: str | None
 
 
 @dataclass(frozen=True)
@@ -120,6 +143,7 @@ class _SeriesCandidate:
     unassigned_reason: str | None
     representative_path: Path
     matching_slots: tuple[str, ...]
+    orientation: OrientationDecision
 
 
 def build_study_records(
@@ -196,6 +220,19 @@ def build_study_records(
                 weighting_source=f"read-error:{type(error).__name__}",
                 fat_suppression_source=f"read-error:{type(error).__name__}",
             )
+        try:
+            orientation = read_orientation_header(representative)
+        except Exception as error:
+            orientation = OrientationDecision(
+                plane="unknown",
+                laterality_tag=None,
+                geometry_laterality=None,
+                resolved_laterality=None,
+                laterality_source="unresolved",
+                horizontal_flip=False,
+                tag_geometry_disagreement=False,
+                audit_reason=f"read-error:{type(error).__name__}",
+            )
         slot_name, unassigned_reason = match_series_table_slot(
             plane, raw_fluid, raw_fat
         )
@@ -222,6 +259,7 @@ def build_study_records(
             unassigned_reason=unassigned_reason,
             representative_path=representative,
             matching_slots=matching,
+            orientation=orientation,
         )
 
     ordered_inputs = sorted(series_inputs.items())
@@ -230,6 +268,7 @@ def build_study_records(
 
     candidates: dict[str, dict[str, list[_SeriesCandidate]]] = {}
     classifications: dict[str, list[SeriesClassification]] = {}
+    orientation_audits: dict[str, list[SeriesOrientationAudit]] = {}
     for candidate in classified:
         relative_header = (
             f"{candidate.study_uid}/{candidate.series_uid}/"
@@ -253,6 +292,22 @@ def build_study_records(
                 ),
                 representative_path=relative_header,
                 matching_slots=candidate.matching_slots,
+            )
+        )
+        orientation_audits.setdefault(candidate.study_uid, []).append(
+            SeriesOrientationAudit(
+                series_uid=candidate.series_uid,
+                representative_path=relative_header,
+                plane=candidate.orientation.plane,
+                laterality_tag=candidate.orientation.laterality_tag,
+                geometry_laterality=candidate.orientation.geometry_laterality,
+                resolved_laterality=candidate.orientation.resolved_laterality,
+                laterality_source=candidate.orientation.laterality_source,
+                horizontal_flip=candidate.orientation.horizontal_flip,
+                tag_geometry_disagreement=(
+                    candidate.orientation.tag_geometry_disagreement
+                ),
+                audit_reason=candidate.orientation.audit_reason,
             )
         )
         for slot_name in candidate.matching_slots:
@@ -405,6 +460,12 @@ def build_study_records(
                         key=lambda item: item.series_uid,
                     )
                 ),
+                orientation_audits=tuple(
+                    sorted(
+                        orientation_audits.get(study_uid, []),
+                        key=lambda item: item.series_uid,
+                    )
+                ),
             )
         )
     return records
@@ -468,6 +529,7 @@ def build_cached_study_records(
         }
 
         classifications = []
+        orientation_audits = []
         candidates: dict[str, list[tuple[str, Mapping[str, object], object]]] = {}
         classified_values: dict[
             str, tuple[object, AcquisitionClass, str | None, bool | None, bool | None]
@@ -490,6 +552,14 @@ def build_cached_study_records(
                 fluid_sensitive = None
                 fat_suppressed = None
             acquisition = classify_acquisition(metadata["acquisition_header"])
+            orientation_header = metadata["acquisition_header"]
+            orientation = decide_orientation(
+                orientation_header,
+                (
+                    int(orientation_header.get("Rows", 0) or 0),
+                    int(orientation_header.get("Columns", 0) or 0),
+                ),
+            )
             matching_slots = (
                 (slot_name,)
                 if slot_name in {slot.name for slot in slots}
@@ -518,6 +588,22 @@ def build_cached_study_records(
                     fat_suppression_source=acquisition.fat_suppression_source,
                     representative_path=str(metadata["representative_path"]),
                     matching_slots=matching_slots,
+                )
+            )
+            orientation_audits.append(
+                SeriesOrientationAudit(
+                    series_uid=series_uid,
+                    representative_path=str(metadata["representative_path"]),
+                    plane=orientation.plane,
+                    laterality_tag=orientation.laterality_tag,
+                    geometry_laterality=orientation.geometry_laterality,
+                    resolved_laterality=orientation.resolved_laterality,
+                    laterality_source=orientation.laterality_source,
+                    horizontal_flip=orientation.horizontal_flip,
+                    tag_geometry_disagreement=(
+                        orientation.tag_geometry_disagreement
+                    ),
+                    audit_reason=orientation.audit_reason,
                 )
             )
             if slot_name in matching_slots:
@@ -689,6 +775,7 @@ def build_cached_study_records(
                 max_series_per_slot=max_series_per_slot,
                 selections=tuple(selections),
                 classifications=tuple(classifications),
+                orientation_audits=tuple(orientation_audits),
             )
         )
     return records
@@ -728,6 +815,12 @@ def load_study_records_cache(
         raise ValueError("Study-record cache window count changed")
     if int(report.get("window_size", -1)) != 3:
         raise ValueError("Study-record cache window size changed")
+    if (
+        report.get("orientation_normalization")
+        != ORIENTATION_NORMALIZATION_METHOD
+        or report.get("medial_side") != "image-right"
+    ):
+        raise ValueError("Study-record cache orientation normalization changed")
 
     split = report.get("splits", {}).get("all-training-studies", {})
     entries = split.get("studies", [])
@@ -851,6 +944,23 @@ def load_study_records_cache(
             )
             for row in entry.get("series_classifications", [])
         )
+        orientation_audits = tuple(
+            SeriesOrientationAudit(
+                series_uid=str(row["series_uid"]),
+                representative_path=str(row["representative_path"]),
+                plane=str(row["plane"]),
+                laterality_tag=row.get("laterality_tag"),
+                geometry_laterality=row.get("geometry_laterality"),
+                resolved_laterality=row.get("resolved_laterality"),
+                laterality_source=str(row["laterality_source"]),
+                horizontal_flip=bool(row["horizontal_flip"]),
+                tag_geometry_disagreement=bool(
+                    row["tag_geometry_disagreement"]
+                ),
+                audit_reason=row.get("audit_reason"),
+            )
+            for row in entry.get("orientation_audits", [])
+        )
         records.append(
             StudyRecord(
                 study_uid=study_uid,
@@ -860,6 +970,7 @@ def load_study_records_cache(
                 max_series_per_slot=max_series_per_slot,
                 selections=tuple(selections),
                 classifications=classifications,
+                orientation_audits=orientation_audits,
             )
         )
     return records, dict(split.get("summary", {}))
@@ -957,6 +1068,19 @@ def read_dicom(
     slope = float(getattr(dataset, "RescaleSlope", 1.0) or 1.0)
     intercept = float(getattr(dataset, "RescaleIntercept", 0.0) or 0.0)
     pixels = pixels * slope + intercept
+    orientation = decide_orientation(
+        {
+            "ImageOrientationPatient": getattr(
+                dataset, "ImageOrientationPatient", None
+            ),
+            "ImagePositionPatient": getattr(dataset, "ImagePositionPatient", None),
+            "PixelSpacing": getattr(dataset, "PixelSpacing", None),
+            "Laterality": getattr(dataset, "Laterality", None),
+        },
+        pixels.shape,
+    )
+    if orientation.horizontal_flip:
+        pixels = np.flip(pixels, axis=1)
     pixels = preprocess_physical_fov(
         pixels,
         getattr(dataset, "PixelSpacing", None),

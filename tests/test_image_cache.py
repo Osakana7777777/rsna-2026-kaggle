@@ -15,6 +15,7 @@ from rsna2026.image_cache import (
     shard_for_study,
 )
 from rsna2026.slice_selection import PhysicalWindowSelection
+from rsna2026.train import slice_selection_report
 
 
 def _selection(paths: list[Path]) -> PhysicalWindowSelection:
@@ -87,7 +88,15 @@ def test_builds_all_series_cache_and_decodes_each_source_once(
     monkeypatch.setattr("rsna2026.image_cache.read_dicom", fake_read)
     monkeypatch.setattr(
         "rsna2026.image_cache.read_series_header",
-        lambda _path: {"SeriesDescription": "SAG PD FS"},
+        lambda _path: {
+            "SeriesDescription": "SAG PD FS",
+            "ImageOrientationPatient": [0, 1, 0, 0, 0, -1],
+            "ImagePositionPatient": [100, 0, 0],
+            "PixelSpacing": [1, 1],
+            "Laterality": "R",
+            "Rows": 224,
+            "Columns": 224,
+        },
     )
 
     manifest = build_image_cache_shard(
@@ -106,7 +115,13 @@ def test_builds_all_series_cache_and_decodes_each_source_once(
     study = manifest["studies"][0]
     assert len(study["series"]) == 2
     assert study["series"][0]["acquisition_header"] == {
-        "SeriesDescription": "SAG PD FS"
+        "SeriesDescription": "SAG PD FS",
+        "ImageOrientationPatient": [0, 1, 0, 0, 0, -1],
+        "ImagePositionPatient": [100, 0, 0],
+        "PixelSpacing": [1, 1],
+        "Laterality": "R",
+        "Rows": 224,
+        "Columns": 224,
     }
 
     reader = ImageCacheReader(
@@ -133,6 +148,16 @@ def test_builds_all_series_cache_and_decodes_each_source_once(
         slot_names=SLOT_NAMES,
         classification_method=CLASSIFICATION_METHOD,
     )
+    assert len(records[0].orientation_audits) == 2
+    assert all(
+        audit.tag_geometry_disagreement
+        for audit in records[0].orientation_audits
+    )
+    audit_summary = slice_selection_report(
+        {"train": records}, window_count=2, max_series_per_slot=1
+    )["splits"]["train"]["summary"]
+    assert audit_summary["laterality_disagreement_studies"] == [study_uid]
+    assert audit_summary["laterality_disagreement_study_count"] == 1
     monkeypatch.setattr(
         "rsna2026.dataset.read_dicom",
         lambda *_args: pytest.fail("persistent cache must not decode DICOM"),

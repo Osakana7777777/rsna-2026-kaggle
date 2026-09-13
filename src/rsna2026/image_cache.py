@@ -13,6 +13,7 @@ import pandas as pd
 import pydicom
 
 from rsna2026.dataset import PREPROCESSING_VERSION, read_dicom
+from rsna2026.orientation import ORIENTATION_NORMALIZATION_METHOD, ORIENTATION_TAGS
 from rsna2026.slice_selection import select_physical_windows
 
 
@@ -38,6 +39,7 @@ ACQUISITION_HEADER_TAGS = (
     "MagneticFieldStrength",
     "Manufacturer",
     "ManufacturerModelName",
+    *ORIENTATION_TAGS,
 )
 
 
@@ -282,6 +284,8 @@ def build_image_cache_shard(
             "physical_fov_mm": physical_fov_mm,
             "normalization_percentiles": [1.0, 99.0],
             "monochrome1_inverted": True,
+            "orientation_normalization": ORIENTATION_NORMALIZATION_METHOD,
+            "medial_side": "image-right",
             "resize_interpolation": "bilinear-align-corners-false",
             "storage_dtype": "uint8",
             "compression": "numpy-npz-deflate-lossless",
@@ -358,6 +362,12 @@ class ImageCacheReader:
                 raise ValueError("Image-cache normalization changed")
             if preprocessing.get("monochrome1_inverted") is not True:
                 raise ValueError("Image-cache monochrome inversion changed")
+            if (
+                preprocessing.get("orientation_normalization")
+                != ORIENTATION_NORMALIZATION_METHOD
+                or preprocessing.get("medial_side") != "image-right"
+            ):
+                raise ValueError("Image-cache orientation normalization changed")
             if (
                 preprocessing.get("resize_interpolation")
                 != "bilinear-align-corners-false"

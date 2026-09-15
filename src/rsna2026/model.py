@@ -196,6 +196,145 @@ class HierarchicalTargetAttentionHead(nn.Module):
         return logits
 
 
+class TransformerTargetAttentionHead(nn.Module):
+    """Contextualize all windows before target-specific global pooling."""
+
+    def __init__(
+        self,
+        feature_size: int,
+        hidden_size: int,
+        num_slots: int,
+        num_targets: int,
+        position_size: int,
+        dropout: float,
+        num_layers: int,
+        num_heads: int,
+    ) -> None:
+        super().__init__()
+        if num_layers <= 0 or num_heads <= 0:
+            raise ValueError("Transformer layer and head counts must be positive")
+        if hidden_size % num_heads:
+            raise ValueError("Attention hidden size must be divisible by head count")
+        self.window_projection = nn.Sequential(
+            nn.LayerNorm(feature_size),
+            nn.Linear(feature_size, hidden_size),
+            nn.GELU(),
+        )
+        self.position_projection = nn.Sequential(
+            nn.Linear(position_size, hidden_size), nn.GELU()
+        )
+        self.slot_embedding = nn.Parameter(
+            torch.randn(num_slots, hidden_size) * 0.02
+        )
+        self.transformer_norms = nn.ModuleList(
+            nn.LayerNorm(hidden_size) for _ in range(num_layers)
+        )
+        self.transformer_layers = nn.ModuleList(
+            nn.MultiheadAttention(
+                hidden_size,
+                num_heads,
+                dropout=dropout,
+                batch_first=True,
+            )
+            for _ in range(num_layers)
+        )
+        self.final_norm = nn.LayerNorm(hidden_size)
+        self.target_query = nn.Parameter(
+            torch.randn(num_targets, hidden_size) * 0.02
+        )
+        self.output_weight = nn.Parameter(
+            torch.randn(num_targets, hidden_size) * 0.02
+        )
+        self.output_bias = nn.Parameter(torch.zeros(num_targets))
+        self.dropout = nn.Dropout(dropout)
+        self.hidden_size = hidden_size
+        self.num_slots = num_slots
+        self.num_targets = num_targets
+        self.position_size = position_size
+
+    @staticmethod
+    def _masked_softmax(scores: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        weights = torch.softmax(scores.masked_fill(~mask, -1e4), dim=-1)
+        weights = weights * mask.to(weights.dtype)
+        return weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+    def forward(
+        self,
+        window_features: torch.Tensor,
+        window_present: torch.Tensor,
+        position_features: torch.Tensor,
+        return_attention: bool = False,
+    ) -> torch.Tensor | tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
+        batch_size, num_slots, max_series, windows, _ = window_features.shape
+        if num_slots != self.num_slots:
+            raise ValueError(f"Expected {self.num_slots} slots, received {num_slots}")
+        if window_present.shape != window_features.shape[:4]:
+            raise ValueError("Window mask shape does not match window features")
+        if position_features.shape != (
+            *window_features.shape[:4],
+            self.position_size,
+        ):
+            raise ValueError("Position feature shape does not match windows")
+
+        hidden = self.window_projection(window_features)
+        hidden = hidden + self.position_projection(position_features)
+        hidden = hidden + self.slot_embedding.view(
+            1, self.num_slots, 1, 1, self.hidden_size
+        )
+        token_count = num_slots * max_series * windows
+        hidden = hidden.reshape(batch_size, token_count, self.hidden_size)
+        token_present = window_present.reshape(batch_size, token_count).to(torch.bool)
+        hidden = hidden.masked_fill(~token_present.unsqueeze(-1), 0.0)
+
+        # MultiheadAttention returns NaNs when every key in a row is masked.
+        # Empty studies bypass it and are handled by the global masked pooling.
+        nonempty = token_present.any(dim=-1)
+        if nonempty.any():
+            contextualized = hidden[nonempty]
+            key_padding_mask = ~token_present[nonempty]
+            for norm, attention in zip(
+                self.transformer_norms, self.transformer_layers, strict=True
+            ):
+                normalized = norm(contextualized)
+                attended, _ = attention(
+                    normalized,
+                    normalized,
+                    normalized,
+                    key_padding_mask=key_padding_mask,
+                    need_weights=False,
+                )
+                contextualized = contextualized + attended
+            hidden = hidden.index_copy(0, nonempty.nonzero().flatten(), contextualized)
+        hidden = self.final_norm(hidden)
+
+        scores = torch.einsum(
+            "bnh,th->btn", hidden, self.target_query
+        ) / math.sqrt(self.hidden_size)
+        global_attention = self._masked_softmax(
+            scores, token_present.unsqueeze(1)
+        )
+        context = self.dropout(
+            torch.einsum("btn,bnh->bth", global_attention, hidden)
+        )
+        logits = (
+            context * self.output_weight.unsqueeze(0)
+        ).sum(dim=-1) + self.output_bias
+        if return_attention:
+            window_attention = global_attention.reshape(
+                batch_size,
+                self.num_targets,
+                num_slots,
+                max_series,
+                windows,
+            )
+            series_attention = window_attention.sum(dim=-1)
+            slot_attention = series_attention.sum(dim=-1)
+            return logits, window_attention, series_attention, slot_attention
+        return logits
+
+
 def find_dinov2_source(input_root: str | Path, variant: str) -> Path:
     """Find exactly one mounted local DINOv2 model of the requested variant."""
     root = Path(input_root)
@@ -279,6 +418,9 @@ class KneeAbnormalityModel(nn.Module):
         slices_per_slot: int,
         attention_hidden_size: int,
         backbone_family: str | None = None,
+        aggregation: str = "hierarchical-target-series-attention",
+        transformer_layers: int = 2,
+        transformer_heads: int = 8,
     ) -> None:
         super().__init__()
         if unfreeze_last <= 0:
@@ -317,14 +459,24 @@ class KneeAbnormalityModel(nn.Module):
             feature_size = int(self.backbone.config.hidden_size) * 2
         else:
             feature_size = int(getattr(self.backbone, "num_features"))
-        self.head = HierarchicalTargetAttentionHead(
-            feature_size=feature_size,
-            hidden_size=attention_hidden_size,
-            num_slots=num_slots,
-            num_targets=num_targets,
-            position_size=3,
-            dropout=dropout,
-        )
+        head_arguments = {
+            "feature_size": feature_size,
+            "hidden_size": attention_hidden_size,
+            "num_slots": num_slots,
+            "num_targets": num_targets,
+            "position_size": 3,
+            "dropout": dropout,
+        }
+        if aggregation == "hierarchical-target-series-attention":
+            self.head = HierarchicalTargetAttentionHead(**head_arguments)
+        elif aggregation == "transformer-target-attention":
+            self.head = TransformerTargetAttentionHead(
+                **head_arguments,
+                num_layers=transformer_layers,
+                num_heads=transformer_heads,
+            )
+        else:
+            raise ValueError(f"Unsupported aggregation: {aggregation}")
         self.unfreeze_last = unfreeze_last
         self.feature_size = feature_size
         self.num_slots = num_slots
@@ -487,6 +639,9 @@ def build_dinov2_model(
     slices_per_slot: int,
     attention_hidden_size: int,
     gradient_checkpointing: bool,
+    aggregation: str = "hierarchical-target-series-attention",
+    transformer_layers: int = 2,
+    transformer_heads: int = 8,
 ) -> tuple[KneeAbnormalityModel, Path]:
     """Load a mounted DINOv2 model without any network access."""
     from transformers import AutoModel
@@ -511,6 +666,9 @@ def build_dinov2_model(
         window_count=window_count,
         slices_per_slot=slices_per_slot,
         attention_hidden_size=attention_hidden_size,
+        aggregation=aggregation,
+        transformer_layers=transformer_layers,
+        transformer_heads=transformer_heads,
     )
     return model, source
 
@@ -528,6 +686,9 @@ def build_coatnet_model(
     slices_per_slot: int,
     attention_hidden_size: int,
     gradient_checkpointing: bool,
+    aggregation: str = "hierarchical-target-series-attention",
+    transformer_layers: int = 2,
+    transformer_heads: int = 8,
 ) -> tuple[KneeAbnormalityModel, Path]:
     """Load a mounted timm CoAtNet checkpoint without network access."""
     import timm
@@ -563,5 +724,8 @@ def build_coatnet_model(
         slices_per_slot=slices_per_slot,
         attention_hidden_size=attention_hidden_size,
         backbone_family="coatnet",
+        aggregation=aggregation,
+        transformer_layers=transformer_layers,
+        transformer_heads=transformer_heads,
     )
     return model, source

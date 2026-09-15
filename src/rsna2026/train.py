@@ -65,9 +65,8 @@ from rsna2026.image_cache import (
     ImageCacheReader,
     build_image_cache_shard,
 )
-from rsna2026.model import build_dinov2_model
-from rsna2026.orientation import ORIENTATION_NORMALIZATION_METHOD
 from rsna2026.model import build_coatnet_model, build_dinov2_model
+from rsna2026.orientation import ORIENTATION_NORMALIZATION_METHOD
 from rsna2026.public_labels import (
     confidence_weight,
     load_public_label_table,
@@ -1048,6 +1047,13 @@ def model_artifact_metadata(config: dict[str, object]) -> dict[str, object]:
         metadata["weights_file"] = str(  # type: ignore[index]
             model_config["weights_file"]  # type: ignore[index]
         )
+    if metadata["aggregation"] == "transformer-target-attention":
+        metadata["transformer_layers"] = int(  # type: ignore[index]
+            model_config["transformer_layers"]
+        )
+        metadata["transformer_heads"] = int(  # type: ignore[index]
+            model_config["transformer_heads"]
+        )
     return metadata
 
 
@@ -1070,8 +1076,24 @@ def build_configured_model(
     if model_name == "coatnet-0" and image_size != 224:
         raise ValueError("CoAtNet-0 requires a 224-pixel input")
     aggregation = str(model_config["aggregation"])  # type: ignore[index]
-    if aggregation != "hierarchical-target-series-attention":
-        raise ValueError("Only hierarchical target-series attention is supported")
+    supported_aggregations = {
+        "hierarchical-target-series-attention",
+        "transformer-target-attention",
+    }
+    if aggregation not in supported_aggregations:
+        raise ValueError(f"Unsupported aggregation: {aggregation}")
+    transformer_layers = int(model_config.get("transformer_layers", 2))  # type: ignore[union-attr]
+    transformer_heads = int(model_config.get("transformer_heads", 8))  # type: ignore[union-attr]
+    if aggregation == "transformer-target-attention":
+        if transformer_layers <= 0 or transformer_heads <= 0:
+            raise ValueError("Transformer layer and head counts must be positive")
+        attention_hidden_size = int(  # type: ignore[index]
+            model_config["attention_hidden_size"]
+        )
+        if attention_hidden_size % transformer_heads:
+            raise ValueError(
+                "Attention hidden size must be divisible by transformer head count"
+            )
     input_representation = str(
         model_config["input_representation"]  # type: ignore[index]
     )
@@ -1116,6 +1138,9 @@ def build_configured_model(
         "attention_hidden_size": int(  # type: ignore[index]
             model_config["attention_hidden_size"]
         ),
+        "aggregation": aggregation,
+        "transformer_layers": transformer_layers,
+        "transformer_heads": transformer_heads,
         "gradient_checkpointing": bool(  # type: ignore[index]
             model_config["gradient_checkpointing"]
         ),
@@ -1873,7 +1898,7 @@ def run_cross_validation_training(
         "fold_assignment_sha256": design.audit["assignment_sha256"],
         "inner_assignment_sha256": design.audit["inner_assignment_sha256"],
         "test_ensemble": str(cv_config["test_ensemble"]),
-        "within_model_pooling": "hierarchical-target-series-attention",
+        "within_model_pooling": str(config["model"]["aggregation"]),  # type: ignore[index]
         "training_slice_selection_sha256": file_sha256(
             output_dir / "slice-selection.json"
         ),
@@ -2500,9 +2525,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             "total_parameters": total_parameters,
             "trainable_parameters": trainable_parameters,
             "grayscale_to_rgb": "three-ordered-slices-as-channels",
-            "window_pooling": "per-target-masked-attention",
-            "series_pooling": "per-target-masked-attention",
-            "slot_pooling": "per-target-masked-attention",
+            "within_model_pooling": str(config["model"]["aggregation"]),
+            "window_pooling": (
+                "per-target-global-masked-attention"
+                if config["model"]["aggregation"]
+                == "transformer-target-attention"
+                else "per-target-masked-attention"
+            ),
+            "series_pooling": (
+                "global-attention-marginal"
+                if config["model"]["aggregation"]
+                == "transformer-target-attention"
+                else "per-target-masked-attention"
+            ),
+            "slot_pooling": (
+                "global-attention-marginal"
+                if config["model"]["aggregation"]
+                == "transformer-target-attention"
+                else "per-target-masked-attention"
+            ),
             "backbone_learning_rate": backbone_learning_rate,
             "head_learning_rate": head_learning_rate,
             "weight_decay": float(config["training"]["weight_decay"]),

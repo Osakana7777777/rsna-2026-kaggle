@@ -130,6 +130,16 @@ def test_artifact_metadata_binds_physical_preprocessing() -> None:
     assert model_artifact_metadata(config) != baseline
 
 
+def test_transformer_artifact_metadata_includes_architecture_settings() -> None:
+    config = load_config("configs/baseline.toml")
+
+    metadata = model_artifact_metadata(config)
+
+    assert metadata["aggregation"] == "transformer-target-attention"
+    assert metadata["transformer_layers"] == 2
+    assert metadata["transformer_heads"] == 8
+
+
 def test_configured_model_rejects_legacy_window_settings() -> None:
     config = deepcopy(load_config("configs/baseline.toml"))
     config["data"]["sampled_slices_per_slot"] = 12
@@ -170,6 +180,27 @@ def test_configured_coatnet_routes_all_model_settings(monkeypatch) -> None:
     assert received["unfreeze_last"] == 6
     assert received["gradient_checkpointing"] is True
     assert received["num_targets"] == 12
+    assert received["aggregation"] == "hierarchical-target-series-attention"
+
+
+def test_configured_dinov2_routes_transformer_settings(monkeypatch) -> None:
+    config = load_config("configs/baseline.toml")
+    received = {}
+
+    def fake_build_dinov2_model(**kwargs):
+        received.update(kwargs)
+        return torch.nn.Linear(1, 1), Path("/mounted/dinov2")
+
+    monkeypatch.setattr(
+        "rsna2026.train.build_dinov2_model", fake_build_dinov2_model
+    )
+
+    _, source, _, _ = build_configured_model(config, torch.device("cpu"))
+
+    assert source == Path("/mounted/dinov2")
+    assert received["aggregation"] == "transformer-target-attention"
+    assert received["transformer_layers"] == 2
+    assert received["transformer_heads"] == 8
 
 
 def test_configured_coatnet_rejects_non_224_input() -> None:

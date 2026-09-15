@@ -131,8 +131,10 @@ input_representation = "2.5d-slice-channels"
 unfreeze_last = 6
 gradient_checkpointing = true
 pooling = "cls-patch-mean"
-aggregation = "hierarchical-target-series-attention"
+aggregation = "transformer-target-attention"
 attention_hidden_size = 256
+transformer_layers = 2
+transformer_heads = 8
 dropout = 0.25
 
 [inference]

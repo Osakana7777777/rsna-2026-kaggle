@@ -15,6 +15,7 @@ from rsna2026.model import (  # noqa: E402
     HierarchicalTargetAttentionHead,
     KneeAbnormalityModel,
     TargetAttentionHead,
+    TransformerTargetAttentionHead,
     build_coatnet_model,
     find_coatnet_source,
 )
@@ -339,6 +340,73 @@ def test_hierarchical_attention_masks_windows_and_slots() -> None:
     assert torch.allclose(series_attention[:, :, 0].sum(-1), torch.ones(1, 3))
     assert torch.allclose(slot_attention.sum(-1), torch.ones(1, 3))
     assert torch.isfinite(logits).all()
+
+
+def test_transformer_attention_masks_windows_and_returns_marginals() -> None:
+    head = TransformerTargetAttentionHead(8, 8, 2, 3, 3, 0.0, 2, 2)
+    features = torch.randn(2, 2, 2, 4, 8)
+    present = torch.tensor(
+        [
+            [
+                [[True, False, True, False], [True, False, False, False]],
+                [[False] * 4, [False, True, False, False]],
+            ],
+            [[[False] * 4, [False] * 4], [[False] * 4, [False] * 4]],
+        ]
+    )
+    positions = torch.randn(2, 2, 2, 4, 3)
+
+    logits, window_attention, series_attention, slot_attention = head(
+        features, present, positions, return_attention=True
+    )
+
+    assert logits.shape == (2, 3)
+    assert window_attention.shape == (2, 3, 2, 2, 4)
+    assert series_attention.shape == (2, 3, 2, 2)
+    assert slot_attention.shape == (2, 3, 2)
+    assert torch.isfinite(logits).all()
+    assert torch.all(window_attention.masked_select(~present.unsqueeze(1)) == 0)
+    assert torch.allclose(window_attention[0].sum(dim=(1, 2, 3)), torch.ones(3))
+    assert torch.all(window_attention[1] == 0)
+    assert torch.allclose(series_attention, window_attention.sum(dim=-1))
+    assert torch.allclose(slot_attention, series_attention.sum(dim=-1))
+
+
+def test_transformer_attention_is_invariant_to_series_permutation() -> None:
+    torch.manual_seed(7)
+    head = TransformerTargetAttentionHead(6, 8, 2, 3, 3, 0.0, 2, 2).eval()
+    features = torch.randn(1, 2, 3, 2, 6)
+    present = torch.tensor(
+        [[
+            [[True, False], [True, True], [False, True]],
+            [[True, True], [False, False], [True, False]],
+        ]]
+    )
+    positions = torch.randn(1, 2, 3, 2, 3)
+    permutation = torch.tensor([2, 0, 1])
+
+    original = head(features, present, positions)
+    permuted = head(
+        features[:, :, permutation],
+        present[:, :, permutation],
+        positions[:, :, permutation],
+    )
+
+    assert torch.allclose(original, permuted, atol=1e-6)
+
+
+def test_transformer_layers_create_window_interactions() -> None:
+    torch.manual_seed(11)
+    head = TransformerTargetAttentionHead(4, 8, 1, 2, 3, 0.0, 2, 2).eval()
+    features = torch.randn(1, 1, 1, 2, 4)
+    positions = torch.zeros(1, 1, 1, 2, 3)
+    only_first = torch.tensor([[[[True, False]]]])
+    both = torch.tensor([[[[True, True]]]])
+
+    first_alone = head(features, only_first, positions)
+    first_with_neighbor = head(features, both, positions)
+
+    assert not torch.allclose(first_alone, first_with_neighbor)
 
 
 def test_series_attention_is_permutation_invariant() -> None:

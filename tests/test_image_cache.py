@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -173,6 +174,29 @@ def test_builds_all_series_cache_and_decodes_each_source_once(
     torch.testing.assert_close(
         batch_images[0, 0, 0, 1], batch_images[0, 0, 1, 0]
     )
+
+    absolute_records = [
+        replace(
+            records[0],
+            window_paths=tuple(
+                tuple(
+                    tmp_path / "competition/train_series" / path
+                    if path is not None
+                    else None
+                    for path in window
+                )
+                for window in records[0].window_paths
+            ),
+        )
+    ]
+    absolute_images, absolute_present, _, _, _ = KneeStudyDataset(
+        absolute_records,
+        image_size=224,
+        physical_fov_mm=130.0,
+        image_cache=reader,
+    )[0]
+    torch.testing.assert_close(absolute_images, batch_images)
+    torch.testing.assert_close(absolute_present, batch_present)
 
 
 def test_cache_records_decode_failure_and_rejects_tampering(

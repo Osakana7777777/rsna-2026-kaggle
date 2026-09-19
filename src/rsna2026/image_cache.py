@@ -393,14 +393,19 @@ class ImageCacheReader:
                 if study_uid in self._studies:
                     raise ValueError(f"Duplicate cached study: {study_uid}")
                 archive_path = manifest_path.parent / str(study["archive"])
-                if not archive_path.is_file():
-                    raise ValueError(f"Missing image-cache archive: {archive_path}")
-                if archive_path.stat().st_size != int(study["archive_bytes"]):
-                    raise ValueError(f"Image-cache archive size changed: {archive_path}")
-                if verify_files and file_sha256(archive_path) != str(
-                    study["archive_sha256"]
-                ):
-                    raise ValueError(f"Image-cache archive SHA-256 changed: {archive_path}")
+                if verify_files:
+                    if not archive_path.is_file():
+                        raise ValueError(
+                            f"Missing image-cache archive: {archive_path}"
+                        )
+                    if archive_path.stat().st_size != int(study["archive_bytes"]):
+                        raise ValueError(
+                            f"Image-cache archive size changed: {archive_path}"
+                        )
+                    if file_sha256(archive_path) != str(study["archive_sha256"]):
+                        raise ValueError(
+                            f"Image-cache archive SHA-256 changed: {archive_path}"
+                        )
                 self._studies[study_uid] = (archive_path, study)
         if shard_count is None or shard_indices != set(range(shard_count)):
             raise ValueError("Image-cache shard set is incomplete")

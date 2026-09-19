@@ -14,9 +14,24 @@ from rsna2026.train import (  # noqa: E402
     DistributedEvaluationSampler,
     apply_runtime_overrides,
     checkpoint_state_dict,
+    folds_for_worker,
     mean_loss_from_totals,
     merge_prediction_shards,
 )
+
+
+def test_fold_workers_train_separate_folds_in_two_parallel_rounds() -> None:
+    assert folds_for_worker(4, worker_index=0, worker_count=2) == (0, 2)
+    assert folds_for_worker(4, worker_index=1, worker_count=2) == (1, 3)
+
+
+def test_single_fold_worker_trains_every_fold() -> None:
+    assert folds_for_worker(4, worker_index=0, worker_count=1) == (0, 1, 2, 3)
+
+
+def test_fold_worker_assignment_rejects_invalid_worker() -> None:
+    with pytest.raises(ValueError, match="Invalid fold worker"):
+        folds_for_worker(4, worker_index=2, worker_count=2)
 
 
 def test_runtime_overrides_preserve_portable_base_config() -> None:

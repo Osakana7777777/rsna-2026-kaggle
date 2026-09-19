@@ -1245,15 +1245,23 @@ class KneeStudyDataset(
         """Load selected paths strictly from one persistent study archive."""
         if self.image_cache is None:
             raise RuntimeError("Persistent image cache is unavailable")
+
+        def cache_key(path: Path) -> str:
+            """Normalize absolute competition paths to cache-relative keys."""
+            parts = path.parts
+            try:
+                study_index = parts.index(record.study_uid)
+            except ValueError:
+                return path.as_posix()
+            return "/".join(parts[study_index:])
+
         flat_paths = [path for window in record.window_paths for path in window]
         unique_paths = tuple(
-            dict.fromkeys(
-                path.as_posix() for path in flat_paths if path is not None
-            )
+            dict.fromkeys(cache_key(path) for path in flat_paths if path is not None)
         )
         inverse_by_path = {path: index for index, path in enumerate(unique_paths)}
         inverse = tuple(
-            inverse_by_path[path.as_posix()] if path is not None else -1
+            inverse_by_path[cache_key(path)] if path is not None else -1
             for path in flat_paths
         )
         cached_images, cached_present, cached_paths = self.image_cache.load_study(

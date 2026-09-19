@@ -6,7 +6,6 @@ import contextlib
 import hashlib
 import os
 import shutil
-import subprocess
 import sys
 import traceback
 from pathlib import Path
@@ -60,7 +59,7 @@ class Tee:
 
 
 def run_payload() -> int:
-    """Run EDA/inference directly or launch two distributed training processes."""
+    """Run EDA/inference directly or launch one distributed training process."""
     if RUN_MODE == "eda":
         from rsna2026.eda import main as eda_main
 
@@ -93,7 +92,6 @@ def run_payload() -> int:
     if RUN_MODE != "train":
         return train_main(arguments)
 
-    environment = os.environ.copy()
     config = load_config(arguments[1])
     data_config = config["data"]
     image_cache_config = config.get("image_cache", {})
@@ -121,51 +119,21 @@ def run_payload() -> int:
         runtime_cache = Path("/tmp/rsna2026-slice-selection.json")
         shutil.copyfile(generated_cache, runtime_cache)
         cache_sha256 = hashlib.sha256(runtime_cache.read_bytes()).hexdigest()
-        environment["RSNA2026_STUDY_RECORDS_CACHE_PATH"] = str(runtime_cache)
-        environment["RSNA2026_STUDY_RECORDS_CACHE_SHA256"] = cache_sha256
+        os.environ["RSNA2026_STUDY_RECORDS_CACHE_PATH"] = str(runtime_cache)
+        os.environ["RSNA2026_STUDY_RECORDS_CACHE_SHA256"] = cache_sha256
         print(
-            "Starting two-GPU training with the newly prepared physical-window "
+            "Starting one-GPU training with the newly prepared physical-window "
             f"selection cache: sha256={cache_sha256}",
             flush=True,
         )
     elif persistent_image_cache:
         print(
-            "Starting two-GPU training from the pinned persistent image cache",
+            "Starting one-GPU training from the pinned persistent image cache",
             flush=True,
         )
-    source_root = str(PAYLOAD_ROOT / "src")
-    current_python_path = environment.get("PYTHONPATH")
-    environment["PYTHONPATH"] = (
-        source_root
-        if not current_python_path
-        else os.pathsep.join((source_root, current_python_path))
-    )
-    environment["PYTHONUNBUFFERED"] = "1"
-    command = [
-        sys.executable,
-        "-m",
-        "torch.distributed.run",
-        "--standalone",
-        "--nproc-per-node=2",
-        "-m",
-        "rsna2026.train",
-        *arguments,
-    ]
-    print(f"Launching two-GPU training: {' '.join(command)}", flush=True)
-    process = subprocess.Popen(
-        command,
-        cwd=PAYLOAD_ROOT,
-        env=environment,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
-    if process.stdout is None:
-        raise RuntimeError("Distributed training output stream is unavailable")
-    for line in process.stdout:
-        print(line, end="", flush=True)
-    return process.wait()
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    print("Launching one-GPU training without torchrun", flush=True)
+    return train_main(arguments)
 
 
 if __name__ == "__main__":

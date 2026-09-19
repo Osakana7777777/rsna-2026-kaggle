@@ -31,6 +31,15 @@ required_files=(
   "src/rsna2026/public_labels.py"
   "src/rsna2026/slice_selection.py"
   "src/rsna2026/train.py"
+  "src/rsna2026/weak_label_calibration.py"
+  "src/rsna2026/weak_label_codes.py"
+  "src/rsna2026/weak_label_decode.py"
+  "src/rsna2026/weak_label_infer.py"
+  "src/rsna2026/weak_label_postprocess.py"
+  "src/rsna2026/weak_label_schema.py"
+  "prompts/rsna_knee_extractor_v1.txt"
+  "modal_weak_labels.py"
+  "docs/weak-label-extraction.md"
   "scripts/prepare.sh"
   "scripts/build_launcher.py"
   "scripts/build_selection_cache.py"
@@ -59,6 +68,7 @@ required_files=(
   "tests/test_dense_windows.py"
   "tests/test_image_cache.py"
   "tests/test_build_launcher.py"
+  "tests/test_weak_labels.py"
   "submissions/README.md"
   "submissions/TEMPLATE.md"
 )
@@ -82,6 +92,7 @@ if command -v uv >/dev/null 2>&1; then
   fi
   "${PROJECT_ROOT}/.venv/bin/python" -m compileall -q \
     "${PROJECT_ROOT}/src" "${PROJECT_ROOT}/kaggle/launcher.py" \
+    "${PROJECT_ROOT}/modal_weak_labels.py" \
     "${PROJECT_ROOT}/scripts/build_launcher.py" "${PROJECT_ROOT}/tests"
   "${PROJECT_ROOT}/.venv/bin/python" -c \
     'import json, pathlib, tomllib; root = pathlib.Path(__import__("sys").argv[1]); files = ["kernel-metadata.json", "train-kernel-metadata.json", "eda-kernel-metadata.json", *[f"preprocess-{index}-kernel-metadata.json" for index in range(4)]]; [json.loads((root / "kaggle" / name).read_text()) for name in files]; [tomllib.loads(path.read_text()) for path in sorted((root / "configs").glob("*.toml"))]' \

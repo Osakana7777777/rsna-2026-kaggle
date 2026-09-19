@@ -21,10 +21,9 @@ max_series_per_slot = 1
 # is not included in the training notebook outputs.
 dicom_cache_dir = "/tmp/rsna2026-dicom-cache"
 series_classification = "competition-series-table-v1"
-# The legacy selection-record cache is deliberately disabled. Selection records
-# are rebuilt from the pinned image-cache manifests and the competition table.
-study_records_cache_path = ""
-study_records_cache_sha256 = ""
+# Reuse the pinned selection records and validate their contents before training.
+study_records_cache_path = "/kaggle/input/rsna-2026-slice-selection-cache/slice-selection.json.xz"
+study_records_cache_sha256 = "5d639d8a41b4001b0eed8398e6a3a2cdc680eb06cb025a3a24695cc6cc26eb01"
 study_records_cache_uids_sha256 = "72bb18659cba9fc84f4f363c2585f1a99f84e6f03971e4d8313813ba647aa81e"
 slots = [
   "sagittal-fluid",
@@ -85,14 +84,14 @@ blur_sigma_max = 1.0
 blur_probability = 0.1
 
 [training]
-epochs = 20
-# One study per GPU with four-step accumulation preserves an effective batch of 8.
+epochs = 30
+# One study on the fold GPU with eight-step accumulation gives batch 8.
 batch_size_per_device = 1
-gradient_accumulation_steps = 4
+gradient_accumulation_steps = 8
 inference_batch_size = 1
 num_workers = 2
-distributed = true
-expected_gpu_count = 2
+distributed = false
+expected_gpu_count = 1
 backbone_learning_rate = 0.000016
 head_learning_rate = 0.002
 weight_decay = 0.02

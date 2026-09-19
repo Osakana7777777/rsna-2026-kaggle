@@ -16,6 +16,7 @@ import time
 from collections import Counter
 from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass
+from datetime import timedelta
 from pathlib import Path
 from statistics import median
 
@@ -188,6 +189,17 @@ class DistributedContext:
         return self.rank == 0
 
 
+def folds_for_worker(
+    fold_count: int, worker_index: int, worker_count: int
+) -> tuple[int, ...]:
+    """Assign folds round-robin so each GPU trains at most one fold at a time."""
+    if fold_count <= 0:
+        raise ValueError("Fold count must be positive")
+    if worker_count <= 0 or worker_index < 0 or worker_index >= worker_count:
+        raise ValueError("Invalid fold worker index or count")
+    return tuple(range(worker_index, fold_count, worker_count))
+
+
 class DistributedEvaluationSampler(Sampler[int]):
     """Shard evaluation indices without padding or duplicate studies."""
 
@@ -238,7 +250,12 @@ def initialize_distributed(
             f"{torch.cuda.device_count()}"
         )
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl", init_method="env://")
+    max_runtime_hours = float(training_config.get("max_runtime_hours", 12.0))
+    dist.init_process_group(
+        backend="nccl",
+        init_method="env://",
+        timeout=timedelta(hours=max_runtime_hours + 1.0),
+    )
     return DistributedContext(
         enabled=True,
         rank=rank,
@@ -1328,13 +1345,14 @@ def train_cv_fold(
     model, model_source, total_parameters, trainable_parameters = (
         build_configured_model(config, device)
     )
-    model = DistributedDataParallel(
-        model,
-        device_ids=[distributed.local_rank],
-        output_device=distributed.local_rank,
-        broadcast_buffers=True,
-        find_unused_parameters=False,
-    )
+    if distributed.enabled:
+        model = DistributedDataParallel(
+            model,
+            device_ids=[distributed.local_rank],
+            output_device=distributed.local_rank,
+            broadcast_buffers=True,
+            find_unused_parameters=False,
+        )
     raw_model = unwrap_model(model)
     backbone_learning_rate = float(training_config["backbone_learning_rate"])
     head_learning_rate = float(training_config["head_learning_rate"])
@@ -1386,14 +1404,17 @@ def train_cv_fold(
             accumulation_steps,
             distributed,
         )
-        inner_predictions, _, _, _, _ = predict_distributed(
-            model,
-            inner_loader,
-            inner_sampler,
-            len(inner_table),
-            device,
-            distributed,
-        )
+        if distributed.enabled:
+            inner_predictions, _, _, _, _ = predict_distributed(
+                model,
+                inner_loader,
+                inner_sampler,
+                len(inner_table),
+                device,
+                distributed,
+            )
+        else:
+            inner_predictions, _, _, _, _ = predict(model, inner_loader, device)
         if distributed.primary:
             if inner_predictions is None:
                 raise RuntimeError("Primary rank did not receive inner predictions")
@@ -1432,33 +1453,43 @@ def train_cv_fold(
             )
             if time_limit_reached:
                 print(f"Global runtime limit reached in fold {fold}", flush=True)
-        stop = torch.tensor(
-            int(time_limit_reached), dtype=torch.int32, device=device
-        )
-        dist.broadcast(stop, src=0)
-        time_limit_reached = bool(stop.item())
+        if distributed.enabled:
+            stop = torch.tensor(
+                int(time_limit_reached), dtype=torch.int32, device=device
+            )
+            dist.broadcast(stop, src=0)
+            time_limit_reached = bool(stop.item())
         if time_limit_reached:
             break
     if distributed.primary:
         if best_state is None:
             raise RuntimeError(f"Fold {fold} did not produce a model state")
         raw_model.load_state_dict(best_state)
-    for tensor in raw_model.state_dict().values():
-        dist.broadcast(tensor, src=0)
-    (
-        outer_predictions,
-        predicted_outer_labels,
-        outer_window_attention,
-        outer_series_attention,
-        outer_slot_attention,
-    ) = predict_distributed(
-        model,
-        outer_loader,
-        outer_sampler,
-        len(outer_table),
-        device,
-        distributed,
-    )
+    if distributed.enabled:
+        for tensor in raw_model.state_dict().values():
+            dist.broadcast(tensor, src=0)
+        (
+            outer_predictions,
+            predicted_outer_labels,
+            outer_window_attention,
+            outer_series_attention,
+            outer_slot_attention,
+        ) = predict_distributed(
+            model,
+            outer_loader,
+            outer_sampler,
+            len(outer_table),
+            device,
+            distributed,
+        )
+    else:
+        (
+            outer_predictions,
+            predicted_outer_labels,
+            outer_window_attention,
+            outer_series_attention,
+            outer_slot_attention,
+        ) = predict(model, outer_loader, device)
     fold_summary: dict[str, object] | None = None
     oof: pd.DataFrame | None = None
     if distributed.primary:
@@ -1547,7 +1578,8 @@ def train_cv_fold(
         for target_index, target in enumerate(TARGETS):
             oof[f"label_{target}"] = outer_labels[:, target_index]
             oof[f"prediction_{target}"] = outer_predictions[:, target_index]
-    dist.barrier()
+    if distributed.enabled:
+        dist.barrier()
     del raw_model
     del model, optimizer, scheduler, scaler
     del training_loader, inner_loader, outer_loader
@@ -1678,7 +1710,9 @@ def run_cross_validation_training(
     if distributed.primary:
         configured_cache = str(data_config.get("study_records_cache_path", ""))
         configured_sha256 = str(data_config.get("study_records_cache_sha256", ""))
-        if persistent_cache_enabled:
+        if persistent_cache_enabled and not (
+            configured_cache and configured_sha256
+        ):
             image_cache = ImageCacheReader(
                 manifest_paths,
                 expected_study_uids=all_uids,
@@ -1788,10 +1822,11 @@ def run_cross_validation_training(
             selection_output = output_dir / "slice-selection.json"
             write_json(selection_output, report)
             selection_summary = report["splits"]["all-training-studies"]["summary"]
-        temporary_records_cache = records_cache.with_suffix(".temporary")
-        with temporary_records_cache.open("wb") as file:
-            pickle.dump(all_records, file, protocol=pickle.HIGHEST_PROTOCOL)
-        os.replace(temporary_records_cache, records_cache)
+        if distributed.enabled:
+            temporary_records_cache = records_cache.with_suffix(".temporary")
+            with temporary_records_cache.open("wb") as file:
+                pickle.dump(all_records, file, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(temporary_records_cache, records_cache)
         print(
             f"Prepared physical-window study records: {selection_summary}", flush=True
         )
@@ -1813,20 +1848,38 @@ def run_cross_validation_training(
     if len(all_records) != len(all_uids):
         raise RuntimeError("Distributed study-record cache is incomplete")
     records_by_uid = {record.study_uid: record for record in all_records}
-    dist.barrier()
+    if distributed.enabled:
+        dist.barrier()
     device = torch.device("cuda", distributed.local_rank)
     local_gpu_name = torch.cuda.get_device_name(distributed.local_rank)
-    gpu_names: list[str | None] = [None] * distributed.world_size
-    dist.all_gather_object(gpu_names, local_gpu_name)
-    if distributed.primary:
+    if distributed.enabled:
+        gpu_names: list[str | None] = [None] * distributed.world_size
+        dist.all_gather_object(gpu_names, local_gpu_name)
         print(
             f"Distributed training on {distributed.world_size} GPUs: "
             f"{gpu_names}",
             flush=True,
         )
+    else:
+        gpu_names = [local_gpu_name]
+        print(f"Single-GPU training on {local_gpu_name}", flush=True)
     fold_summaries = []
     oof_tables = []
-    for fold in range(int(cv_config["folds"])):
+    fold_count = int(cv_config["folds"])
+    worker_folds = folds_for_worker(
+        fold_count,
+        distributed.rank if distributed.enabled else 0,
+        distributed.world_size if distributed.enabled else 1,
+    )
+    fold_context = DistributedContext(
+        enabled=False,
+        local_rank=distributed.local_rank,
+    )
+    print(
+        f"GPU {distributed.local_rank} training folds {list(worker_folds)}",
+        flush=True,
+    )
+    for fold in worker_folds:
         fold_roles = inner_splits.loc[inner_splits["model_fold"] == fold]
         summary, oof, time_limit = train_cv_fold(
             config,
@@ -1838,18 +1891,42 @@ def run_cross_validation_training(
             public.rows,
             records_by_uid,
             device,
-            distributed,
+            fold_context,
             image_cache,
         )
-        if distributed.primary:
-            if summary is None or oof is None:
-                raise RuntimeError("Primary rank did not receive fold artifacts")
-            fold_summaries.append(summary)
-            oof_tables.append(oof)
-        if time_limit and fold < int(cv_config["folds"]) - 1:
+        if summary is None or oof is None:
+            raise RuntimeError("Fold worker did not produce fold artifacts")
+        fold_summaries.append(summary)
+        oof_tables.append(oof)
+        if time_limit and fold != worker_folds[-1]:
             raise RuntimeError("Runtime limit prevented a complete four-fold ensemble")
-    if not distributed.primary:
-        return 0
+
+    if distributed.enabled:
+        gathered_results: list[
+            tuple[list[dict[str, object]], list[pd.DataFrame]] | None
+        ] = [None] * distributed.world_size
+        dist.all_gather_object(gathered_results, (fold_summaries, oof_tables))
+        if not distributed.primary:
+            return 0
+        fold_summaries = [
+            summary
+            for result in gathered_results
+            if result is not None
+            for summary in result[0]
+        ]
+        oof_tables = [
+            table
+            for result in gathered_results
+            if result is not None
+            for table in result[1]
+        ]
+    fold_summaries = sorted(
+        fold_summaries, key=lambda summary: int(summary["fold"])
+    )
+    if [int(summary["fold"]) for summary in fold_summaries] != list(
+        range(fold_count)
+    ):
+        raise RuntimeError("Fold workers did not produce every configured fold")
     oof = pd.concat(oof_tables, ignore_index=True).sort_values(
         "StudyInstanceUID"
     ).reset_index(drop=True)
@@ -1912,21 +1989,25 @@ def run_cross_validation_training(
             "enabled": distributed.enabled,
             "backend": distributed.backend,
             "world_size": distributed.world_size,
+            "strategy": (
+                "one-fold-per-gpu" if distributed.enabled else "single-gpu-sequential"
+            ),
+            "simultaneous_folds": (
+                distributed.world_size if distributed.enabled else 1
+            ),
             "gpu_names": gpu_names,
             "batch_size_per_device": int(
                 config["training"]["batch_size_per_device"]  # type: ignore[index]
             ),
             "microbatch_global_size": int(
                 config["training"]["batch_size_per_device"]  # type: ignore[index]
-            )
-            * distributed.world_size,
+            ),
             "gradient_accumulation_steps": int(
                 config["training"]["gradient_accumulation_steps"]  # type: ignore[index]
             ),
             "effective_batch_size": int(
                 config["training"]["batch_size_per_device"]  # type: ignore[index]
             )
-            * distributed.world_size
             * int(
                 config["training"]["gradient_accumulation_steps"]  # type: ignore[index]
             ),
@@ -2227,10 +2308,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     cv_config = config.get("cross_validation", {})
     if isinstance(cv_config, dict) and bool(cv_config.get("enabled", False)):
-        if not distributed.enabled:
-            raise RuntimeError(
-                "Cross-validation experiment requires distributed training"
-            )
         try:
             return run_cross_validation_training(
                 config, output_dir, started_at, distributed

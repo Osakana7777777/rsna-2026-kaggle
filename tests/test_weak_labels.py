@@ -17,6 +17,7 @@ from rsna2026.weak_label_decode import (
     semantic_warnings,
 )
 from rsna2026.weak_label_infer import (
+    DEFAULT_MODEL,
     InferenceSettings,
     Report,
     completed_study_ids,
@@ -231,7 +232,7 @@ def test_flat_rows_round_trip_through_parquet(tmp_path):
     assert table.column("ACL_competition_call").to_pylist() == ["uncertain"]
 
 
-def test_modal_model_prepare_is_cpu_only_and_inference_is_h100():
+def test_modal_model_prepare_is_cpu_only_and_inference_is_a100_80gb():
     source_path = Path(__file__).resolve().parents[1] / "modal_weak_labels.py"
     source = source_path.read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -252,13 +253,15 @@ def test_modal_model_prepare_is_cpu_only_and_inference_is_h100():
     extract_keywords = {
         keyword.arg: keyword.value for keyword in extract_decorator.keywords
     }
-    assert ast.literal_eval(extract_keywords["gpu"]) == "H100"
+    assert ast.literal_eval(extract_keywords["gpu"]) == "A100-80GB"
     assert '"HF_HUB_OFFLINE": "1"' in source
     assert '"TRANSFORMERS_OFFLINE": "1"' in source
     assert "snapshot_path = _prepared_snapshot(model, revision)" in source
     assert 'if action == "prepare-model":' in source
     assert "check_prepared_model.remote(" in source
     assert "input_path=input_path" in source
+    assert '"vllm==0.29.0"' in source
+    assert '"transformers==5.17.0"' in source
     assert source.index(".env(") < source.index(".add_local_dir(")
 
 
@@ -273,7 +276,7 @@ def test_vllm_engine_prefers_prepared_local_snapshot(monkeypatch):
             sampling = types.SimpleNamespace(
                 temperature=1.0,
                 top_p=0.95,
-                top_k=20,
+                top_k=64,
                 max_tokens=None,
                 structured_outputs=None,
             )
@@ -300,12 +303,20 @@ def test_vllm_engine_prefers_prepared_local_snapshot(monkeypatch):
     )
     assert captured["engine"]["model"] == "/cache/snapshots/fixed-revision"
     assert captured["engine"]["tensor_parallel_size"] == 1
-    assert captured["engine"]["max_num_seqs"] == 64
+    assert DEFAULT_MODEL == "google/gemma-4-31B-it"
+    assert captured["engine"]["max_num_seqs"] == 32
     assert captured["engine"]["enable_prefix_caching"] is True
+    assert captured["engine"]["dtype"] == "bfloat16"
+    assert captured["engine"]["kv_cache_dtype"] == "auto"
+    assert "calculate_kv_scales" not in captured["engine"]
+    assert captured["engine"]["limit_mm_per_prompt"] == {
+        "image": 0,
+        "audio": 0,
+    }
     assert captured["engine"]["generation_config"] == "auto"
     assert captured["sampling"].temperature == 1.0
     assert captured["sampling"].top_p == 0.95
-    assert captured["sampling"].top_k == 20
+    assert captured["sampling"].top_k == 64
     assert captured["sampling"].max_tokens == 1_200
     assert captured["sampling"].structured_outputs is not None
     assert captured["structured"]["json"]["required"] == ["l", "s", "g", "x"]

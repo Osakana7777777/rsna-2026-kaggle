@@ -74,7 +74,7 @@ def _schema_without_unique_items(value: object) -> object:
     return value
 
 
-# vLLM 0.24's guidance backend rejects ``uniqueItems``. The constrained decoder
+# vLLM's guidance backend rejects ``uniqueItems``. The constrained decoder
 # enforces every other structural rule, and ``validate_prediction`` below still
 # rejects duplicate global, feature, and review IDs before anything is persisted.
 VLLM_RSNA_LABEL_SCHEMA: dict[str, Any] = _schema_without_unique_items(

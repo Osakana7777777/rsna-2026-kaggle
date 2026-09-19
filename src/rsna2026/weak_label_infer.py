@@ -1,4 +1,4 @@
-"""Deterministic vLLM batch inference for report-derived weak labels."""
+"""vLLM batch inference for report-derived weak labels."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from rsna2026.weak_label_decode import decode_prediction, semantic_warnings
 from rsna2026.weak_label_schema import VLLM_RSNA_LABEL_SCHEMA
 
 LOGGER = logging.getLogger(__name__)
-DEFAULT_MODEL = "Qwen/Qwen3.8-27B-FP8"
+DEFAULT_MODEL = "google/gemma-4-31B-it"
 PROMPT_VERSION = "v1"
 DEFAULT_PROMPT_PATH = (
     Path(__file__).resolve().parents[2] / "prompts" / "rsna_knee_extractor_v1.txt"
@@ -30,12 +30,13 @@ class InferenceSettings:
     model: str = DEFAULT_MODEL
     model_revision: str | None = None
     model_path: str | None = None
-    max_model_len: int = 65_536
+    max_model_len: int = 8_192
     max_tokens: int = 1_200
-    batch_size: int = 64
-    max_num_seqs: int = 64
+    batch_size: int = 32
+    max_num_seqs: int = 32
     gpu_memory_utilization: float = 0.92
-    kv_cache_dtype: str = "fp8"
+    dtype: str = "bfloat16"
+    kv_cache_dtype: str = "auto"
     enable_prefix_caching: bool = True
     generation_config: str = "auto"
     thinking: bool = False
@@ -148,9 +149,11 @@ def create_engine(settings: InferenceSettings) -> tuple[Any, Any]:
         max_model_len=settings.max_model_len,
         max_num_seqs=settings.max_num_seqs,
         enable_prefix_caching=settings.enable_prefix_caching,
+        dtype=settings.dtype,
         kv_cache_dtype=settings.kv_cache_dtype,
         gpu_memory_utilization=settings.gpu_memory_utilization,
         generation_config=settings.generation_config,
+        limit_mm_per_prompt={"image": 0, "audio": 0},
         trust_remote_code=False,
     )
     sampling = engine.get_default_sampling_params()
@@ -376,12 +379,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--model-path",
         help="Optional local snapshot path; model remains the metadata identity",
     )
-    parser.add_argument("--max-model-len", type=int, default=65_536)
+    parser.add_argument("--max-model-len", type=int, default=8_192)
     parser.add_argument("--max-tokens", type=int, default=1_200)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--max-num-seqs", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--max-num-seqs", type=int, default=32)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.92)
-    parser.add_argument("--kv-cache-dtype", default="fp8")
+    parser.add_argument("--dtype", default="bfloat16")
+    parser.add_argument("--kv-cache-dtype", default="auto")
     parser.add_argument(
         "--enable-prefix-caching",
         action=argparse.BooleanOptionalAction,
@@ -407,6 +411,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         batch_size=args.batch_size,
         max_num_seqs=args.max_num_seqs,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        dtype=args.dtype,
         kv_cache_dtype=args.kv_cache_dtype,
         enable_prefix_caching=args.enable_prefix_caching,
     )

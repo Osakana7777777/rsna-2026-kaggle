@@ -1,4 +1,4 @@
-"""Run weak-label extraction on one Modal H100.
+"""Run weak-label extraction on one Modal A100 80GB.
 
 The input CSV must already exist in the ``rsna-weak-label-data`` Modal Volume.
 """
@@ -21,7 +21,8 @@ image = (
         add_python="3.11",
     )
     .pip_install(
-        "vllm==0.24.0",
+        "vllm==0.29.0",
+        "transformers==5.17.0",
         "pyarrow>=17,<22",
     )
     .env(
@@ -103,7 +104,7 @@ def _prepared_snapshot(model: str, revision: str | None) -> str:
     if not manifest_path.is_file():
         raise RuntimeError(
             "Model is not prepared in the shared cache. Run the prepare-model "
-            "action before starting the H100 inference function."
+            "action before starting the A100 80GB inference function."
         )
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("model") != model or manifest.get("revision") != revision:
@@ -129,7 +130,7 @@ def check_prepared_model(
     revision: str | None = None,
     input_path: str | None = None,
 ) -> str:
-    """Validate cached model and input on CPU before requesting an H100."""
+    """Validate cached model and input on CPU before requesting an A100 80GB."""
     snapshot_path = _prepared_snapshot(model, revision)
     if input_path is not None:
         mounted_input = Path(_volume_path(input_path))
@@ -142,7 +143,7 @@ def check_prepared_model(
 
 @app.function(
     image=image,
-    gpu="H100",
+    gpu="A100-80GB",
     timeout=24 * 60 * 60,
     volumes={
         "/data": data_volume,
@@ -161,6 +162,7 @@ def extract(
     batch_size: int,
     max_num_seqs: int,
     gpu_memory_utilization: float,
+    dtype: str,
     kv_cache_dtype: str,
     resume: bool,
 ) -> None:
@@ -194,6 +196,8 @@ def extract(
         str(max_num_seqs),
         "--gpu-memory-utilization",
         str(gpu_memory_utilization),
+        "--dtype",
+        dtype,
         "--kv-cache-dtype",
         kv_cache_dtype,
         "--enable-prefix-caching",
@@ -227,14 +231,15 @@ def main(
     output_path: str = "outputs/raw_predictions.jsonl",
     id_column: str = "StudyInstanceUID",
     report_column: str = "report",
-    model: str = "Qwen/Qwen3.8-27B-FP8",
+    model: str = "google/gemma-4-31B-it",
     revision: str | None = None,
-    max_model_len: int = 65_536,
+    max_model_len: int = 8_192,
     max_tokens: int = 1_200,
-    batch_size: int = 64,
-    max_num_seqs: int = 64,
+    batch_size: int = 32,
+    max_num_seqs: int = 32,
     gpu_memory_utilization: float = 0.92,
-    kv_cache_dtype: str = "fp8",
+    dtype: str = "bfloat16",
+    kv_cache_dtype: str = "auto",
     resume: bool = True,
 ) -> None:
     if action == "prepare-model":
@@ -260,6 +265,7 @@ def main(
         batch_size=batch_size,
         max_num_seqs=max_num_seqs,
         gpu_memory_utilization=gpu_memory_utilization,
+        dtype=dtype,
         kv_cache_dtype=kv_cache_dtype,
         resume=resume,
     )

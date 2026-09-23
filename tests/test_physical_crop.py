@@ -209,3 +209,28 @@ def test_configured_coatnet_rejects_non_224_input() -> None:
 
     with pytest.raises(ValueError, match="224-pixel"):
         build_configured_model(config, torch.device("cpu"))
+
+
+def test_radimagenet_metadata_and_model_settings_are_routed(monkeypatch) -> None:
+    config = load_config("configs/radimagenet-resnet50-224.toml")
+    metadata = model_artifact_metadata(config)
+    received = {}
+
+    def fake_build_radimagenet_model(**kwargs):
+        received.update(kwargs)
+        return torch.nn.Linear(1, 1), Path("/mounted/radimagenet")
+
+    monkeypatch.setattr(
+        "rsna2026.train.build_radimagenet_resnet50_model",
+        fake_build_radimagenet_model,
+    )
+
+    _, source, _, _ = build_configured_model(config, torch.device("cpu"))
+
+    assert metadata["weights_file"] == "ResNet50.pt"
+    assert metadata["normalization"] == "minus-one-to-one"
+    assert source == Path("/mounted/radimagenet")
+    assert received["weights_file"] == "ResNet50.pt"
+    assert received["unfreeze_last"] == 0
+    assert received["gradient_checkpointing"] is False
+    assert received["aggregation"] == "transformer-target-attention"

@@ -20,16 +20,20 @@ from rsna2026.weak_label_infer import (
     DEFAULT_MODEL,
     InferenceSettings,
     Report,
+    build_parser,
     completed_study_ids,
     create_engine,
     messages,
+    parse_and_validate_prediction,
+    parse_model_output,
     read_reports,
 )
 from rsna2026.weak_label_postprocess import load_flat_rows, write_parquet
 from rsna2026.weak_label_schema import (
-    PredictionValidationError,
     RSNA_LABEL_SCHEMA,
     VLLM_RSNA_LABEL_SCHEMA,
+    PredictionValidationError,
+    normalize_unique_items,
     validate_prediction,
 )
 
@@ -176,12 +180,15 @@ def test_flatten_adds_calls_weights_review_mask_and_second_pass():
     assert row["needs_second_pass"] is True
 
 
-def test_messages_have_identical_system_prefix_and_variable_user_suffix():
+def test_messages_put_fixed_prefix_and_variable_suffix_in_one_user_turn():
     first = messages("fixed", Report("uid-1", "report one"))
     second = messages("fixed", Report("uid-2", "report two"))
-    assert first[0] == second[0] == {"role": "system", "content": "fixed"}
-    assert first[1] != second[1]
-    assert first[1]["content"].endswith("report one")
+    assert len(first) == len(second) == 1
+    assert first[0]["role"] == second[0]["role"] == "user"
+    assert first[0]["content"].startswith("fixed\n\n--- CASE INPUT ---")
+    assert second[0]["content"].startswith("fixed\n\n--- CASE INPUT ---")
+    assert first[0]["content"].endswith("report one")
+    assert second[0]["content"].endswith("report two")
 
 
 def test_read_reports_rejects_duplicate_uids(tmp_path):
@@ -262,6 +269,8 @@ def test_modal_model_prepare_is_cpu_only_and_inference_is_a100_80gb():
     assert "input_path=input_path" in source
     assert '"vllm==0.29.0"' in source
     assert '"transformers==5.17.0"' in source
+    assert '"--thinking" if thinking else "--no-thinking"' in source
+    assert "thinking=thinking" in source
     assert source.index(".env(") < source.index(".add_local_dir(")
 
 
@@ -279,6 +288,7 @@ def test_vllm_engine_prefers_prepared_local_snapshot(monkeypatch):
                 top_k=64,
                 max_tokens=None,
                 structured_outputs=None,
+                skip_special_tokens=True,
             )
             captured["sampling"] = sampling
             return sampling
@@ -303,7 +313,7 @@ def test_vllm_engine_prefers_prepared_local_snapshot(monkeypatch):
     )
     assert captured["engine"]["model"] == "/cache/snapshots/fixed-revision"
     assert captured["engine"]["tensor_parallel_size"] == 1
-    assert DEFAULT_MODEL == "google/gemma-4-31B-it"
+    assert DEFAULT_MODEL == "google/gemma-4-12B-it"
     assert captured["engine"]["max_num_seqs"] == 32
     assert captured["engine"]["enable_prefix_caching"] is True
     assert captured["engine"]["dtype"] == "bfloat16"
@@ -314,9 +324,88 @@ def test_vllm_engine_prefers_prepared_local_snapshot(monkeypatch):
         "audio": 0,
     }
     assert captured["engine"]["generation_config"] == "auto"
+    assert captured["engine"]["structured_outputs_config"] == {
+        "reasoning_parser": "gemma4",
+        "enable_in_reasoning": False,
+    }
     assert captured["sampling"].temperature == 1.0
     assert captured["sampling"].top_p == 0.95
     assert captured["sampling"].top_k == 64
-    assert captured["sampling"].max_tokens == 1_200
+    assert captured["sampling"].max_tokens == 4_096
+    assert captured["sampling"].skip_special_tokens is False
     assert captured["sampling"].structured_outputs is not None
     assert captured["structured"]["json"]["required"] == ["l", "s", "g", "x"]
+
+
+def test_parse_model_output_separates_gemma4_reasoning(monkeypatch):
+    gemma4_utils = types.ModuleType("vllm.reasoning.gemma4_utils")
+
+    def fake_parse_thinking_output(text):
+        assert text == "raw tagged output"
+        return {
+            "thinking": "clinical reasoning",
+            "answer": '{"l":"en","s":0,"g":[],"x":[]}',
+        }
+
+    gemma4_utils.parse_thinking_output = fake_parse_thinking_output
+    reasoning = types.ModuleType("vllm.reasoning")
+    vllm = types.ModuleType("vllm")
+    monkeypatch.setitem(sys.modules, "vllm", vllm)
+    monkeypatch.setitem(sys.modules, "vllm.reasoning", reasoning)
+    monkeypatch.setitem(sys.modules, "vllm.reasoning.gemma4_utils", gemma4_utils)
+
+    answer, thinking = parse_model_output("raw tagged output")
+    assert answer.startswith('{"l":"en"')
+    assert thinking == "clinical reasoning"
+
+
+def test_final_answer_normalizes_unique_items_then_satisfies_schema(monkeypatch):
+    duplicate_global_flag = prediction_with("ACL", absent_finding())
+    duplicate_global_flag["g"] = [1, 1]
+    duplicate_global_flag["x"][0][5] = [1, 1, 2, 2]
+    duplicate_global_flag["x"][0][6] = [3, 3]
+    gemma4_utils = types.ModuleType("vllm.reasoning.gemma4_utils")
+    gemma4_utils.parse_thinking_output = lambda text: {
+        "thinking": "clinical reasoning",
+        "answer": text,
+    }
+    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    monkeypatch.setitem(
+        sys.modules, "vllm.reasoning", types.ModuleType("vllm.reasoning")
+    )
+    monkeypatch.setitem(sys.modules, "vllm.reasoning.gemma4_utils", gemma4_utils)
+
+    prediction, thinking, paths = parse_and_validate_prediction(
+        json.dumps(duplicate_global_flag)
+    )
+    assert prediction["g"] == [1]
+    assert prediction["x"][0][5] == [1, 2]
+    assert prediction["x"][0][6] == [3]
+    assert paths == ["g", "x[0][5]", "x[0][6]"]
+    assert thinking == "clinical reasoning"
+
+    valid = prediction_with("ACL", absent_finding())
+    prediction, thinking, paths = parse_and_validate_prediction(json.dumps(valid))
+    assert prediction == valid
+    assert thinking == "clinical reasoning"
+    assert paths == []
+
+
+def test_unique_items_normalization_does_not_hide_invalid_types():
+    value = prediction_with("ACL", absent_finding())
+    value["g"] = [1, True]
+    normalized, paths = normalize_unique_items(value)
+    assert paths == []
+    with pytest.raises(PredictionValidationError, match="integer"):
+        validate_prediction(normalized)
+
+
+def test_reasoning_can_be_disabled_from_cli():
+    default_args = build_parser().parse_args(
+        ["--input", "reports.csv", "--output", "predictions.jsonl"]
+    )
+    args = build_parser().parse_args(
+        ["--input", "reports.csv", "--output", "predictions.jsonl", "--no-thinking"]
+    )
+    assert default_args.thinking is True
+    assert args.thinking is False

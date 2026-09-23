@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import gc
 import json
 import lzma
@@ -66,7 +67,11 @@ from rsna2026.image_cache import (
     ImageCacheReader,
     build_image_cache_shard,
 )
-from rsna2026.model import build_coatnet_model, build_dinov2_model
+from rsna2026.model import (
+    build_coatnet_model,
+    build_dinov2_model,
+    build_radimagenet_resnet50_model,
+)
 from rsna2026.orientation import ORIENTATION_NORMALIZATION_METHOD
 from rsna2026.public_labels import (
     confidence_weight,
@@ -117,6 +122,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Override training.expected_gpu_count for the current runtime",
     )
     parser.add_argument(
+        "--ema-decay",
+        type=float,
+        help="Enable EMA model selection with this decay",
+    )
+    parser.add_argument(
         "--build-selection-cache",
         action="store_true",
         help="Build the study-record cache instead of using the configured mount",
@@ -140,6 +150,11 @@ def apply_runtime_overrides(
         if args.expected_gpu_count < 1:
             raise ValueError("Expected GPU count must be positive")
         training["expected_gpu_count"] = args.expected_gpu_count
+    ema_decay = getattr(args, "ema_decay", None)
+    if ema_decay is not None:
+        if not 0.0 <= ema_decay < 1.0:
+            raise ValueError("EMA decay must be in [0, 1)")
+        training["ema_decay"] = ema_decay
     if args.build_selection_cache:
         data = config.get("data")
         if not isinstance(data, dict):
@@ -268,6 +283,41 @@ def initialize_distributed(
 def unwrap_model(model: nn.Module) -> nn.Module:
     """Return the underlying model without a distributed wrapper."""
     return getattr(model, "module", model)
+
+
+class ExponentialMovingAverage:
+    """Maintain an evaluation model using parameter exponential averages."""
+
+    def __init__(self, model: nn.Module, decay: float) -> None:
+        if not math.isfinite(decay) or not 0.0 <= decay < 1.0:
+            raise ValueError("EMA decay must be finite and in [0, 1)")
+        self.decay = float(decay)
+        self.model = copy.deepcopy(unwrap_model(model)).eval()
+        self.model.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        """Update floating tensors and copy non-floating buffers exactly."""
+        source_state = unwrap_model(model).state_dict()
+        averaged_state = self.model.state_dict()
+        if source_state.keys() != averaged_state.keys():
+            raise RuntimeError("EMA model state does not match the training model")
+        for name, averaged in averaged_state.items():
+            source = source_state[name].detach()
+            if torch.is_floating_point(averaged) or torch.is_complex(averaged):
+                averaged.lerp_(source, 1.0 - self.decay)
+            else:
+                averaged.copy_(source)
+
+
+def configured_ema(
+    model: nn.Module, training_config: dict[str, object]
+) -> ExponentialMovingAverage | None:
+    """Build EMA only when an experiment explicitly configures its decay."""
+    decay = training_config.get("ema_decay")
+    if decay is None:
+        return None
+    return ExponentialMovingAverage(model, float(decay))
 
 
 def checkpoint_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
@@ -453,10 +503,27 @@ def load_pseudo_supervision(
         [public.rows[uid] for uid in candidates["StudyInstanceUID"]],
         dtype=np.float32,
     )
-    candidate_weights = np.asarray(
-        [[confidence_weight(value) for value in row] for row in candidate_labels],
-        dtype=np.float32,
-    )
+    if public.confidence_weights is not None and public.masks is not None:
+        candidate_weights = np.asarray(
+            [
+                [
+                    weight * public.masks[uid]
+                    for weight in public.confidence_weights[uid]
+                ]
+                for uid in candidates["StudyInstanceUID"]
+            ],
+            dtype=np.float32,
+        )
+        supervision_format = "explicit-confidence-weight-and-mask"
+    else:
+        candidate_weights = np.asarray(
+            [
+                [confidence_weight(value) for value in row]
+                for row in candidate_labels
+            ],
+            dtype=np.float32,
+        )
+        supervision_format = "probability-derived-confidence-weight"
     eligible = candidate_weights.sum(axis=1) > 0
     candidates = candidates.loc[eligible].reset_index(drop=True)
     candidate_labels = candidate_labels[eligible]
@@ -494,6 +561,12 @@ def load_pseudo_supervision(
         "pseudo_label_source": str(pseudo_path),
         "pseudo_label_file": str(pseudo_config["file_name"]),
         "pseudo_labels_sha256": public.sha256,
+        "pseudo_supervision_format": supervision_format,
+        "masked_pseudo_label_studies": (
+            sum(mask == 0 for mask in public.masks.values())
+            if public.masks is not None
+            else 0
+        ),
         "training_study_uids_sha256": stable_collection_hash(chosen_uids),
         "gold_report_duplicate_candidates_excluded": int(duplicate_report.sum()),
         "eligible_pseudo_label_studies": len(candidates),
@@ -587,6 +660,7 @@ def train_epoch(
     augmentation: AugmentationConfig,
     gradient_accumulation_steps: int,
     distributed: DistributedContext | None = None,
+    ema: ExponentialMovingAverage | None = None,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -635,8 +709,12 @@ def train_epoch(
             backward_loss = loss / group_size
         scaler.scale(backward_loss).backward()
         if should_step:
+            previous_scale = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
+            optimizer_ran = scaler.get_scale() >= previous_scale
+            if ema is not None and optimizer_ran:
+                ema.update(model)
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
         total_loss += float(loss.detach().cpu())
@@ -1064,6 +1142,10 @@ def model_artifact_metadata(config: dict[str, object]) -> dict[str, object]:
         metadata["weights_file"] = str(  # type: ignore[index]
             model_config["weights_file"]  # type: ignore[index]
         )
+    if "normalization" in model_config:  # type: ignore[operator]
+        metadata["normalization"] = str(  # type: ignore[index]
+            model_config["normalization"]  # type: ignore[index]
+        )
     if metadata["aggregation"] == "transformer-target-attention":
         metadata["transformer_layers"] = int(  # type: ignore[index]
             model_config["transformer_layers"]
@@ -1085,13 +1167,13 @@ def build_configured_model(
     if not math.isfinite(physical_fov_mm) or physical_fov_mm <= 0:
         raise ValueError("Physical FOV must be finite and positive")
     model_name = str(model_config["name"])  # type: ignore[index]
-    if model_name not in {"dinov2-small", "coatnet-0"}:
+    if model_name not in {"dinov2-small", "coatnet-0", "radimagenet-resnet50"}:
         model_name = model_config["name"]  # type: ignore[index]
         raise ValueError(f"Unsupported model: {model_name}")
     if model_name == "dinov2-small" and image_size % 14:
         raise ValueError("DINOv2 image size must be divisible by its patch size 14")
-    if model_name == "coatnet-0" and image_size != 224:
-        raise ValueError("CoAtNet-0 requires a 224-pixel input")
+    if model_name in {"coatnet-0", "radimagenet-resnet50"} and image_size != 224:
+        raise ValueError(f"{model_name} requires a 224-pixel input")
     aggregation = str(model_config["aggregation"])  # type: ignore[index]
     supported_aggregations = {
         "hierarchical-target-series-attention",
@@ -1170,7 +1252,7 @@ def build_configured_model(
             variant=str(model_config["variant"]),  # type: ignore[index]
             **shared_model_arguments,
         )
-    else:
+    elif model_name == "coatnet-0":
         if pooling != "global-average":
             raise ValueError("CoAtNet-0 requires global-average pooling")
         weights_file = str(model_config.get("weights_file", ""))  # type: ignore[union-attr]
@@ -1178,6 +1260,29 @@ def build_configured_model(
             raise ValueError("CoAtNet-0 requires model.weights_file")
         model, model_source = build_coatnet_model(
             architecture=str(model_config["variant"]),  # type: ignore[index]
+            weights_file=weights_file,
+            **shared_model_arguments,
+        )
+    else:
+        if pooling != "global-average":
+            raise ValueError("RadImageNet ResNet-50 requires global-average pooling")
+        if bool(model_config["gradient_checkpointing"]):  # type: ignore[index]
+            raise ValueError(
+                "RadImageNet ResNet-50 does not support gradient checkpointing"
+            )
+        normalization = str(
+            model_config.get("normalization", "")  # type: ignore[union-attr]
+        )
+        if normalization != "minus-one-to-one":
+            raise ValueError(
+                "RadImageNet ResNet-50 requires minus-one-to-one normalization"
+            )
+        weights_file = str(
+            model_config.get("weights_file", "")  # type: ignore[union-attr]
+        )
+        if not weights_file:
+            raise ValueError("RadImageNet ResNet-50 requires model.weights_file")
+        model, model_source = build_radimagenet_resnet50_model(
             weights_file=weights_file,
             **shared_model_arguments,
         )
@@ -1204,6 +1309,45 @@ def write_json(path: Path, value: object, allow_nan: bool = False) -> None:
         json.dumps(value, indent=2, allow_nan=allow_nan) + "\n",
         encoding="utf-8",
     )
+
+
+def open_verified_image_cache(
+    manifest_paths: Sequence[Path],
+    expected_study_uids: Sequence[str],
+    expected_manifest_sha256: Sequence[str],
+    image_cache_config: dict[str, object],
+) -> tuple[ImageCacheReader, dict[str, int]]:
+    """Open and validate the persistent image cache used by a training run."""
+    image_cache = ImageCacheReader(
+        manifest_paths,
+        expected_study_uids=expected_study_uids,
+        expected_manifest_sha256=expected_manifest_sha256,
+        verify_files=True,
+    )
+    cache_summary = {
+        key: sum(int(summary[key]) for summary in image_cache.summaries)
+        for key in (
+            "studies",
+            "series",
+            "images",
+            "decoded_images",
+            "failed_images",
+            "archive_bytes",
+        )
+    }
+    expected_cache = {
+        "studies": int(image_cache_config["expected_studies"]),
+        "series": int(image_cache_config["expected_series"]),
+        "images": int(image_cache_config["expected_images"]),
+        "failed_images": int(image_cache_config["expected_failed_images"]),
+    }
+    for key, expected in expected_cache.items():
+        if cache_summary[key] != expected:
+            raise ValueError(
+                f"Persistent image-cache {key} changed: "
+                f"{cache_summary[key]} != {expected}"
+            )
+    return image_cache, cache_summary
 
 
 def supervision_arrays(
@@ -1379,6 +1523,7 @@ def train_cv_fold(
         pct_start=float(training_config["one_cycle_warmup_fraction"]),
     )
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+    ema = configured_ema(raw_model, training_config)
     target_weights = positive_weights(train_labels, train_weights).to(device)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -1403,10 +1548,12 @@ def train_cv_fold(
             augmentation,
             accumulation_steps,
             distributed,
+            ema,
         )
+        evaluation_model = ema.model if ema is not None else model
         if distributed.enabled:
             inner_predictions, _, _, _, _ = predict_distributed(
-                model,
+                evaluation_model,
                 inner_loader,
                 inner_sampler,
                 len(inner_table),
@@ -1414,7 +1561,9 @@ def train_cv_fold(
                 distributed,
             )
         else:
-            inner_predictions, _, _, _, _ = predict(model, inner_loader, device)
+            inner_predictions, _, _, _, _ = predict(
+                evaluation_model, inner_loader, device
+            )
         if distributed.primary:
             if inner_predictions is None:
                 raise RuntimeError("Primary rank did not receive inner predictions")
@@ -1447,7 +1596,7 @@ def train_cv_fold(
             if best_state is None or auc > best_score:
                 best_score = auc
                 best_epoch = epoch + 1
-                best_state = checkpoint_state_dict(model)
+                best_state = checkpoint_state_dict(evaluation_model)
             time_limit_reached = (
                 time.monotonic() - started_at >= max_runtime_seconds
             )
@@ -1529,6 +1678,7 @@ def train_cv_fold(
                 "outer_gold_studies": len(outer_table),
                 "attention_weights": "attention-weights.npz",
                 "augmentation": augmentation.metadata(),
+                "ema_decay": ema.decay if ema is not None else None,
             },
         )
         fold_summary = {
@@ -1557,6 +1707,7 @@ def train_cv_fold(
             "trainable_parameters": trainable_parameters,
             "attention_weights": "attention-weights.npz",
             "augmentation": augmentation.metadata(),
+            "ema_decay": ema.decay if ema is not None else None,
             "distributed": {
                 "backend": distributed.backend,
                 "world_size": distributed.world_size,
@@ -1692,6 +1843,7 @@ def run_cross_validation_training(
         f"/tmp/rsna2026-distributed-study-records-{run_id}.pkl"
     )
     image_cache: ImageCacheReader | None = None
+    cache_summary: dict[str, int] | None = None
     image_cache_config = config.get("image_cache", {})
     persistent_cache_enabled = (
         isinstance(image_cache_config, dict)
@@ -1710,40 +1862,38 @@ def run_cross_validation_training(
     if distributed.primary:
         configured_cache = str(data_config.get("study_records_cache_path", ""))
         configured_sha256 = str(data_config.get("study_records_cache_sha256", ""))
-        if persistent_cache_enabled and not (
-            configured_cache and configured_sha256
-        ):
-            image_cache = ImageCacheReader(
+        if persistent_cache_enabled:
+            image_cache, cache_summary = open_verified_image_cache(
                 manifest_paths,
-                expected_study_uids=all_uids,
-                expected_manifest_sha256=manifest_sha256,
-                verify_files=True,
+                all_uids,
+                manifest_sha256,
+                image_cache_config,
             )
-            cache_summary = {
-                key: sum(int(summary[key]) for summary in image_cache.summaries)
-                for key in (
-                    "studies",
-                    "series",
-                    "images",
-                    "decoded_images",
-                    "failed_images",
-                    "archive_bytes",
-                )
-            }
-            expected_cache = {
-                "studies": int(image_cache_config["expected_studies"]),
-                "series": int(image_cache_config["expected_series"]),
-                "images": int(image_cache_config["expected_images"]),
-                "failed_images": int(
-                    image_cache_config["expected_failed_images"]
-                ),
-            }
-            for key, expected in expected_cache.items():
-                if cache_summary[key] != expected:
-                    raise ValueError(
-                        f"Persistent image-cache {key} changed: "
-                        f"{cache_summary[key]} != {expected}"
-                    )
+        if configured_cache and configured_sha256:
+            selection_cache_path = resolve_input_file(
+                configured_cache,
+                config["paths"]["input_root"],  # type: ignore[index]
+            )
+            all_records, selection_summary = load_study_records_cache(
+                selection_cache_path,
+                input_path / "train_series",
+                all_uids,
+                int(data_config["window_count"]),
+                int(data_config["max_series_per_slot"]),
+                list(data_config["slots"]),
+                str(data_config["series_classification"]),
+                configured_sha256,
+                str(data_config["study_records_cache_uids_sha256"]),
+            )
+            selection_output = output_dir / "slice-selection.json"
+            if selection_cache_path.suffix == ".xz":
+                with lzma.open(selection_cache_path, "rb") as source:
+                    with selection_output.open("wb") as destination:
+                        shutil.copyfileobj(source, destination)
+            else:
+                shutil.copyfile(selection_cache_path, selection_output)
+        elif persistent_cache_enabled:
+            assert image_cache is not None
             all_records = build_cached_study_records(
                 train_series,
                 image_cache,
@@ -1781,29 +1931,6 @@ def run_cross_validation_training(
             selection_summary["persistent_image_cache"] = cache_summary
             selection_output = output_dir / "slice-selection.json"
             write_json(selection_output, report)
-        elif configured_cache and configured_sha256:
-            selection_cache_path = resolve_input_file(
-                configured_cache,
-                config["paths"]["input_root"],  # type: ignore[index]
-            )
-            all_records, selection_summary = load_study_records_cache(
-                selection_cache_path,
-                input_path / "train_series",
-                all_uids,
-                int(data_config["window_count"]),
-                int(data_config["max_series_per_slot"]),
-                list(data_config["slots"]),
-                str(data_config["series_classification"]),
-                configured_sha256,
-                str(data_config["study_records_cache_uids_sha256"]),
-            )
-            selection_output = output_dir / "slice-selection.json"
-            if selection_cache_path.suffix == ".xz":
-                with lzma.open(selection_cache_path, "rb") as source:
-                    with selection_output.open("wb") as destination:
-                        shutil.copyfileobj(source, destination)
-            else:
-                shutil.copyfile(selection_cache_path, selection_output)
         else:
             all_records = build_study_records(
                 train_series,
@@ -1981,6 +2108,8 @@ def run_cross_validation_training(
         ),
     }
     write_json(output_dir / "ensemble-manifest.json", ensemble_manifest)
+    if persistent_cache_enabled and cache_summary is None:
+        raise RuntimeError("Persistent image-cache summary was not initialized")
     elapsed = time.monotonic() - started_at
     run_summary = {
         "status": "cross-validation-training-complete",
@@ -2026,6 +2155,11 @@ def run_cross_validation_training(
             "scheduler": "one-cycle",
             "one_cycle_warmup_fraction": float(
                 config["training"]["one_cycle_warmup_fraction"]  # type: ignore[index]
+            ),
+            "ema_decay": (
+                float(config["training"]["ema_decay"])  # type: ignore[index]
+                if "ema_decay" in config["training"]  # type: ignore[operator]
+                else None
             ),
         },
         "augmentation": augmentation.metadata(),
@@ -2487,6 +2621,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         pct_start=float(config["training"]["one_cycle_warmup_fraction"]),
     )
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+    training_config = config["training"]
+    if not isinstance(training_config, dict):
+        raise TypeError("training configuration must be a table")
+    ema = configured_ema(model, training_config)
     target_weights = positive_weights(training_labels, training_weights).to(device)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -2511,14 +2649,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             target_weights,
             augmentation,
             accumulation_steps,
+            ema=ema,
         )
+        evaluation_model = ema.model if ema is not None else model
         (
             validation_predictions,
             validation_labels,
             validation_window_attention,
             validation_series_attention,
             validation_slot_attention,
-        ) = predict(model, validation_loader, device)
+        ) = predict(evaluation_model, validation_loader, device)
         if validation_labels is None:
             raise RuntimeError("Validation labels are unavailable")
         auc = macro_auc(validation_labels, validation_predictions)
@@ -2540,10 +2680,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if best_state is None or selection_score > best_score:
             best_score = selection_score
             best_epoch = epoch + 1
-            best_state = {
-                name: value.detach().cpu().clone()
-                for name, value in model.state_dict().items()
-            }
+            best_state = checkpoint_state_dict(evaluation_model)
         if time.monotonic() - started_at >= max_runtime_seconds:
             time_limit_reached = True
             print(
@@ -2575,6 +2712,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "training_studies": len(training_records),
             "validation_studies": len(validation_records),
             "augmentation": augmentation.metadata(),
+            "ema_decay": ema.decay if ema is not None else None,
         },
     )
     elapsed_seconds = time.monotonic() - started_at
@@ -2628,6 +2766,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "one_cycle_warmup_fraction": float(
                 config["training"]["one_cycle_warmup_fraction"]
             ),
+            "ema_decay": ema.decay if ema is not None else None,
         },
         "slice_selection": {
             "selection_method": selection_report["slice_selection_method"],

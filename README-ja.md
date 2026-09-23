@@ -286,6 +286,18 @@ Runpod へ追加した場合、その鍵は起動済み Pod に自動反映さ�
 │   └── llm_labels_v4_blend.csv
 ├── rsna-2026-slice-selection-cache/
 │   └── slice-selection.json.xz
+├── rsna-2026-preprocess-shard-0/outputs/image-cache/
+│   ├── cache-manifest.json
+│   └── studies/*.npz
+├── rsna-2026-preprocess-shard-1/outputs/image-cache/
+│   ├── cache-manifest.json
+│   └── studies/*.npz
+├── rsna-2026-preprocess-shard-2/outputs/image-cache/
+│   ├── cache-manifest.json
+│   └── studies/*.npz
+├── rsna-2026-preprocess-shard-3/outputs/image-cache/
+│   ├── cache-manifest.json
+│   └── studies/*.npz
 └── dinov2-small/
     ├── config.json
     └── model.safetensors（または同等のローカルモデル重みファイル）
@@ -306,6 +318,12 @@ Pod に割り当てられた GPU の一部だけを使用する場合は、`--gp
 認識された枚数以下の値を指定します。固定済みの断面選択キャッシュを配置していない場合は、
 `--build-selection-cache` を指定してください。学習前に配置済み DICOM のヘッダーから
 キャッシュを再構築します。
+
+四つの `rsna-2026-preprocess-shard-*` には、Kaggleで生成した前処理済み画像キャッシュを
+ディレクトリ構成ごと配置します。学習開始時に `configs/baseline.toml` に記録された
+マニフェストのSHA-256と全検査の圧縮配列を検証します。この構成では学習中に元DICOMを
+復号せず、Kaggle学習時と同じ8ビット前処理画像を読み込みます。四分割の合計容量は約
+24.76 GiBです。
 
 実行環境固有のパスと GPU 枚数は実行時に上書きされるため、
 `configs/baseline.toml` は Kaggle 実験と同一の定義を維持します。

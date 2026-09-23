@@ -37,6 +37,27 @@ def test_loads_exact_soft_label_schema_and_preserves_probabilities(tmp_path) -> 
     table = load_public_label_table(path, file_sha256(path), expected_rows=2)
     assert table.rows["a"] == (0.25,) * len(TARGETS)
     assert table.rows["b"] == (0.75,) * len(TARGETS)
+    assert table.confidence_weights is None
+    assert table.masks is None
+
+
+def test_loads_explicit_confidence_weights_and_masks(tmp_path) -> None:
+    path = tmp_path / "weak-supervision.csv"
+    columns = [
+        "StudyInstanceUID",
+        *TARGETS,
+        *(f"{target}_confidence_weight" for target in TARGETS),
+        "mask",
+    ]
+    row = label_row("a", 0.9)
+    row.update({f"{target}_confidence_weight": 0.7 for target in TARGETS})
+    row["mask"] = 0
+    write_table(path, [row], columns)
+
+    table = load_public_label_table(path, file_sha256(path), expected_rows=1)
+    assert table.rows["a"] == (0.9,) * len(TARGETS)
+    assert table.confidence_weights == {"a": (0.7,) * len(TARGETS)}
+    assert table.masks == {"a": 0}
 
 
 @pytest.mark.parametrize("value", [-0.01, 1.01, float("nan"), float("inf")])
@@ -68,11 +89,11 @@ def test_rejects_hash_schema_row_count_and_duplicate_drift(tmp_path) -> None:
 
 
 def test_confidence_weight_uses_distance_from_undecided() -> None:
-    assert confidence_weight(0.0) == 1.0
-    assert confidence_weight(0.25) == 0.5
-    assert confidence_weight(0.5) == 0.0
-    assert confidence_weight(0.75) == 0.5
-    assert confidence_weight(1.0) == 1.0
+    assert confidence_weight(0.0) == 2.0
+    assert confidence_weight(0.25) == pytest.approx(1.15)
+    assert confidence_weight(0.5) == 0.30
+    assert confidence_weight(0.75) == pytest.approx(1.15)
+    assert confidence_weight(1.0) == 2.0
 
 
 def test_report_hash_normalizes_case_spacing_and_unicode() -> None:

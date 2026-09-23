@@ -45,13 +45,13 @@ manifest_paths = [
 manifest_sha256 = [
   "432466d2ceabeefad9b8c77169fdd357d92def685dc637a9d7360a6c63d301f4",
   "27c0bef3bd2c7614bf1aba0d8bd63831c5744c997a13e34776732568846da737",
-  "55a5a90a40064230120210b5f0a9e9a24af074404d9ef65267855d914dad0d45",
+  "fe238119835aefd358a97efd9110f6f177630d7d4bcc3fab3e48aa17956f9e79",
   "e89b0cc5a6c1ba7ad9bd68bae46ff32dc1df0ac90d3a79557d6ffe932763c481",
 ]
 expected_studies = 4407
 expected_series = 24371
 expected_images = 665954
-expected_failed_images = 2
+expected_failed_images = 0
 expected_selected_series = 21334
 
 [image_cache.expected_missing_by_slot]
@@ -84,8 +84,8 @@ blur_sigma_max = 1.0
 blur_probability = 0.1
 
 [training]
-epochs = 30
-# One study on the fold GPU with eight-step accumulation gives batch 8.
+epochs = 20
+# One study batch of eight on the single training GPU; no gradient accumulation.
 batch_size_per_device = 1
 gradient_accumulation_steps = 8
 inference_batch_size = 1
@@ -107,19 +107,19 @@ folds = 4
 outer_seed = 42
 inner_seed = 1042
 inner_validation_fraction = 0.20
-gold_loss_weight = 3.0
+gold_loss_weight = 14.0
 bootstrap_resamples = 5000
 test_ensemble = "per-target-percentile-rank-mean"
 split_algorithm = "report-group-multilabel-v1"
 
 [pseudo_labels]
 enabled = true
-dataset = "stevenleehans/rsna-knee-llm-report-labels"
-file_name = "llm_labels_v4_blend.csv"
-source_path = "/kaggle/input/rsna-knee-llm-report-labels/llm_labels_v4_blend.csv"
-sha256 = "eb4c2b29e7e84adbb4b5ccee825ca20ade6a43dbe295f13be442d549e4f5dca4"
+dataset = "osakanateishoku/rsna-2026-gpt56-luna-weak-labels"
+file_name = "weak_labels_gpt56_luna_calibrated_synovitis_imputed.csv"
+source_path = "/kaggle/input/rsna-2026-gpt56-luna-weak-labels/weak_labels_gpt56_luna_calibrated_synovitis_imputed.csv"
+sha256 = "b50a4ccb89e2232595d249d0c428673e3aaaf737a419054f9097ca446a278eee"
 expected_rows = 4407
-max_studies = 4345
+max_studies = 3303
 expected_validation_studies = 58
 minimum_source_macro_auc = 0.88
 
@@ -128,7 +128,7 @@ name = "dinov2-small"
 variant = "small"
 input_representation = "2.5d-slice-channels"
 unfreeze_last = 6
-gradient_checkpointing = true
+gradient_checkpointing = false
 pooling = "cls-patch-mean"
 aggregation = "transformer-target-attention"
 attention_hidden_size = 256

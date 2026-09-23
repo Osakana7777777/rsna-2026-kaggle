@@ -30,7 +30,8 @@ download or commit the derived medical images locally.
 rsna-2026-kaggle/
 ├── configs/
 │   ├── baseline.toml           # submitted DINOv2 baseline
-│   └── coatnet-0-224.toml      # isolated CoAtNet-0 experiment
+│   ├── coatnet-0-224.toml      # isolated CoAtNet-0 experiment
+│   └── radimagenet-resnet50-224.toml # RadImageNet ResNet-50 experiment
 ├── kaggle/
 │   ├── train-kernel-metadata.json # training notebook and inputs
 │   ├── kernel-metadata.json    # inference/submission notebook and inputs
@@ -99,6 +100,11 @@ or push a different experiment without modifying the baseline. For example:
 ./scripts/push.sh train configs/coatnet-0-224.toml
 ```
 
+For the RadImageNet ResNet-50 experiment, attach the private
+`osakanateishoku/radimagenet-resnet50` Dataset containing the official
+`ResNet50.pt`, then select `configs/radimagenet-resnet50-224.toml` in the
+same commands. The notebook loads that checkpoint strictly and offline.
+
 Omitting the second argument continues to use `configs/baseline.toml`.
 
 ## Run EDA and download its outputs
@@ -149,8 +155,8 @@ The model classifies series into six plane-and-acquisition slots and retains the
 two series with the largest slice counts in each slot. It orders every retained
 series on the DICOM patient-coordinate axis, forms adjacent three-slice windows,
 and selects up to ten unique windows nearest equally spaced physical centers over
-the usable acquisition range. The configured DINOv2 or CoAtNet backbone encodes
-every valid window in one model call.
+the usable acquisition range. The configured DINOv2, CoAtNet, or RadImageNet
+ResNet-50 backbone encodes every valid window in one model call.
 Target-specific masked attention aggregates windows within each series, series
 within each slot, and finally the six slots. Physical position and adjacent-spacing
 features accompany each window. Decoded and resized source images are cached once
@@ -161,10 +167,14 @@ The CoAtNet experiment deliberately retains the baseline ImageNet channel mean a
 standard deviation for a controlled backbone comparison. This differs from the
 pretrained CoAtNet checkpoint's recommended mean and standard deviation of 0.5 and
 is a known limitation of the experiment.
+The RadImageNet experiment uses the checkpoint contract's 0.5 channel mean and
+standard deviation, mapping cached `[0, 1]` pixels to `[-1, 1]`, and keeps the
+entire ResNet-50 backbone frozen while training the aggregation head.
 
-The Kaggle image supplies PyTorch, pandas, NumPy, pydicom, timm, and safetensors.
+The Kaggle image supplies PyTorch, torchvision, pandas, NumPy, pydicom, timm, and
+safetensors.
 Internet access remains disabled during the run; pretrained weights are attached
-through `model_sources`.
+through `model_sources` or `dataset_sources`.
 
 After a successful inference run, submit its version number:
 
@@ -192,20 +202,18 @@ For a complete new training and inference cycle:
 ## Run training on Runpod
 
 Runpod is an alternative training host; Kaggle remains the submission host. Install
-and authenticate the current `runpodctl`, then inspect the GPU IDs currently in
-stock and create a Pod with an explicit GPU type and count:
+and authenticate the current `runpodctl`, then inspect the GPU IDs and create a
+single-GPU Pod. By default the script tries RTX 4090 first, then RTX A6000 and A40:
 
 ```bash
 runpodctl doctor
 ./scripts/runpod.sh gpus
 ./scripts/runpod.sh create \
-  --gpu-id "NVIDIA GeForce RTX 4090" \
-  --gpu-count 2 \
   --network-volume-id YOUR_NETWORK_VOLUME_ID
 ```
 
 Use `--dry-run` to inspect the complete creation command without renting a Pod.
-The default is Secure Cloud, two GPUs, a current Runpod PyTorch image, a 50 GB
+The default is Secure Cloud, one GPU, a current Runpod PyTorch image, a 50 GB
 container disk, and `/workspace` as the persistent-volume mount. A disposable
 200 GB Pod volume is created when no network-volume ID is supplied. Pod billing
 continues until it is stopped or deleted:
@@ -230,6 +238,18 @@ volume is:
 │   └── llm_labels_v4_blend.csv
 ├── rsna-2026-slice-selection-cache/
 │   └── slice-selection.json.xz
+├── rsna-2026-preprocess-shard-0/outputs/image-cache/
+│   ├── cache-manifest.json
+│   └── studies/*.npz
+├── rsna-2026-preprocess-shard-1/outputs/image-cache/
+│   ├── cache-manifest.json
+│   └── studies/*.npz
+├── rsna-2026-preprocess-shard-2/outputs/image-cache/
+│   ├── cache-manifest.json
+│   └── studies/*.npz
+├── rsna-2026-preprocess-shard-3/outputs/image-cache/
+│   ├── cache-manifest.json
+│   └── studies/*.npz
 └── dinov2-small/
     ├── config.json
     └── model.safetensors (or the equivalent local model-weight file)
@@ -238,8 +258,8 @@ volume is:
 After connecting to the Pod, place this repository under `/workspace`, install
 `uv`, and start training from the repository. The runner creates a uv virtual
 environment that can see the PyTorch image's system packages, installs `pydicom`,
-`transformers`, `timm`, and `safetensors` if needed, validates CUDA, and uses all
-visible GPUs by default:
+`transformers`, `timm`, and `safetensors` if needed, validates CUDA, and uses one
+GPU:
 
 ```bash
 ./scripts/runpod-train.sh \
@@ -247,11 +267,15 @@ visible GPUs by default:
   --output-dir /workspace/outputs/experiment-name
 ```
 
-Pass `--gpu-count 1` (or another count no larger than the Pod allocation) to use
-a subset of visible GPUs. Pass `--build-selection-cache` if the pinned selection
-cache was not staged; this rebuilds it from the staged DICOM headers before
-training. Host-specific paths and GPU count are runtime overrides, so
-`configs/baseline.toml` remains identical to the Kaggle experiment definition.
+The runner rejects GPU counts other than one. Pass `--build-selection-cache` if
+the pinned selection cache was not staged; this rebuilds it from the staged DICOM
+headers before training. The baseline uses batch size 8, one accumulation step,
+and disables gradient checkpointing.
+
+Copy all four Kaggle preprocessing outputs with their directory layout intact.
+At startup, training verifies the manifest hashes from `configs/baseline.toml` and
+every per-study archive before using the same uint8 preprocessed pixels as Kaggle.
+The four shards require approximately 24.76 GiB in total.
 
 ## 実験0002: 公開LLM混合ラベル
 

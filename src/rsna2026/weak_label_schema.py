@@ -81,9 +81,115 @@ VLLM_RSNA_LABEL_SCHEMA: dict[str, Any] = _schema_without_unique_items(
     deepcopy(RSNA_LABEL_SCHEMA)
 )
 
+OPENAI_FINDING_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["m", "c", "v", "a", "t", "k", "r", "e"],
+    "properties": {
+        "m": {"type": "integer", "enum": [0, 1, 2, 3]},
+        "c": {"type": "integer", "enum": [0, 1, 2, 3, 4]},
+        "v": {"type": "integer", "minimum": 0, "maximum": 12},
+        "a": {"type": "integer", "minimum": 0, "maximum": 6},
+        "t": {"type": "integer", "enum": [0, 1, 2, 3, 4]},
+        "k": {
+            "type": "array",
+            "maxItems": 5,
+            "items": {"type": "integer", "minimum": 1, "maximum": 29},
+        },
+        "r": {
+            "type": "array",
+            "maxItems": 4,
+            "items": {"type": "integer", "minimum": 1, "maximum": 9},
+        },
+        "e": {
+            "type": "array",
+            "maxItems": 2,
+            "items": {"type": "string"},
+        },
+    },
+}
+
+# The OpenAI Structured Outputs subset does not support tuple-style
+# ``prefixItems`` or ``uniqueItems``. Named finding fields keep every other
+# constraint strict; they are compacted and de-duplicated before validation.
+OPENAI_RSNA_LABEL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["l", "s", "g", "x"],
+    "properties": {
+        "l": {"type": "string"},
+        "s": {"type": "integer", "enum": [0, 1, 2, 3]},
+        "g": {
+            "type": "array",
+            "maxItems": 5,
+            "items": {"type": "integer", "minimum": 1, "maximum": 5},
+        },
+        "x": {
+            "type": "array",
+            "minItems": len(TARGETS),
+            "maxItems": len(TARGETS),
+            "items": OPENAI_FINDING_SCHEMA,
+        },
+    },
+}
+
 
 class PredictionValidationError(ValueError):
     """Raised when model output violates the production schema."""
+
+
+def _deduplicate_integer_list(value: object) -> tuple[object, bool]:
+    """Remove repeated integer codes while preserving their first-seen order."""
+    if not isinstance(value, list) or not all(type(item) is int for item in value):
+        return value, False
+    deduplicated = list(dict.fromkeys(value))
+    return deduplicated, deduplicated != value
+
+
+def normalize_unique_items(value: object) -> tuple[object, list[str]]:
+    """Normalize only arrays whose production schema declares ``uniqueItems``."""
+    normalized = deepcopy(value)
+    changed_paths: list[str] = []
+    if not isinstance(normalized, dict):
+        return normalized, changed_paths
+
+    global_flags, changed = _deduplicate_integer_list(normalized.get("g"))
+    if changed:
+        normalized["g"] = global_flags
+        changed_paths.append("g")
+
+    findings = normalized.get("x")
+    if not isinstance(findings, list):
+        return normalized, changed_paths
+    for target_index, finding in enumerate(findings):
+        if not isinstance(finding, list):
+            continue
+        for item_index in (5, 6):
+            if len(finding) <= item_index:
+                continue
+            codes, changed = _deduplicate_integer_list(finding[item_index])
+            if changed:
+                finding[item_index] = codes
+                changed_paths.append(f"x[{target_index}][{item_index}]")
+    return normalized, changed_paths
+
+
+def compact_openai_prediction(value: object) -> object:
+    """Convert the API's named finding objects to the canonical compact tuples."""
+    if not isinstance(value, dict):
+        return value
+    compact = deepcopy(value)
+    findings = compact.get("x")
+    if not isinstance(findings, list):
+        return compact
+    field_order = ("m", "c", "v", "a", "t", "k", "r", "e")
+    compact["x"] = [
+        [finding.get(field) for field in field_order]
+        if isinstance(finding, dict)
+        else finding
+        for finding in findings
+    ]
+    return compact
 
 
 def _integer(value: object, path: str, minimum: int, maximum: int) -> int:

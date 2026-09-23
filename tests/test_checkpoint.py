@@ -36,6 +36,35 @@ def test_resolve_input_file_uses_unique_name_fallback(tmp_path):
     assert resolved == mounted
 
 
+def test_resolve_input_file_remaps_kaggle_layout_before_name_fallback(tmp_path):
+    expected = (
+        tmp_path
+        / "rsna-2026-preprocess-shard-2"
+        / "outputs"
+        / "image-cache"
+        / "cache-manifest.json"
+    )
+    expected.parent.mkdir(parents=True)
+    expected.write_bytes(b"expected")
+    duplicate = (
+        tmp_path
+        / "rsna-2026-preprocess-shard-3"
+        / "outputs"
+        / "image-cache"
+        / "cache-manifest.json"
+    )
+    duplicate.parent.mkdir(parents=True)
+    duplicate.write_bytes(b"duplicate")
+
+    resolved = resolve_input_file(
+        "/kaggle/input/rsna-2026-preprocess-shard-2/outputs/"
+        "image-cache/cache-manifest.json",
+        tmp_path,
+    )
+
+    assert resolved == expected
+
+
 def test_manifest_rejects_wrong_checkpoint_name(tmp_path):
     checkpoint = tmp_path / "best-model.pt"
     manifest_path = tmp_path / "checkpoint-manifest.json"

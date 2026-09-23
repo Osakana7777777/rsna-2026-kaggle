@@ -16,7 +16,7 @@ from rsna2026.image_cache import (
     shard_for_study,
 )
 from rsna2026.slice_selection import PhysicalWindowSelection
-from rsna2026.train import slice_selection_report
+from rsna2026.train import open_verified_image_cache, slice_selection_report
 
 
 def _selection(paths: list[Path]) -> PhysicalWindowSelection:
@@ -48,6 +48,67 @@ def test_study_hash_partition_is_deterministic_and_complete() -> None:
     assert set.union(*partitions) == set(uids)
     assert sum(len(partition) for partition in partitions) == len(uids)
     assert shard_for_study("study-1", 4) == shard_for_study("study-1", 4)
+
+
+def test_verified_image_cache_always_returns_run_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeImageCacheReader:
+        summaries = [
+            {
+                "studies": 2,
+                "series": 3,
+                "images": 5,
+                "decoded_images": 4,
+                "failed_images": 1,
+                "archive_bytes": 100,
+            },
+            {
+                "studies": 1,
+                "series": 4,
+                "images": 6,
+                "decoded_images": 6,
+                "failed_images": 0,
+                "archive_bytes": 200,
+            },
+        ]
+
+        def __init__(self, manifest_paths, **kwargs) -> None:
+            calls.append({"manifest_paths": manifest_paths, **kwargs})
+
+    monkeypatch.setattr("rsna2026.train.ImageCacheReader", FakeImageCacheReader)
+    manifests = [tmp_path / "shard-0.json", tmp_path / "shard-1.json"]
+    reader, summary = open_verified_image_cache(
+        manifests,
+        ["study-1", "study-2", "study-3"],
+        ["a" * 64, "b" * 64],
+        {
+            "expected_studies": 3,
+            "expected_series": 7,
+            "expected_images": 11,
+            "expected_failed_images": 1,
+        },
+    )
+
+    assert isinstance(reader, FakeImageCacheReader)
+    assert calls == [
+        {
+            "manifest_paths": manifests,
+            "expected_study_uids": ["study-1", "study-2", "study-3"],
+            "expected_manifest_sha256": ["a" * 64, "b" * 64],
+            "verify_files": True,
+        }
+    ]
+    assert summary == {
+        "studies": 3,
+        "series": 7,
+        "images": 11,
+        "decoded_images": 10,
+        "failed_images": 1,
+        "archive_bytes": 300,
+    }
 
 
 def test_builds_all_series_cache_and_decodes_each_source_once(

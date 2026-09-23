@@ -8,7 +8,9 @@
   "enable_gpu": true,
   "enable_internet": false,
   "machine_shape": "NvidiaTeslaT4",
-  "dataset_sources": [],
+  "dataset_sources": [
+    "osakanateishoku/radimagenet-resnet50"
+  ],
   "competition_sources": [
     "rsna-knee-abnormality-detection"
   ],

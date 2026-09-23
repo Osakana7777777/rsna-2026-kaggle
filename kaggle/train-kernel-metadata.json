@@ -9,8 +9,9 @@
   "enable_internet": false,
   "machine_shape": "NvidiaTeslaT4",
   "dataset_sources": [
-    "stevenleehans/rsna-knee-llm-report-labels",
-    "osakanateishoku/rsna-2026-slice-selection-cache"
+    "osakanateishoku/rsna-2026-gpt56-luna-weak-labels",
+    "osakanateishoku/rsna-2026-slice-selection-cache",
+    "osakanateishoku/radimagenet-resnet50"
   ],
   "competition_sources": [
     "rsna-knee-abnormality-detection"

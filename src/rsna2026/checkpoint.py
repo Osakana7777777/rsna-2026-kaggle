@@ -22,11 +22,20 @@ def file_sha256(path: str | Path) -> str:
 
 
 def resolve_input_file(configured_path: str | Path, input_root: str | Path) -> Path:
-    """Resolve a configured Kaggle input, allowing one exact-name fallback."""
+    """Resolve a configured input across Kaggle-compatible mount roots."""
     configured = Path(configured_path)
     if configured.is_file():
         return configured
     root = Path(input_root)
+    kaggle_input_root = Path("/kaggle/input")
+    try:
+        relative = configured.relative_to(kaggle_input_root)
+    except ValueError:
+        relative = configured if not configured.is_absolute() else None
+    if relative is not None:
+        remapped = root / relative
+        if remapped.is_file():
+            return remapped
     candidates = []
     for directory, names, files in os.walk(root):
         names[:] = [

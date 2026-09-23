@@ -20,6 +20,8 @@ class PublicLabelTable:
 
     rows: dict[str, tuple[float, ...]]
     sha256: str
+    confidence_weights: dict[str, tuple[float, ...]] | None = None
+    masks: dict[str, int] | None = None
 
 
 def file_sha256(path: Path) -> str:
@@ -44,10 +46,18 @@ def load_public_label_table(
         )
 
     expected_columns = ["StudyInstanceUID", *TARGETS]
+    extended_columns = [
+        *expected_columns,
+        *(f"{target}_confidence_weight" for target in TARGETS),
+        "mask",
+    ]
     rows: dict[str, tuple[float, ...]] = {}
+    confidence_weights: dict[str, tuple[float, ...]] = {}
+    masks: dict[str, int] = {}
     with path.open(encoding="utf-8", newline="") as file:
         reader = csv.DictReader(file)
-        if reader.fieldnames != expected_columns:
+        has_explicit_supervision = reader.fieldnames == extended_columns
+        if reader.fieldnames not in (expected_columns, extended_columns):
             raise ValueError(
                 f"Unexpected public label columns: {reader.fieldnames}"
             )
@@ -72,12 +82,41 @@ def load_public_label_table(
                     )
                 values.append(value)
             rows[study_uid] = tuple(values)
+            if has_explicit_supervision:
+                weights = []
+                for target in TARGETS:
+                    column = f"{target}_confidence_weight"
+                    try:
+                        weight = float(row[column])
+                    except (TypeError, ValueError) as error:
+                        raise ValueError(
+                            f"Invalid confidence weight for {study_uid}, {target}"
+                        ) from error
+                    if not math.isfinite(weight) or not 0.0 <= weight <= 1.0:
+                        raise ValueError(
+                            f"Confidence weight outside [0, 1] for {study_uid}, "
+                            f"{target}: {weight}"
+                        )
+                    weights.append(weight)
+                try:
+                    mask = int(row["mask"])
+                except (TypeError, ValueError) as error:
+                    raise ValueError(f"Invalid mask for {study_uid}") from error
+                if str(row["mask"]).strip() not in {"0", "1"}:
+                    raise ValueError(f"Mask must be 0 or 1 for {study_uid}: {row['mask']}")
+                confidence_weights[study_uid] = tuple(weights)
+                masks[study_uid] = mask
 
     if len(rows) != expected_rows:
         raise ValueError(
             f"Expected {expected_rows} public label rows, found {len(rows)}"
         )
-    return PublicLabelTable(rows=rows, sha256=actual_sha256)
+    return PublicLabelTable(
+        rows=rows,
+        sha256=actual_sha256,
+        confidence_weights=confidence_weights if confidence_weights else None,
+        masks=masks if masks else None,
+    )
 
 
 def normalize_report(report: str) -> str:
@@ -90,11 +129,11 @@ def report_hash(report: str) -> str:
 
 
 def confidence_weight(probability: float) -> float:
-    """Map distance from the undecided value to a [0, 1] loss weight."""
+    """Weight weak supervision by its distance from the undecided value."""
     value = float(probability)
     if not math.isfinite(value) or not 0.0 <= value <= 1.0:
         raise ValueError(f"Probability outside [0, 1]: {probability!r}")
-    return 2.0 * abs(value - 0.5)
+    return 0.30 + 3.40 * abs(value - 0.5)
 
 
 def stable_sample(values: Iterable[str], count: int, seed: int) -> list[str]:

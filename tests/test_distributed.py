@@ -47,6 +47,7 @@ def test_runtime_overrides_preserve_portable_base_config() -> None:
         input_root="/workspace/input",
         output_dir="/workspace/outputs",
         expected_gpu_count=4,
+        ema_decay=0.995,
         build_selection_cache=True,
     )
 
@@ -57,6 +58,7 @@ def test_runtime_overrides_preserve_portable_base_config() -> None:
         "output_dir": "/workspace/outputs",
     }
     assert config["training"]["expected_gpu_count"] == 4
+    assert config["training"]["ema_decay"] == 0.995
     assert config["data"]["study_records_cache_path"] == ""
     assert config["data"]["study_records_cache_sha256"] == ""
 

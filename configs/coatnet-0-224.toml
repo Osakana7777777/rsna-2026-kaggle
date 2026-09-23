@@ -43,15 +43,15 @@ manifest_paths = [
   "/kaggle/input/rsna-2026-preprocess-shard-3/outputs/image-cache/cache-manifest.json",
 ]
 manifest_sha256 = [
-  "13437172941ca71c12a556a763a46d7dbb185c96457573e752abaabf3f22346a",
-  "beaa99b55409dc3a706477039c2b07bf3cc5306d36d8e96a8e4e4fb929fe611b",
-  "e7c2d8c9f122fede187d96674170a516a1939d722c88361985377ff303b155b9",
-  "e590c0f51175f88b8a6e542e4e21d36f6231e865bd856404091822b38b6dd647",
+  "432466d2ceabeefad9b8c77169fdd357d92def685dc637a9d7360a6c63d301f4",
+  "27c0bef3bd2c7614bf1aba0d8bd63831c5744c997a13e34776732568846da737",
+  "fe238119835aefd358a97efd9110f6f177630d7d4bcc3fab3e48aa17956f9e79",
+  "e89b0cc5a6c1ba7ad9bd68bae46ff32dc1df0ac90d3a79557d6ffe932763c481",
 ]
 expected_studies = 4407
 expected_series = 24371
 expected_images = 665954
-expected_failed_images = 2
+expected_failed_images = 0
 expected_selected_series = 21334
 
 [image_cache.expected_missing_by_slot]
@@ -114,12 +114,12 @@ split_algorithm = "report-group-multilabel-v1"
 
 [pseudo_labels]
 enabled = true
-dataset = "stevenleehans/rsna-knee-llm-report-labels"
-file_name = "llm_labels_v4_blend.csv"
-source_path = "/kaggle/input/rsna-knee-llm-report-labels/llm_labels_v4_blend.csv"
-sha256 = "eb4c2b29e7e84adbb4b5ccee825ca20ade6a43dbe295f13be442d549e4f5dca4"
+dataset = "osakanateishoku/rsna-2026-gpt56-luna-weak-labels"
+file_name = "weak_labels_gpt56_luna_calibrated_synovitis_imputed.csv"
+source_path = "/kaggle/input/rsna-2026-gpt56-luna-weak-labels/weak_labels_gpt56_luna_calibrated_synovitis_imputed.csv"
+sha256 = "b50a4ccb89e2232595d249d0c428673e3aaaf737a419054f9097ca446a278eee"
 expected_rows = 4407
-max_studies = 4345
+max_studies = 3303
 expected_validation_studies = 58
 minimum_source_macro_auc = 0.88
 

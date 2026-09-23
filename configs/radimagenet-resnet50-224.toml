@@ -1,0 +1,137 @@
+[competition]
+input_slug = "rsna-knee-abnormality-detection"
+
+[paths]
+input_root = "/kaggle/input"
+working_root = "/kaggle/working"
+output_dir = "/kaggle/working/outputs"
+
+[run]
+seed = 42
+
+[data]
+image_size = 224
+physical_fov_mm = 130.0
+window_count = 10
+window_size = 3
+max_series_per_slot = 1
+dicom_cache_dir = "/tmp/rsna2026-dicom-cache"
+series_classification = "competition-series-table-v1"
+study_records_cache_path = "/kaggle/input/rsna-2026-slice-selection-cache/slice-selection.json.xz"
+study_records_cache_sha256 = "5d639d8a41b4001b0eed8398e6a3a2cdc680eb06cb025a3a24695cc6cc26eb01"
+study_records_cache_uids_sha256 = "72bb18659cba9fc84f4f363c2585f1a99f84e6f03971e4d8313813ba647aa81e"
+slots = [
+  "sagittal-fluid",
+  "coronal-fluid",
+  "axial-fluid",
+  "sagittal-structural",
+  "coronal-structural",
+  "axial-structural",
+]
+
+[image_cache]
+enabled = true
+manifest_paths = [
+  "/kaggle/input/rsna-2026-preprocess-shard-0/outputs/image-cache/cache-manifest.json",
+  "/kaggle/input/rsna-2026-preprocess-shard-1/outputs/image-cache/cache-manifest.json",
+  "/kaggle/input/rsna-2026-preprocess-shard-2/outputs/image-cache/cache-manifest.json",
+  "/kaggle/input/rsna-2026-preprocess-shard-3/outputs/image-cache/cache-manifest.json",
+]
+manifest_sha256 = [
+  "432466d2ceabeefad9b8c77169fdd357d92def685dc637a9d7360a6c63d301f4",
+  "27c0bef3bd2c7614bf1aba0d8bd63831c5744c997a13e34776732568846da737",
+  "fe238119835aefd358a97efd9110f6f177630d7d4bcc3fab3e48aa17956f9e79",
+  "e89b0cc5a6c1ba7ad9bd68bae46ff32dc1df0ac90d3a79557d6ffe932763c481",
+]
+expected_studies = 4407
+expected_series = 24371
+expected_images = 665954
+expected_failed_images = 0
+expected_selected_series = 21334
+
+[image_cache.expected_missing_by_slot]
+sagittal-fluid = 257
+coronal-fluid = 159
+axial-fluid = 0
+sagittal-structural = 141
+coronal-structural = 1001
+axial-structural = 3550
+
+[augmentation]
+enabled = true
+rotation_degrees = 8.0
+rotation_probability = 0.5
+translation_fraction = 0.05
+scale_min = 0.92
+scale_max = 1.08
+affine_probability = 0.5
+brightness_limit = 0.10
+contrast_limit = 0.10
+brightness_contrast_probability = 0.4
+gamma_min = 0.85
+gamma_max = 1.15
+gamma_probability = 0.3
+noise_std_max = 0.02
+noise_probability = 0.2
+blur_kernel_sizes = [3, 5]
+blur_sigma_min = 0.1
+blur_sigma_max = 1.0
+blur_probability = 0.1
+
+[training]
+epochs = 20
+# Four studies on the only GPU with two-step accumulation gives batch 8.
+batch_size_per_device = 4
+gradient_accumulation_steps = 2
+ema_decay = 0.999
+inference_batch_size = 1
+num_workers = 2
+distributed = false
+expected_gpu_count = 1
+backbone_learning_rate = 0.000016
+head_learning_rate = 0.002
+weight_decay = 0.02
+one_cycle_warmup_fraction = 0.15
+max_runtime_hours = 12.0
+validation_fraction = 0.2
+max_train_studies = 0
+
+[cross_validation]
+enabled = true
+folds = 4
+outer_seed = 42
+inner_seed = 1042
+inner_validation_fraction = 0.20
+gold_loss_weight = 14.0
+bootstrap_resamples = 5000
+test_ensemble = "per-target-percentile-rank-mean"
+split_algorithm = "report-group-multilabel-v1"
+
+[pseudo_labels]
+enabled = true
+dataset = "osakanateishoku/rsna-2026-gpt56-luna-weak-labels"
+file_name = "weak_labels_gpt56_luna_calibrated_synovitis_imputed.csv"
+source_path = "/kaggle/input/rsna-2026-gpt56-luna-weak-labels/weak_labels_gpt56_luna_calibrated_synovitis_imputed.csv"
+sha256 = "b50a4ccb89e2232595d249d0c428673e3aaaf737a419054f9097ca446a278eee"
+expected_rows = 4407
+max_studies = 3303
+expected_validation_studies = 58
+minimum_source_macro_auc = 0.88
+
+[model]
+name = "radimagenet-resnet50"
+variant = "resnet50"
+weights_file = "ResNet50.pt"
+normalization = "minus-one-to-one"
+input_representation = "2.5d-slice-channels"
+unfreeze_last = 0
+gradient_checkpointing = false
+pooling = "global-average"
+aggregation = "transformer-target-attention"
+attention_hidden_size = 256
+transformer_layers = 2
+transformer_heads = 8
+dropout = 0.25
+
+[inference]
+ensemble_manifest_path = "/kaggle/input/rsna-2026-training/outputs/ensemble-manifest.json"

@@ -1,0 +1,16 @@
+{
+  "title": "RSNA 2026 GPT-5.6 Luna Weak Labels",
+  "id": "osakanateishoku/rsna-2026-gpt56-luna-weak-labels",
+  "licenses": [
+    {
+      "name": "other"
+    }
+  ],
+  "description": "Private report-derived weak supervision for the RSNA Knee Abnormality Detection competition. Contains soft probabilities, independent confidence weights, and report-level masks. Use is restricted to the competition workflow and its rules.",
+  "resources": [
+    {
+      "path": "weak_labels_gpt56_luna_calibrated_synovitis_imputed.csv",
+      "description": "Calibrated weak supervision for 4,407 studies with Effusion-based Synovitis completion, 12 confidence weights, and one report-level mask."
+    }
+  ]
+}

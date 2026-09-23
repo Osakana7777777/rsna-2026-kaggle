@@ -22,7 +22,11 @@ from rsna2026.dataset import (  # noqa: E402
     StudyRecord,
     build_study_records,
 )
-from rsna2026.train import slice_selection_report, train_epoch  # noqa: E402
+from rsna2026.train import (  # noqa: E402
+    ExponentialMovingAverage,
+    slice_selection_report,
+    train_epoch,
+)
 
 
 def disabled_augmentation() -> AugmentationConfig:
@@ -221,3 +225,40 @@ def test_train_epoch_steps_optimizer_after_gradient_accumulation(monkeypatch) ->
     assert np.isfinite(loss)
     assert len(optimizer_steps) == 3
     assert scheduler.steps == 3
+
+
+def test_ema_updates_after_each_optimizer_step() -> None:
+    samples = [
+        (
+            torch.zeros(1, 1, 3, 2, 2),
+            torch.ones(1, 1, dtype=torch.bool),
+            torch.zeros(1, 1, 3),
+            torch.ones(12),
+            torch.ones(12),
+        )
+        for _ in range(2)
+    ]
+    model = TinyDenseModel()
+    ema = ExponentialMovingAverage(model, decay=0.5)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+    train_epoch(
+        model,
+        DataLoader(samples, batch_size=1),
+        optimizer,
+        CountingScheduler(),  # type: ignore[arg-type]
+        torch.amp.GradScaler("cuda", enabled=False),
+        torch.device("cpu"),
+        torch.ones(12),
+        disabled_augmentation(),
+        gradient_accumulation_steps=1,
+        ema=ema,
+    )
+
+    assert model.weight.item() > ema.model.weight.item() > 0.0
+
+
+@pytest.mark.parametrize("decay", [-0.1, 1.0, float("nan")])
+def test_ema_rejects_invalid_decay(decay) -> None:
+    with pytest.raises(ValueError, match="EMA decay"):
+        ExponentialMovingAverage(TinyDenseModel(), decay)

@@ -164,6 +164,7 @@ def extract(
     gpu_memory_utilization: float,
     dtype: str,
     kv_cache_dtype: str,
+    thinking: bool,
     resume: bool,
 ) -> None:
     snapshot_path = _prepared_snapshot(model, revision)
@@ -201,6 +202,7 @@ def extract(
         "--kv-cache-dtype",
         kv_cache_dtype,
         "--enable-prefix-caching",
+        "--thinking" if thinking else "--no-thinking",
     ]
     if revision is not None:
         command.extend(["--model-revision", revision])
@@ -231,15 +233,16 @@ def main(
     output_path: str = "outputs/raw_predictions.jsonl",
     id_column: str = "StudyInstanceUID",
     report_column: str = "report",
-    model: str = "google/gemma-4-31B-it",
+    model: str = "google/gemma-4-12B-it",
     revision: str | None = None,
     max_model_len: int = 8_192,
-    max_tokens: int = 1_200,
+    max_tokens: int = 4_096,
     batch_size: int = 32,
     max_num_seqs: int = 32,
     gpu_memory_utilization: float = 0.92,
     dtype: str = "bfloat16",
     kv_cache_dtype: str = "auto",
+    thinking: bool = True,
     resume: bool = True,
 ) -> None:
     if action == "prepare-model":
@@ -267,5 +270,6 @@ def main(
         gpu_memory_utilization=gpu_memory_utilization,
         dtype=dtype,
         kv_cache_dtype=kv_cache_dtype,
+        thinking=thinking,
         resume=resume,
     )

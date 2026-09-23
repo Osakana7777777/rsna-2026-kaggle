@@ -6,7 +6,8 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 config_path="${PROJECT_ROOT}/configs/baseline.toml"
 input_root="/workspace/input"
 output_dir="/workspace/outputs"
-gpu_count="auto"
+gpu_count="1"
+ema_decay="0.995"
 venv_path="/workspace/.venvs/rsna-2026"
 build_selection_cache=false
 
@@ -16,7 +17,8 @@ Usage: ./scripts/runpod-train.sh [options]
 
   --input-root PATH       Staged read-only inputs (default: ${input_root})
   --output-dir PATH       Persistent experiment outputs (default: ${output_dir})
-  --gpu-count COUNT       Visible GPUs to use, or auto (default: auto)
+  --gpu-count COUNT       Must be 1 for this single-GPU experiment (default: 1)
+  --ema-decay DECAY       Model EMA decay (default: ${ema_decay})
   --config PATH           Experiment TOML (default: configs/baseline.toml)
   --venv PATH             uv virtual environment path (default: ${venv_path})
   --build-selection-cache Build slice selection metadata from staged DICOM files
@@ -28,6 +30,7 @@ while [[ "$#" -gt 0 ]]; do
     --input-root) input_root="${2:?Missing value for --input-root}"; shift 2 ;;
     --output-dir) output_dir="${2:?Missing value for --output-dir}"; shift 2 ;;
     --gpu-count) gpu_count="${2:?Missing value for --gpu-count}"; shift 2 ;;
+    --ema-decay) ema_decay="${2:?Missing value for --ema-decay}"; shift 2 ;;
     --config) config_path="${2:?Missing value for --config}"; shift 2 ;;
     --venv) venv_path="${2:?Missing value for --venv}"; shift 2 ;;
     --build-selection-cache) build_selection_cache=true; shift ;;
@@ -54,15 +57,12 @@ if [[ ! -f "${config_path}" ]]; then
 fi
 
 visible_gpu_count="$(nvidia-smi --list-gpus | wc -l | tr -d '[:space:]')"
-if [[ "${gpu_count}" == "auto" ]]; then
-  gpu_count="${visible_gpu_count}"
-fi
-if ! [[ "${gpu_count}" =~ ^[1-9][0-9]*$ ]]; then
-  echo "--gpu-count must be a positive integer or auto." >&2
+if [[ "${gpu_count}" != "1" ]]; then
+  echo "--gpu-count must be 1; this experiment is configured for one GPU." >&2
   exit 2
 fi
-if (( gpu_count > visible_gpu_count )); then
-  echo "Requested ${gpu_count} GPUs, but only ${visible_gpu_count} are visible." >&2
+if (( visible_gpu_count < 1 )); then
+  echo "No NVIDIA GPU is visible." >&2
   exit 1
 fi
 
@@ -78,12 +78,12 @@ if ! "${venv_path}/bin/python" -c \
     'timm>=1.0,<2' 'transformers>=4.40,<6'
 fi
 "${venv_path}/bin/python" -c \
-  'import numpy, pandas, pydicom, safetensors, timm, torch, transformers; assert torch.cuda.is_available()'
+  'import numpy, pandas, pydicom, safetensors, timm, torch, torchvision, transformers; assert torch.cuda.is_available()'
 
 export PYTHONPATH="${PROJECT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 export PYTHONUNBUFFERED=1
 
-echo "Starting training with ${gpu_count}/${visible_gpu_count} visible GPUs."
+echo "Starting training on one of ${visible_gpu_count} visible GPUs."
 training_command=(
   "${venv_path}/bin/python" -m torch.distributed.run
   --standalone
@@ -94,6 +94,7 @@ training_command=(
   --input-root "${input_root}"
   --output-dir "${output_dir}"
   --expected-gpu-count "${gpu_count}"
+  --ema-decay "${ema_decay}"
 )
 if [[ "${build_selection_cache}" == true ]]; then
   training_command+=(--build-selection-cache)

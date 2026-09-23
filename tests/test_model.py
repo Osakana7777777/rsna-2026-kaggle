@@ -14,10 +14,15 @@ from torch import nn  # noqa: E402
 from rsna2026.model import (  # noqa: E402
     HierarchicalTargetAttentionHead,
     KneeAbnormalityModel,
+    RADIMAGENET_MEAN,
+    RADIMAGENET_STD,
+    RadImageNetResNet50,
     TargetAttentionHead,
     TransformerTargetAttentionHead,
     build_coatnet_model,
+    build_radimagenet_resnet50_model,
     find_coatnet_source,
+    find_radimagenet_source,
 )
 
 
@@ -76,6 +81,38 @@ class DummyCoAtNet(nn.Module):
             values = stage.blocks(values)
         values = self.norm(values)
         return values.mean(dim=(2, 3))
+
+
+class DummyRadImageNetResNet50(nn.Sequential):
+    num_features = 4
+
+    def __init__(self) -> None:
+        stages = [self._stage(count) for count in (3, 4, 6, 3)]
+        super().__init__(
+            nn.Conv2d(3, 4, 1),
+            nn.BatchNorm2d(4),
+            nn.ReLU(),
+            nn.Identity(),
+            *stages,
+            nn.AdaptiveAvgPool2d((1, 1)),
+        )
+        self.loaded_strict = None
+
+    @staticmethod
+    def _stage(count: int) -> nn.Sequential:
+        return nn.Sequential(
+            *(
+                nn.Sequential(nn.BatchNorm2d(4), nn.Conv2d(4, 4, 1))
+                for _ in range(count)
+            )
+        )
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        self.loaded_strict = strict
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
+
+    def forward(self, pixels):
+        return super().forward(pixels).flatten(1)
 
 
 def test_target_attention_masks_missing_slots_and_renormalizes() -> None:
@@ -140,6 +177,31 @@ def test_model_requires_three_slices_for_2_5d_input() -> None:
             max_series_per_slot=2,
             window_count=10,
             slices_per_slot=1,
+            attention_hidden_size=4,
+        )
+
+
+@pytest.mark.parametrize(
+    ("backbone", "backbone_family"),
+    [
+        (DummyBackbone, None),
+        (DummyCoAtNet, "coatnet"),
+    ],
+)
+def test_non_radimagenet_backbones_require_a_trainable_block(
+    backbone, backbone_family
+) -> None:
+    with pytest.raises(ValueError, match="At least one backbone block"):
+        KneeAbnormalityModel(
+            backbone=backbone(),
+            backbone_family=backbone_family,
+            num_targets=2,
+            unfreeze_last=0,
+            dropout=0.0,
+            num_slots=1,
+            max_series_per_slot=1,
+            window_count=1,
+            slices_per_slot=3,
             attention_hidden_size=4,
         )
 
@@ -308,6 +370,236 @@ def test_build_coatnet_uses_strict_offline_checkpoint_loading(
         "strict": True,
     }
     assert backbone.checkpointing is True
+
+
+def test_find_radimagenet_source_requires_exactly_one_weight_file(
+    tmp_path,
+) -> None:
+    with pytest.raises(FileNotFoundError, match=r"found \[\]"):
+        find_radimagenet_source(tmp_path)
+
+    source = tmp_path / "radimagenet"
+    source.mkdir()
+    (source / "ResNet50.pt").write_bytes(b"weights")
+    assert find_radimagenet_source(tmp_path) == source
+
+    duplicate = tmp_path / "duplicate"
+    duplicate.mkdir()
+    (duplicate / "ResNet50.pt").write_bytes(b"weights")
+    with pytest.raises(FileNotFoundError, match="exactly one"):
+        find_radimagenet_source(tmp_path)
+
+
+def test_radimagenet_feature_extractor_returns_2048_global_average_features(
+    monkeypatch,
+) -> None:
+    fake_resnet = nn.Sequential(
+        nn.Conv2d(3, 2048, 1),
+        nn.Identity(),
+        nn.Identity(),
+        nn.Identity(),
+        nn.Identity(),
+        nn.Identity(),
+        nn.Identity(),
+        nn.Identity(),
+        nn.AdaptiveAvgPool2d((1, 1)),
+    )
+    torchvision = types.ModuleType("torchvision")
+    torchvision_models = types.ModuleType("torchvision.models")
+    torchvision_models.resnet50 = lambda weights=None: fake_resnet
+    monkeypatch.setitem(sys.modules, "torchvision", torchvision)
+    monkeypatch.setitem(sys.modules, "torchvision.models", torchvision_models)
+
+    backbone = RadImageNetResNet50()
+    features = backbone(torch.randn(2, 3, 8, 8))
+
+    assert features.shape == (2, 2048)
+
+
+def test_radimagenet_freezes_all_bottlenecks_normalizes_and_freezes_bn(
+) -> None:
+    backbone = DummyRadImageNetResNet50()
+    received = []
+    backbone[0].register_forward_pre_hook(
+        lambda _module, inputs: received.append(inputs[0].detach().clone())
+    )
+    model = KneeAbnormalityModel(
+        backbone=backbone,
+        backbone_family="radimagenet-resnet50",
+        image_mean=RADIMAGENET_MEAN,
+        image_std=RADIMAGENET_STD,
+        num_targets=2,
+        unfreeze_last=0,
+        dropout=0.0,
+        num_slots=1,
+        max_series_per_slot=1,
+        window_count=1,
+        slices_per_slot=3,
+        attention_hidden_size=4,
+    )
+    blocks = [block for stage in list(backbone.children())[4:8] for block in stage]
+
+    assert len(blocks) == 16
+    assert not any(parameter.requires_grad for parameter in backbone.parameters())
+
+    model.train()
+    assert backbone[1].training is False
+    assert blocks[0][0].training is False
+    assert blocks[-1][0].training is False
+
+    images = torch.full((1, 1, 1, 1, 3, 4, 4), 0.25)
+    present = torch.ones((1, 1, 1, 1), dtype=torch.bool)
+    positions = torch.zeros((1, 1, 1, 1, 3))
+    assert model(images, present, positions).shape == (1, 2)
+    assert torch.allclose(received[0], torch.full((1, 3, 4, 4), -0.5))
+
+
+def test_build_radimagenet_uses_official_sequential_state_dict_strictly(
+    tmp_path, monkeypatch
+) -> None:
+    source = tmp_path / "radimagenet"
+    source.mkdir()
+    checkpoint = source / "ResNet50.pt"
+    expected_backbone = DummyRadImageNetResNet50()
+    torch.save(
+        {
+            f"backbone.{key}": value
+            for key, value in expected_backbone.state_dict().items()
+        },
+        checkpoint,
+    )
+    loaded_backbone = DummyRadImageNetResNet50()
+    monkeypatch.setattr(
+        "rsna2026.model.RadImageNetResNet50", lambda: loaded_backbone
+    )
+
+    model, found_source = build_radimagenet_resnet50_model(
+        input_root=tmp_path,
+        weights_file=checkpoint.name,
+        num_targets=2,
+        unfreeze_last=0,
+        dropout=0.0,
+        num_slots=1,
+        max_series_per_slot=1,
+        window_count=1,
+        slices_per_slot=3,
+        attention_hidden_size=4,
+        gradient_checkpointing=False,
+    )
+
+    assert found_source == source
+    assert model.backbone is loaded_backbone
+    assert not any(
+        parameter.requires_grad for parameter in model.backbone.parameters()
+    )
+    assert loaded_backbone.loaded_strict is True
+    assert model.feature_size == 4
+    assert torch.equal(model.image_mean.flatten(), torch.tensor(RADIMAGENET_MEAN))
+    assert torch.equal(model.image_std.flatten(), torch.tensor(RADIMAGENET_STD))
+
+
+@pytest.mark.parametrize(
+    "state_dict",
+    [
+        {},
+        {"0.weight": torch.ones(1)},
+        {
+            "backbone.0.weight": torch.ones(1),
+            "1.weight": torch.ones(1),
+        },
+        {"module.backbone.0.weight": torch.ones(1)},
+        {"backbone.": torch.ones(1)},
+    ],
+    ids=["empty", "missing-prefix", "mixed-prefix", "unexpected-prefix", "empty-key"],
+)
+def test_build_radimagenet_rejects_invalid_checkpoint_namespace(
+    tmp_path, monkeypatch, state_dict
+) -> None:
+    source = tmp_path / "radimagenet"
+    source.mkdir()
+    checkpoint = source / "ResNet50.pt"
+    torch.save(state_dict, checkpoint)
+    monkeypatch.setattr(
+        "rsna2026.model.RadImageNetResNet50", DummyRadImageNetResNet50
+    )
+
+    with pytest.raises(RuntimeError, match="Invalid official.*namespace"):
+        build_radimagenet_resnet50_model(
+            input_root=tmp_path,
+            weights_file=checkpoint.name,
+            num_targets=2,
+            unfreeze_last=6,
+            dropout=0.0,
+            num_slots=1,
+            max_series_per_slot=1,
+            window_count=1,
+            slices_per_slot=3,
+            attention_hidden_size=4,
+            gradient_checkpointing=False,
+        )
+
+
+def test_build_radimagenet_rejects_key_collision_after_prefix_stripping(
+    tmp_path, monkeypatch
+) -> None:
+    class CollidingCheckpoint(dict):
+        def items(self):
+            tensor = torch.ones(1)
+            return [
+                ("backbone.0.weight", tensor),
+                ("backbone.0.weight", tensor),
+            ]
+
+    source = tmp_path / "radimagenet"
+    source.mkdir()
+    checkpoint = source / "ResNet50.pt"
+    checkpoint.touch()
+    monkeypatch.setattr(
+        "rsna2026.model.torch.load",
+        lambda *_args, **_kwargs: CollidingCheckpoint(x=1),
+    )
+
+    with pytest.raises(RuntimeError, match="Invalid official.*namespace"):
+        build_radimagenet_resnet50_model(
+            input_root=tmp_path,
+            weights_file=checkpoint.name,
+            num_targets=2,
+            unfreeze_last=6,
+            dropout=0.0,
+            num_slots=1,
+            max_series_per_slot=1,
+            window_count=1,
+            slices_per_slot=3,
+            attention_hidden_size=4,
+            gradient_checkpointing=False,
+        )
+
+
+def test_build_radimagenet_reports_strict_checkpoint_mismatch(
+    tmp_path, monkeypatch
+) -> None:
+    source = tmp_path / "radimagenet"
+    source.mkdir()
+    checkpoint = source / "ResNet50.pt"
+    torch.save({"backbone.unexpected.weight": torch.ones(1)}, checkpoint)
+    monkeypatch.setattr(
+        "rsna2026.model.RadImageNetResNet50", DummyRadImageNetResNet50
+    )
+
+    with pytest.raises(RuntimeError, match="Failed to strictly load"):
+        build_radimagenet_resnet50_model(
+            input_root=tmp_path,
+            weights_file=checkpoint.name,
+            num_targets=2,
+            unfreeze_last=6,
+            dropout=0.0,
+            num_slots=1,
+            max_series_per_slot=1,
+            window_count=1,
+            slices_per_slot=3,
+            attention_hidden_size=4,
+            gradient_checkpointing=False,
+        )
 
 
 def test_hierarchical_attention_masks_windows_and_slots() -> None:

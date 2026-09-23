@@ -13,6 +13,8 @@ from torch import nn
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+RADIMAGENET_MEAN = (0.5, 0.5, 0.5)
+RADIMAGENET_STD = (0.5, 0.5, 0.5)
 
 
 class TargetAttentionHead(nn.Module):
@@ -403,6 +405,76 @@ def find_coatnet_source(
     return candidates[0]
 
 
+def find_radimagenet_source(
+    input_root: str | Path, weights_file: str = "ResNet50.pt"
+) -> Path:
+    """Find exactly one mounted official RadImageNet weight file."""
+    root = Path(input_root)
+    if not root.is_dir():
+        raise FileNotFoundError(f"Model input root does not exist: {root}")
+    candidates = []
+    for directory, names, files in os.walk(root):
+        names[:] = [
+            name for name in names if name not in {"train_series", "test_series"}
+        ]
+        if weights_file in files:
+            candidates.append(Path(directory))
+    candidates.sort()
+    if len(candidates) != 1:
+        raise FileNotFoundError(
+            "Expected exactly one mounted RadImageNet weight file "
+            f"{weights_file}, found {candidates}"
+        )
+    return candidates[0]
+
+
+class RadImageNetResNet50(nn.Sequential):
+    """Official RadImageNet ResNet-50 feature extractor without its classifier."""
+
+    num_features = 2048
+
+    def __init__(self) -> None:
+        from torchvision.models import resnet50
+
+        model = resnet50(weights=None)
+        super().__init__(*list(model.children())[:9])
+
+    def forward(self, pixels: torch.Tensor) -> torch.Tensor:
+        return super().forward(pixels).flatten(1)
+
+
+def _strip_radimagenet_backbone_prefix(
+    checkpoint: dict[object, object],
+) -> dict[str, object]:
+    """Validate the official checkpoint namespace and strip its wrapper prefix."""
+    if not checkpoint:
+        raise ValueError("RadImageNet checkpoint state dictionary is empty")
+
+    prefix = "backbone."
+    normalized: dict[str, object] = {}
+    for key, value in checkpoint.items():
+        if not isinstance(key, str):
+            raise TypeError("RadImageNet checkpoint keys must be strings")
+        if not key.startswith(prefix):
+            raise ValueError(
+                "Official RadImageNet checkpoint keys must all start with "
+                f"{prefix!r}; found {key!r}"
+            )
+        stripped_key = key[len(prefix) :]
+        if not stripped_key:
+            raise ValueError(
+                "RadImageNet checkpoint contains an empty key after stripping "
+                f"{prefix!r}"
+            )
+        if stripped_key in normalized:
+            raise ValueError(
+                "RadImageNet checkpoint key collision after stripping "
+                f"{prefix!r}: {stripped_key!r}"
+            )
+        normalized[stripped_key] = value
+    return normalized
+
+
 class KneeAbnormalityModel(nn.Module):
     """Encode three-slice 2.5D slots and attend to them by target."""
 
@@ -418,13 +490,15 @@ class KneeAbnormalityModel(nn.Module):
         slices_per_slot: int,
         attention_hidden_size: int,
         backbone_family: str | None = None,
+        image_mean: tuple[float, float, float] = IMAGENET_MEAN,
+        image_std: tuple[float, float, float] = IMAGENET_STD,
         aggregation: str = "hierarchical-target-series-attention",
         transformer_layers: int = 2,
         transformer_heads: int = 8,
     ) -> None:
         super().__init__()
-        if unfreeze_last <= 0:
-            raise ValueError("At least one backbone block must be trainable")
+        if unfreeze_last < 0:
+            raise ValueError("Backbone blocks to unfreeze cannot be negative")
         if slices_per_slot <= 0:
             raise ValueError("Slices per slot must be positive")
         if slices_per_slot != 3:
@@ -435,6 +509,10 @@ class KneeAbnormalityModel(nn.Module):
             raise ValueError("Maximum series per slot must be positive")
         self.backbone = backbone
         self.backbone_family = backbone_family or self._detect_backbone_family()
+        if unfreeze_last == 0 and self.backbone_family != "radimagenet-resnet50":
+            raise ValueError("At least one backbone block must be trainable")
+        if len(image_mean) != 3 or len(image_std) != 3:
+            raise ValueError("Image normalization must have three channels")
         layers = self._backbone_blocks()
         if unfreeze_last > len(layers):
             raise ValueError(
@@ -442,12 +520,14 @@ class KneeAbnormalityModel(nn.Module):
             )
         for parameter in self.backbone.parameters():
             parameter.requires_grad = False
-        for layer in layers[-unfreeze_last:]:
-            for parameter in layer.parameters():
-                parameter.requires_grad = True
+        if unfreeze_last:
+            for layer in layers[-unfreeze_last:]:
+                for parameter in layer.parameters():
+                    parameter.requires_grad = True
         final_norm = self._final_norm()
-        for parameter in final_norm.parameters():
-            parameter.requires_grad = True
+        if final_norm is not None:
+            for parameter in final_norm.parameters():
+                parameter.requires_grad = True
         self._frozen_batch_norms = [
             module
             for module in self.backbone.modules()
@@ -485,10 +565,10 @@ class KneeAbnormalityModel(nn.Module):
         self.num_targets = num_targets
         self.slices_per_slot = slices_per_slot
         self.register_buffer(
-            "image_mean", torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1)
+            "image_mean", torch.tensor(image_mean).view(1, 3, 1, 1)
         )
         self.register_buffer(
-            "image_std", torch.tensor(IMAGENET_STD).view(1, 3, 1, 1)
+            "image_std", torch.tensor(image_std).view(1, 3, 1, 1)
         )
 
     def _detect_backbone_family(self) -> str:
@@ -513,6 +593,15 @@ class KneeAbnormalityModel(nn.Module):
                     raise TypeError("CoAtNet stage does not expose sequential blocks")
                 blocks.extend(stage_blocks)
             return blocks
+        if self.backbone_family == "radimagenet-resnet50":
+            stages = list(self.backbone.children())[4:8]
+            if len(stages) != 4 or not all(
+                isinstance(stage, nn.Sequential) for stage in stages
+            ):
+                raise TypeError(
+                    "RadImageNet ResNet-50 does not expose layer1 to layer4"
+                )
+            return [block for stage in stages for block in stage]
         if self.backbone_family != "dinov2":
             raise ValueError(f"Unsupported backbone family: {self.backbone_family}")
         encoder = getattr(self.backbone, "encoder", None)
@@ -521,7 +610,9 @@ class KneeAbnormalityModel(nn.Module):
             raise TypeError("DINOv2 backbone does not expose encoder.layer")
         return list(layers)
 
-    def _final_norm(self) -> nn.Module:
+    def _final_norm(self) -> nn.Module | None:
+        if self.backbone_family == "radimagenet-resnet50":
+            return None
         name = "layernorm" if self.backbone_family == "dinov2" else "norm"
         final_norm = getattr(self.backbone, name, None)
         if not isinstance(final_norm, nn.Module):
@@ -531,10 +622,13 @@ class KneeAbnormalityModel(nn.Module):
         return final_norm
 
     def _encode(self, pixels: torch.Tensor) -> torch.Tensor:
-        if self.backbone_family == "coatnet":
+        if self.backbone_family in {"coatnet", "radimagenet-resnet50"}:
             encoded = self.backbone(pixels)
             if encoded.ndim != 2 or encoded.shape[1] != self.feature_size:
-                raise ValueError("CoAtNet backbone returned an invalid embedding shape")
+                raise ValueError(
+                    f"{self.backbone_family} backbone returned an invalid "
+                    "embedding shape"
+                )
             return encoded
         tokens = self.backbone(pixel_values=pixels).last_hidden_state
         if tokens.shape[1] < 2:
@@ -542,7 +636,7 @@ class KneeAbnormalityModel(nn.Module):
         return torch.cat((tokens[:, 0], tokens[:, 1:].mean(dim=1)), dim=1)
 
     def train(self, mode: bool = True) -> KneeAbnormalityModel:
-        """Keep running statistics fixed in frozen CoAtNet batch norms."""
+        """Keep running statistics fixed in frozen backbone batch norms."""
         super().train(mode)
         if mode:
             for module in self._frozen_batch_norms:
@@ -724,6 +818,68 @@ def build_coatnet_model(
         slices_per_slot=slices_per_slot,
         attention_hidden_size=attention_hidden_size,
         backbone_family="coatnet",
+        aggregation=aggregation,
+        transformer_layers=transformer_layers,
+        transformer_heads=transformer_heads,
+    )
+    return model, source
+
+
+def build_radimagenet_resnet50_model(
+    input_root: str | Path,
+    weights_file: str,
+    num_targets: int,
+    unfreeze_last: int,
+    dropout: float,
+    num_slots: int,
+    max_series_per_slot: int,
+    window_count: int,
+    slices_per_slot: int,
+    attention_hidden_size: int,
+    gradient_checkpointing: bool,
+    aggregation: str = "hierarchical-target-series-attention",
+    transformer_layers: int = 2,
+    transformer_heads: int = 8,
+) -> tuple[KneeAbnormalityModel, Path]:
+    """Load official RadImageNet ResNet-50 weights without network access."""
+    if gradient_checkpointing:
+        raise ValueError(
+            "RadImageNet ResNet-50 does not support gradient checkpointing"
+        )
+    source = find_radimagenet_source(input_root, weights_file)
+    checkpoint = torch.load(
+        source / weights_file, map_location="cpu", weights_only=True
+    )
+    if not isinstance(checkpoint, dict):
+        raise TypeError("RadImageNet checkpoint must be a state dictionary")
+    try:
+        checkpoint = _strip_radimagenet_backbone_prefix(checkpoint)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(
+            "Invalid official RadImageNet ResNet-50 checkpoint namespace: "
+            f"{source / weights_file}"
+        ) from error
+    backbone = RadImageNetResNet50()
+    try:
+        backbone.load_state_dict(checkpoint, strict=True)
+    except RuntimeError as error:
+        raise RuntimeError(
+            "Failed to strictly load the official RadImageNet ResNet-50 "
+            f"checkpoint: {source / weights_file}"
+        ) from error
+    model = KneeAbnormalityModel(
+        backbone=backbone,
+        num_targets=num_targets,
+        unfreeze_last=unfreeze_last,
+        dropout=dropout,
+        num_slots=num_slots,
+        max_series_per_slot=max_series_per_slot,
+        window_count=window_count,
+        slices_per_slot=slices_per_slot,
+        attention_hidden_size=attention_hidden_size,
+        backbone_family="radimagenet-resnet50",
+        image_mean=RADIMAGENET_MEAN,
+        image_std=RADIMAGENET_STD,
         aggregation=aggregation,
         transformer_layers=transformer_layers,
         transformer_heads=transformer_heads,

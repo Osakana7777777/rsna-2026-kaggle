@@ -15,10 +15,14 @@ from pathlib import Path
 from typing import Any
 
 from rsna2026.weak_label_decode import decode_prediction, semantic_warnings
-from rsna2026.weak_label_schema import VLLM_RSNA_LABEL_SCHEMA
+from rsna2026.weak_label_schema import (
+    VLLM_RSNA_LABEL_SCHEMA,
+    normalize_unique_items,
+    validate_prediction,
+)
 
 LOGGER = logging.getLogger(__name__)
-DEFAULT_MODEL = "google/gemma-4-31B-it"
+DEFAULT_MODEL = "google/gemma-4-12B-it"
 PROMPT_VERSION = "v1"
 DEFAULT_PROMPT_PATH = (
     Path(__file__).resolve().parents[2] / "prompts" / "rsna_knee_extractor_v1.txt"
@@ -31,7 +35,7 @@ class InferenceSettings:
     model_revision: str | None = None
     model_path: str | None = None
     max_model_len: int = 8_192
-    max_tokens: int = 1_200
+    max_tokens: int = 4_096
     batch_size: int = 32
     max_num_seqs: int = 32
     gpu_memory_utilization: float = 0.92
@@ -39,7 +43,7 @@ class InferenceSettings:
     kv_cache_dtype: str = "auto"
     enable_prefix_caching: bool = True
     generation_config: str = "auto"
-    thinking: bool = False
+    thinking: bool = True
 
 
 @dataclass(frozen=True)
@@ -53,10 +57,12 @@ def user_prompt(report: Report) -> str:
 
 
 def messages(system_prompt: str, report: Report) -> list[dict[str, str]]:
-    """Keep the shared prefix fixed and all case-specific text at the end."""
+    """Put fixed instructions first in one user turn for prefix caching."""
     return [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt(report)},
+        {
+            "role": "user",
+            "content": f"{system_prompt}\n\n--- CASE INPUT ---\n\n{user_prompt(report)}",
+        }
     ]
 
 
@@ -98,8 +104,7 @@ def completed_study_ids(
                 decode_prediction(row["prediction"])
                 if (
                     expected_inference_settings is not None
-                    and row.get("inference_settings")
-                    != expected_inference_settings
+                    and row.get("inference_settings") != expected_inference_settings
                 ):
                     raise ValueError(
                         "inference settings differ from the current run; "
@@ -154,14 +159,44 @@ def create_engine(settings: InferenceSettings) -> tuple[Any, Any]:
         gpu_memory_utilization=settings.gpu_memory_utilization,
         generation_config=settings.generation_config,
         limit_mm_per_prompt={"image": 0, "audio": 0},
+        structured_outputs_config={
+            "reasoning_parser": "gemma4",
+            "enable_in_reasoning": False,
+        },
         trust_remote_code=False,
     )
     sampling = engine.get_default_sampling_params()
     sampling.max_tokens = settings.max_tokens
-    sampling.structured_outputs = StructuredOutputsParams(
-        json=VLLM_RSNA_LABEL_SCHEMA
-    )
+    sampling.skip_special_tokens = False
+    sampling.structured_outputs = StructuredOutputsParams(json=VLLM_RSNA_LABEL_SCHEMA)
     return engine, sampling
+
+
+def parse_model_output(raw_output: str) -> tuple[str, str | None]:
+    """Split Gemma 4 thinking from the final structured answer."""
+    try:
+        from vllm.reasoning.gemma4_utils import parse_thinking_output
+    except ImportError as error:
+        raise RuntimeError(
+            "Gemma 4 reasoning parser is unavailable in the vLLM runtime"
+        ) from error
+    parsed = parse_thinking_output(raw_output)
+    answer = parsed.get("answer")
+    reasoning = parsed.get("thinking")
+    if not isinstance(answer, str) or not answer.strip():
+        raise ValueError("Gemma 4 output contains no final answer")
+    if reasoning is not None and not isinstance(reasoning, str):
+        raise ValueError("Gemma 4 reasoning output is not text")
+    return answer.strip(), reasoning
+
+
+def parse_and_validate_prediction(
+    raw_output: str,
+) -> tuple[dict[str, Any], str | None, list[str]]:
+    """Accept only a final answer that satisfies the complete production schema."""
+    answer, reasoning = parse_model_output(raw_output)
+    prediction, normalized_paths = normalize_unique_items(json.loads(answer))
+    return validate_prediction(prediction), reasoning, normalized_paths
 
 
 def generation_settings(sampling: Any, source: str) -> dict[str, Any]:
@@ -284,13 +319,16 @@ def run_inference(
         error_rows: list[dict[str, Any]] = []
         for report, result in zip(report_batch, results):
             raw_output = None
+            reasoning = None
             try:
                 raw_output = result.outputs[0].text
                 generated_count = len(result.outputs[0].token_ids or ())
                 input_tokens += len(result.prompt_token_ids or ())
                 output_tokens += generated_count
                 generated_token_counts.append(generated_count)
-                prediction = json.loads(raw_output)
+                prediction, reasoning, normalized_paths = parse_and_validate_prediction(
+                    raw_output
+                )
                 decoded = decode_prediction(prediction)
                 warnings = semantic_warnings(decoded)
             except (
@@ -319,6 +357,8 @@ def run_inference(
                     "generation_settings": effective_generation_settings,
                     "prediction": prediction,
                     "raw_output": raw_output,
+                    "reasoning": reasoning,
+                    "normalized_unique_items": normalized_paths,
                     "semantic_warning": bool(warnings),
                     "semantic_warnings": warnings,
                 }
@@ -380,7 +420,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional local snapshot path; model remains the metadata identity",
     )
     parser.add_argument("--max-model-len", type=int, default=8_192)
-    parser.add_argument("--max-tokens", type=int, default=1_200)
+    parser.add_argument("--max-tokens", type=int, default=4_096)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--max-num-seqs", type=int, default=32)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.92)
@@ -388,6 +428,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kv-cache-dtype", default="auto")
     parser.add_argument(
         "--enable-prefix-caching",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--thinking",
         action=argparse.BooleanOptionalAction,
         default=True,
     )
@@ -414,6 +459,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         dtype=args.dtype,
         kv_cache_dtype=args.kv_cache_dtype,
         enable_prefix_caching=args.enable_prefix_caching,
+        thinking=args.thinking,
     )
     if not 0.0 < settings.gpu_memory_utilization <= 1.0:
         raise ValueError("gpu memory utilization must be in (0, 1]")

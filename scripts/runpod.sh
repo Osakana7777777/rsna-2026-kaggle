@@ -6,14 +6,14 @@ usage() {
   cat <<'EOF'
 Usage:
   ./scripts/runpod.sh gpus
-  ./scripts/runpod.sh create --gpu-id GPU_ID [options]
+  ./scripts/runpod.sh create [--gpu-id GPU_ID] [options]
   ./scripts/runpod.sh get POD_ID
   ./scripts/runpod.sh stop POD_ID
   ./scripts/runpod.sh delete POD_ID
 
 Create options:
-  --gpu-id GPU_ID             Exact ID shown by the gpus command (required)
-  --gpu-count COUNT           Number of GPUs (default: 2)
+  --gpu-id GPU_ID             Exact ID shown by gpus; omit to try 4090, A6000, A40
+  --gpu-count COUNT           Number of GPUs (must be 1; default: 1)
   --name NAME                 Pod name (default: rsna-2026-experiment)
   --image IMAGE               Container image
   --cloud-type TYPE           SECURE or COMMUNITY (default: SECURE)
@@ -65,7 +65,7 @@ case "${command_name}" in
 esac
 
 gpu_id=""
-gpu_count=2
+gpu_count=1
 pod_name="rsna-2026-experiment"
 image_name="runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04"
 cloud_type="SECURE"
@@ -92,12 +92,8 @@ while [[ "$#" -gt 0 ]]; do
   esac
 done
 
-if [[ -z "${gpu_id}" ]]; then
-  echo "--gpu-id is required. Run './scripts/runpod.sh gpus' first." >&2
-  exit 2
-fi
-if ! [[ "${gpu_count}" =~ ^[1-9][0-9]*$ ]]; then
-  echo "--gpu-count must be a positive integer." >&2
+if [[ "${gpu_count}" != "1" ]]; then
+  echo "--gpu-count must be 1 for this single-GPU experiment." >&2
   exit 2
 fi
 if [[ "${cloud_type}" != "SECURE" && "${cloud_type}" != "COMMUNITY" ]]; then
@@ -108,14 +104,12 @@ fi
 create_command=(
   runpodctl pod create
   --name "${pod_name}"
-  --gpu-id "${gpu_id}"
   --gpu-count "${gpu_count}"
   --image "${image_name}"
   --cloud-type "${cloud_type}"
   --container-disk-in-gb "${container_disk_gb}"
   --volume-mount-path /workspace
   --ports 8888/http,22/tcp
-  --docker-args "sleep infinity"
 )
 if [[ -n "${network_volume_id}" ]]; then
   create_command+=(--network-volume-id "${network_volume_id}")
@@ -126,13 +120,41 @@ if [[ -n "${data_center_ids}" ]]; then
   create_command+=(--data-center-ids "${data_center_ids}")
 fi
 
+preferred_gpu_ids=(
+  "NVIDIA GeForce RTX 4090"
+  "NVIDIA RTX A6000"
+  "NVIDIA A40"
+)
+if [[ -n "${gpu_id}" ]]; then
+  candidate_gpu_ids=("${gpu_id}")
+else
+  candidate_gpu_ids=("${preferred_gpu_ids[@]}")
+fi
+
 if [[ "${dry_run}" == true ]]; then
-  printf '%q ' "${create_command[@]}"
-  printf '\n'
+  echo "GPU candidates, in attempt order:"
+  for candidate_gpu_id in "${candidate_gpu_ids[@]}"; do
+    printf '  '
+    printf '%q ' "${create_command[@]}" --gpu-id "${candidate_gpu_id}"
+    printf '\n'
+  done
   exit 0
 fi
 
 require_runpodctl
-echo "Creating ${gpu_count} GPU Pod with ${gpu_id}. Billing starts when deployed."
-"${create_command[@]}"
+echo "GPU types reported by runpodctl:"
+runpodctl gpu list
+pod_created=false
+for candidate_gpu_id in "${candidate_gpu_ids[@]}"; do
+  echo "Trying one ${candidate_gpu_id}. Billing starts if deployment succeeds."
+  if "${create_command[@]}" --gpu-id "${candidate_gpu_id}"; then
+    pod_created=true
+    break
+  fi
+  echo "Could not create a Pod with ${candidate_gpu_id}; trying the next candidate." >&2
+done
+if [[ "${pod_created}" != true ]]; then
+  echo "No Pod was created. Check the errors above and './scripts/runpod.sh gpus'." >&2
+  exit 1
+fi
 echo "After connecting and staging the permitted inputs, run scripts/runpod-train.sh inside the repository."

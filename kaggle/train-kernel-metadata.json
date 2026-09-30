@@ -9,7 +9,7 @@
   "enable_internet": false,
   "machine_shape": "NvidiaTeslaT4",
   "dataset_sources": [
-    "osakanateishoku/rsna-2026-gpt56-luna-weak-labels",
+    "stevenleehans/rsna-knee-llm-report-labels",
     "osakanateishoku/rsna-2026-slice-selection-cache",
     "osakanateishoku/radimagenet-resnet50"
   ],

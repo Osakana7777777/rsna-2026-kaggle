@@ -44,6 +44,22 @@ def resolve_input_file(configured_path: str | Path, input_root: str | Path) -> P
         if configured.name in files:
             candidates.append(Path(directory) / configured.name)
     candidates.sort()
+    if relative is not None:
+        # New Kaggle mounts insert notebooks/<owner>/ or datasets/<owner>/
+        # before the slug. Preserve the entire slug-relative artifact path
+        # so identically named files from different shards cannot collide.
+        matching = [
+            candidate
+            for candidate in candidates
+            if candidate.relative_to(root).parts[-len(relative.parts):]
+            == relative.parts
+        ]
+        if len(matching) == 1:
+            return matching[0]
+        if len(matching) > 1:
+            raise FileNotFoundError(
+                f"Expected one mounted {relative} beneath {root}, found {matching}"
+            )
     if len(candidates) != 1:
         raise FileNotFoundError(
             f"Expected one mounted {configured.name} beneath {root}, "

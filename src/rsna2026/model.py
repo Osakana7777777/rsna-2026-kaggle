@@ -783,8 +783,16 @@ def build_coatnet_model(
     aggregation: str = "hierarchical-target-series-attention",
     transformer_layers: int = 2,
     transformer_heads: int = 8,
+    normalization: str = "imagenet",
 ) -> tuple[KneeAbnormalityModel, Path]:
     """Load a mounted timm CoAtNet checkpoint without network access."""
+    if normalization == "imagenet":
+        image_mean, image_std = IMAGENET_MEAN, IMAGENET_STD
+    elif normalization == "minus-one-to-one":
+        image_mean = image_std = (0.5, 0.5, 0.5)
+    else:
+        raise ValueError(f"Unsupported CoAtNet normalization: {normalization}")
+
     import timm
     from timm.models import load_checkpoint
 
@@ -818,6 +826,8 @@ def build_coatnet_model(
         slices_per_slot=slices_per_slot,
         attention_hidden_size=attention_hidden_size,
         backbone_family="coatnet",
+        image_mean=image_mean,
+        image_std=image_std,
         aggregation=aggregation,
         transformer_layers=transformer_layers,
         transformer_heads=transformer_heads,

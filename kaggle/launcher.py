@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import os
 import shutil
+import subprocess
 import sys
 import traceback
 from pathlib import Path
@@ -59,7 +60,7 @@ class Tee:
 
 
 def run_payload() -> int:
-    """Run EDA/inference directly or launch one distributed training process."""
+    """Run the selected mode, using torchrun for distributed training."""
     if RUN_MODE == "eda":
         from rsna2026.eda import main as eda_main
 
@@ -122,15 +123,39 @@ def run_payload() -> int:
         os.environ["RSNA2026_STUDY_RECORDS_CACHE_PATH"] = str(runtime_cache)
         os.environ["RSNA2026_STUDY_RECORDS_CACHE_SHA256"] = cache_sha256
         print(
-            "Starting one-GPU training with the newly prepared physical-window "
+            "Starting training with the newly prepared physical-window "
             f"selection cache: sha256={cache_sha256}",
             flush=True,
         )
     elif persistent_image_cache:
         print(
-            "Starting one-GPU training from the pinned persistent image cache",
+            "Starting training from the pinned persistent image cache",
             flush=True,
         )
+    training = config["training"]
+    if bool(training.get("distributed", False)):
+        gpu_count = int(training["expected_gpu_count"])
+        if gpu_count < 1:
+            raise ValueError("Expected GPU count must be positive")
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(PAYLOAD_ROOT / "src") + (
+            os.pathsep + environment["PYTHONPATH"]
+            if environment.get("PYTHONPATH") else ""
+        )
+        environment["PYTHONUNBUFFERED"] = "1"
+        command = [
+            sys.executable, "-m", "torch.distributed.run", "--standalone",
+            f"--nproc-per-node={gpu_count}", "-m", "rsna2026.train", *arguments,
+        ]
+        print(f"Launching training with torchrun on {gpu_count} GPUs", flush=True)
+        with subprocess.Popen(
+            command, env=environment, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, bufsize=1,
+        ) as process:
+            assert process.stdout is not None
+            for line in process.stdout:
+                print(line, end="", flush=True)
+            return process.wait()
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     print("Launching one-GPU training without torchrun", flush=True)
     return train_main(arguments)

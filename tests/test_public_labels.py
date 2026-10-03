@@ -96,6 +96,19 @@ def test_confidence_weight_uses_distance_from_undecided() -> None:
     assert confidence_weight(1.0) == 2.0
 
 
+@pytest.mark.parametrize(
+    ("probability", "expected"),
+    [(0.0, 1.0), (0.25, 0.5), (0.5, 0.0), (0.75, 0.5), (1.0, 1.0)],
+)
+def test_linear_confidence_weight(probability: float, expected: float) -> None:
+    assert confidence_weight(probability, "linear-distance") == expected
+
+
+def test_rejects_unknown_confidence_weight_method() -> None:
+    with pytest.raises(ValueError, match="Unsupported confidence weight method"):
+        confidence_weight(0.75, "unknown")
+
+
 def test_report_hash_normalizes_case_spacing_and_unicode() -> None:
     assert report_hash("  ACL  INTACT ") == report_hash("acl intact")
     assert report_hash("ＡＣＬ") == report_hash("acl")

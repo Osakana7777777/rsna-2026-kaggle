@@ -111,3 +111,62 @@ def test_build_launcher_rejects_config_outside_configs(tmp_path: Path) -> None:
 
     assert result.returncode != 0
     assert "Configuration must be below" in result.stderr
+
+
+def test_launcher_uses_torchrun_only_for_distributed_training(monkeypatch):
+    import io
+    import os
+    import types
+
+    source = (PROJECT_ROOT / "kaggle/launcher.py").read_text()
+    function = next(
+        node for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == "run_payload"
+    )
+    code = compile(ast.Module(body=[function], type_ignores=[]), "launcher", "exec")
+    calls = []
+
+    class Process:
+        stdout = io.StringIO("worker log\n")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def wait(self):
+            return 7
+
+    def popen(command, **kwargs):
+        calls.append((command, kwargs))
+        return Process()
+
+    for distributed in (False, True):
+        config = {
+            "data": {}, "image_cache": {"enabled": True},
+            "training": {"distributed": distributed, "expected_gpu_count": 2},
+        }
+        namespace = {
+            "RUN_MODE": "train", "PAYLOAD_ROOT": PROJECT_ROOT,
+            "CONFIG_RELATIVE_PATH": "configs/coatnet-0-224.toml",
+            "load_config": lambda path: config, "train_main": lambda args: 0,
+            "os": os, "sys": sys, "subprocess": types.SimpleNamespace(
+                Popen=popen, PIPE=-1, STDOUT=-2,
+            ),
+        }
+        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        exec(code, namespace)
+        result = namespace["run_payload"]()
+        if distributed:
+            assert result == 7
+            command, options = calls[-1]
+            assert "torch.distributed.run" in command
+            assert "--nproc-per-node=2" in command
+            assert "rsna2026.train" in command
+            assert "CUDA_VISIBLE_DEVICES" not in options["env"]
+            assert options["env"]["PYTHONPATH"].startswith(str(PROJECT_ROOT / "src"))
+        else:
+            assert result == 0
+            assert os.environ["CUDA_VISIBLE_DEVICES"] == "0"
+            assert not calls

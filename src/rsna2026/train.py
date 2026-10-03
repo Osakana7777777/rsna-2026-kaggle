@@ -38,12 +38,14 @@ from rsna2026.checkpoint import (
     write_checkpoint_manifest,
 )
 from rsna2026.config import load_config
+from rsna2026.losses import pairwise_logistic_ranking_loss
 from rsna2026.constants import TARGETS
 from rsna2026.cross_validation import (
     bootstrap_macro_auc_interval,
     create_inner_roles,
     create_outer_folds,
     dataframe_sha256,
+    selected_training_folds,
     weighted_binary_cross_entropy,
 )
 from rsna2026.data import competition_input
@@ -215,6 +217,33 @@ def folds_for_worker(
     return tuple(range(worker_index, fold_count, worker_count))
 
 
+def cv_fold_execution(
+    run_folds: Sequence[int],
+    training_config: dict[str, object],
+    distributed: DistributedContext,
+) -> tuple[tuple[int, ...], DistributedContext, bool]:
+    """Choose shared-fold data parallelism or independent fold workers."""
+    data_parallel = (
+        distributed.enabled
+        and training_config.get("distributed_strategy", "one-fold-per-gpu")
+        == "data-parallel"
+    )
+    if data_parallel:
+        worker_folds = tuple(run_folds)
+        fold_context = distributed
+    else:
+        worker_fold_indices = folds_for_worker(
+            len(run_folds),
+            distributed.rank if distributed.enabled else 0,
+            distributed.world_size if distributed.enabled else 1,
+        )
+        worker_folds = tuple(run_folds[index] for index in worker_fold_indices)
+        fold_context = DistributedContext(
+            enabled=False, local_rank=distributed.local_rank,
+        )
+    return worker_folds, fold_context, data_parallel
+
+
 class DistributedEvaluationSampler(Sampler[int]):
     """Shard evaluation indices without padding or duplicate studies."""
 
@@ -249,6 +278,9 @@ def initialize_distributed(
     if not enabled:
         return DistributedContext(enabled=False)
 
+    strategy = training_config.get("distributed_strategy", "one-fold-per-gpu")
+    if strategy not in {"one-fold-per-gpu", "data-parallel"}:
+        raise ValueError(f"Unsupported distributed strategy: {strategy}")
     expected = int(training_config.get("expected_gpu_count", 2))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
@@ -270,6 +302,13 @@ def initialize_distributed(
         backend="nccl",
         init_method="env://",
         timeout=timedelta(hours=max_runtime_hours + 1.0),
+    )
+    print(
+        f"Initialized {strategy} NCCL rank {rank}/{world_size} on "
+        f"GPU {local_rank}: {torch.cuda.get_device_name(local_rank)}; "
+        f"batch_per_gpu={training_config['batch_size_per_device']}, "
+        f"accumulation={training_config['gradient_accumulation_steps']}",
+        flush=True,
     )
     return DistributedContext(
         enabled=True,
@@ -518,7 +557,13 @@ def load_pseudo_supervision(
     else:
         candidate_weights = np.asarray(
             [
-                [confidence_weight(value) for value in row]
+                [
+                    confidence_weight(
+                        value,
+                        str(pseudo_config.get("confidence_weight_method", "legacy-distance")),
+                    )
+                    for value in row
+                ]
                 for row in candidate_labels
             ],
             dtype=np.float32,
@@ -661,12 +706,15 @@ def train_epoch(
     gradient_accumulation_steps: int,
     distributed: DistributedContext | None = None,
     ema: ExponentialMovingAverage | None = None,
+    pairwise_ranking_loss_weight: float = 0.0,
 ) -> float:
     model.train()
     total_loss = 0.0
     total_batches = 0
     if gradient_accumulation_steps <= 0:
         raise ValueError("Gradient accumulation steps must be positive")
+    if not math.isfinite(pairwise_ranking_loss_weight) or pairwise_ranking_loss_weight < 0:
+        raise ValueError("Ranking loss weight must be finite and nonnegative")
     optimizer.zero_grad(set_to_none=True)
     for batch_index, (images, present, positions, labels, label_weights) in enumerate(
         loader
@@ -700,6 +748,11 @@ def train_epoch(
                 logits, targets, reduction="none", pos_weight=target_weights
             )
             loss = (losses * weights).sum() / weights.sum().clamp_min(1.0)
+            if pairwise_ranking_loss_weight > 0:
+                loss = loss + pairwise_ranking_loss_weight * pairwise_logistic_ranking_loss(
+                    logits, labels, weights,
+                    distributed=distributed is not None and distributed.enabled,
+                )
             group_start = (
                 batch_index // gradient_accumulation_steps
             ) * gradient_accumulation_steps
@@ -1260,6 +1313,7 @@ def build_configured_model(
             raise ValueError("CoAtNet-0 requires model.weights_file")
         model, model_source = build_coatnet_model(
             architecture=str(model_config["variant"]),  # type: ignore[index]
+            normalization=str(model_config.get("normalization", "imagenet")),
             weights_file=weights_file,
             **shared_model_arguments,
         )
@@ -1355,6 +1409,7 @@ def supervision_arrays(
     public_rows: dict[str, tuple[float, ...]],
     gold_loss_weight: float,
     use_gold: bool,
+    confidence_weight_method: str = "legacy-distance",
 ) -> tuple[np.ndarray, np.ndarray]:
     """Build aligned targets and cell weights for one CV role."""
     labels = []
@@ -1368,7 +1423,9 @@ def supervision_arrays(
         else:
             values = [float(value) for value in public_rows[uid]]
             labels.append(values)
-            weights.append([confidence_weight(value) for value in values])
+            weights.append([
+                confidence_weight(value, confidence_weight_method) for value in values
+            ])
     return np.asarray(labels, dtype=np.float32), np.asarray(weights, dtype=np.float32)
 
 
@@ -1401,6 +1458,9 @@ def train_cv_fold(
     if not isinstance(cv_config, dict):
         raise TypeError("cross_validation configuration must be a table")
     gold_loss_weight = float(cv_config["gold_loss_weight"])
+    confidence_weight_method = str(
+        config["pseudo_labels"].get("confidence_weight_method", "legacy-distance")
+    )
 
     indexed_roles = roles.set_index("StudyInstanceUID")
     train_uids = indexed_roles.index[indexed_roles["role"] == "training"]
@@ -1412,10 +1472,10 @@ def train_cv_fold(
     inner_table = table_by_uid.loc[list(inner_uids)].reset_index(drop=True)
     outer_table = table_by_uid.loc[list(outer_uids)].reset_index(drop=True)
     train_labels, train_weights = supervision_arrays(
-        train_table, public_rows, gold_loss_weight, True
+        train_table, public_rows, gold_loss_weight, True, confidence_weight_method
     )
     inner_labels, inner_weights = supervision_arrays(
-        inner_table, public_rows, gold_loss_weight, False
+        inner_table, public_rows, gold_loss_weight, False, confidence_weight_method
     )
     outer_labels = outer_table[TARGETS].to_numpy(dtype=np.float32)
     outer_weights = np.ones_like(outer_labels, dtype=np.float32)
@@ -1534,6 +1594,7 @@ def train_cv_fold(
     history = []
     time_limit_reached = False
     selection_targets = np.where(inner_weights > 0, inner_labels, np.nan)
+    best_inner_predictions: np.ndarray | None = None
     for epoch in range(epochs):
         epoch_started_at = time.monotonic()
         training_sampler.set_epoch(epoch)
@@ -1549,6 +1610,9 @@ def train_cv_fold(
             accumulation_steps,
             distributed,
             ema,
+            pairwise_ranking_loss_weight=float(
+                training_config.get("pairwise_ranking_loss_weight", 0.0)
+            ),
         )
         evaluation_model = ema.model if ema is not None else model
         if distributed.enabled:
@@ -1597,6 +1661,7 @@ def train_cv_fold(
                 best_score = auc
                 best_epoch = epoch + 1
                 best_state = checkpoint_state_dict(evaluation_model)
+                best_inner_predictions = inner_predictions.copy()
             time_limit_reached = (
                 time.monotonic() - started_at >= max_runtime_seconds
             )
@@ -1654,6 +1719,18 @@ def train_cv_fold(
             raise RuntimeError(f"Fold {fold} outer labels changed during prediction")
         fold_dir = output_dir / f"fold-{fold}"
         fold_dir.mkdir(parents=True, exist_ok=True)
+        if best_inner_predictions is None:
+            raise RuntimeError(f"Fold {fold} did not retain inner predictions")
+        inner_output = pd.DataFrame(
+            {"StudyInstanceUID": inner_table["StudyInstanceUID"].astype(str)}
+        )
+        for target_index, target in enumerate(TARGETS):
+            inner_output[f"label_{target}"] = inner_labels[:, target_index]
+            inner_output[f"weight_{target}"] = inner_weights[:, target_index]
+            inner_output[f"prediction_{target}"] = best_inner_predictions[
+                :, target_index
+            ]
+        inner_output.to_csv(fold_dir / "inner-predictions.csv", index=False)
         checkpoint_path = fold_dir / "best-model.pt"
         torch.save(best_state, checkpoint_path)
         np.savez_compressed(
@@ -1693,6 +1770,7 @@ def train_cv_fold(
             "best_epoch": best_epoch,
             "best_inner_validation_auc": best_score,
             "completed_epochs": len(history),
+            "inner_predictions": "inner-predictions.csv",
             "time_limit_reached": time_limit_reached,
             "elapsed_seconds": time.monotonic() - fold_started_at,
             "peak_gpu_memory_bytes": (
@@ -1739,13 +1817,53 @@ def train_cv_fold(
     return fold_summary, oof, time_limit_reached
 
 
+def write_proxy_training_artifacts(
+    config: dict[str, object],
+    output_dir: Path,
+    oof: pd.DataFrame,
+    fold_summaries: list[dict[str, object]],
+    audit: dict[str, object],
+    label_validation: dict[str, object],
+    elapsed_seconds: float,
+) -> None:
+    """Write explicitly partial results without an inference ensemble manifest."""
+    labels = oof[[f"label_{target}" for target in TARGETS]].to_numpy()
+    predictions = oof[[f"prediction_{target}" for target in TARGETS]].to_numpy()
+    completed = all(
+        int(summary["completed_epochs"]) == int(config["training"]["epochs"])
+        for summary in fold_summaries
+    )
+    summary = {
+        "status": (
+            "proxy-training-complete" if completed else "proxy-training-incomplete"
+        ),
+        "full_oof": False,
+        "configured_folds": int(config["cross_validation"]["folds"]),
+        "trained_folds": [int(item["fold"]) for item in fold_summaries],
+        "gold_studies": len(oof),
+        "partial_oof_macro_auc": macro_auc(labels, predictions),
+        "partial_oof_auc_by_target": target_auc_scores(labels, predictions),
+        "fold_assignment_sha256": audit["assignment_sha256"],
+        "inner_assignment_sha256": audit["inner_assignment_sha256"],
+        "elapsed_seconds": elapsed_seconds,
+        "folds": fold_summaries,
+        "config": config,
+        "label_source_validation": label_validation,
+        "partial_oof_predictions": "partial-oof-predictions.csv",
+    }
+    oof.to_csv(output_dir / "partial-oof-predictions.csv", index=False)
+    write_json(output_dir / "proxy-summary.json", summary, allow_nan=False)
+    write_json(output_dir / "run-summary.json", summary, allow_nan=False)
+
+
 def run_cross_validation_training(
     config: dict[str, object],
     output_dir: Path,
     started_at: float,
     distributed: DistributedContext,
 ) -> int:
-    """Train four grouped folds and write auditable OOF artifacts."""
+    """Train selected grouped folds, retaining the full split design."""
+    run_folds = selected_training_folds(config["cross_validation"])
     augmentation = AugmentationConfig.from_mapping(config["augmentation"])
     input_path = competition_input(
         config["paths"]["input_root"],  # type: ignore[index]
@@ -1869,6 +1987,16 @@ def run_cross_validation_training(
                 manifest_sha256,
                 image_cache_config,
             )
+            write_json(
+                output_dir / "image-cache-validation.json",
+                {
+                    "manifest_files": [str(path) for path in manifest_paths],
+                    "manifest_sha256": manifest_sha256,
+                    "summary": cache_summary,
+                },
+                allow_nan=False,
+            )
+            print(f"Verified persistent image cache: {cache_summary}", flush=True)
         if configured_cache and configured_sha256:
             selection_cache_path = resolve_input_file(
                 configured_cache,
@@ -1885,6 +2013,10 @@ def run_cross_validation_training(
                 configured_sha256,
                 str(data_config["study_records_cache_uids_sha256"]),
             )
+            if cache_summary is not None:
+                # The selection artifact can retain statistics from an older
+                # image cache; report the cache actually validated for this run.
+                selection_summary["persistent_image_cache"] = cache_summary
             selection_output = output_dir / "slice-selection.json"
             if selection_cache_path.suffix == ".xz":
                 with lzma.open(selection_cache_path, "rb") as source:
@@ -1993,14 +2125,8 @@ def run_cross_validation_training(
     fold_summaries = []
     oof_tables = []
     fold_count = int(cv_config["folds"])
-    worker_folds = folds_for_worker(
-        fold_count,
-        distributed.rank if distributed.enabled else 0,
-        distributed.world_size if distributed.enabled else 1,
-    )
-    fold_context = DistributedContext(
-        enabled=False,
-        local_rank=distributed.local_rank,
+    worker_folds, fold_context, data_parallel = cv_fold_execution(
+        run_folds, config["training"], distributed
     )
     print(
         f"GPU {distributed.local_rank} training folds {list(worker_folds)}",
@@ -2021,14 +2147,17 @@ def run_cross_validation_training(
             fold_context,
             image_cache,
         )
-        if summary is None or oof is None:
-            raise RuntimeError("Fold worker did not produce fold artifacts")
-        fold_summaries.append(summary)
-        oof_tables.append(oof)
+        if fold_context.primary:
+            if summary is None or oof is None:
+                raise RuntimeError("Fold worker did not produce fold artifacts")
+            fold_summaries.append(summary)
+            oof_tables.append(oof)
         if time_limit and fold != worker_folds[-1]:
-            raise RuntimeError("Runtime limit prevented a complete four-fold ensemble")
+            raise RuntimeError("Runtime limit prevented all requested folds")
 
-    if distributed.enabled:
+    if data_parallel and not distributed.primary:
+        return 0
+    if distributed.enabled and not data_parallel:
         gathered_results: list[
             tuple[list[dict[str, object]], list[pd.DataFrame]] | None
         ] = [None] * distributed.world_size
@@ -2050,13 +2179,35 @@ def run_cross_validation_training(
     fold_summaries = sorted(
         fold_summaries, key=lambda summary: int(summary["fold"])
     )
-    if [int(summary["fold"]) for summary in fold_summaries] != list(
-        range(fold_count)
-    ):
-        raise RuntimeError("Fold workers did not produce every configured fold")
+    if [int(summary["fold"]) for summary in fold_summaries] != list(run_folds):
+        raise RuntimeError("Fold workers did not produce every requested fold")
     oof = pd.concat(oof_tables, ignore_index=True).sort_values(
         "StudyInstanceUID"
     ).reset_index(drop=True)
+    expected_oof_uids = set(
+        design.assignments.loc[
+            design.assignments["is_gold"]
+            & design.assignments["outer_fold"].isin(run_folds),
+            "StudyInstanceUID",
+        ].astype(str)
+    )
+    if (
+        set(oof["StudyInstanceUID"].astype(str)) != expected_oof_uids
+        or not oof["StudyInstanceUID"].is_unique
+    ):
+        raise RuntimeError("OOF predictions do not cover the requested gold studies")
+    if len(run_folds) < fold_count:
+        write_proxy_training_artifacts(
+            config,
+            output_dir,
+            oof,
+            fold_summaries,
+            design.audit,
+            label_validation,
+            time.monotonic() - started_at,
+        )
+        print(f"Completed proxy training for folds {list(run_folds)}", flush=True)
+        return 0
     if len(oof) != expected_gold or not oof["StudyInstanceUID"].is_unique:
         raise RuntimeError("OOF predictions do not cover every gold study exactly once")
     oof.to_csv(output_dir / "oof-predictions.csv", index=False)
@@ -2119,10 +2270,12 @@ def run_cross_validation_training(
             "backend": distributed.backend,
             "world_size": distributed.world_size,
             "strategy": (
-                "one-fold-per-gpu" if distributed.enabled else "single-gpu-sequential"
+                "data-parallel" if data_parallel else (
+                    "one-fold-per-gpu" if distributed.enabled else "single-gpu-sequential"
+                )
             ),
             "simultaneous_folds": (
-                distributed.world_size if distributed.enabled else 1
+                distributed.world_size if distributed.enabled and not data_parallel else 1
             ),
             "gpu_names": gpu_names,
             "batch_size_per_device": int(
@@ -2130,18 +2283,22 @@ def run_cross_validation_training(
             ),
             "microbatch_global_size": int(
                 config["training"]["batch_size_per_device"]  # type: ignore[index]
-            ),
+            ) * (distributed.world_size if data_parallel else 1),
             "gradient_accumulation_steps": int(
                 config["training"]["gradient_accumulation_steps"]  # type: ignore[index]
             ),
             "effective_batch_size": int(
                 config["training"]["batch_size_per_device"]  # type: ignore[index]
             )
+            * (distributed.world_size if data_parallel else 1)
             * int(
                 config["training"]["gradient_accumulation_steps"]  # type: ignore[index]
             ),
         },
         "optimization": {
+            "pairwise_ranking_loss_weight": float(
+                config["training"].get("pairwise_ranking_loss_weight", 0.0)
+            ),
             "epochs": int(config["training"]["epochs"]),  # type: ignore[index]
             "backbone_learning_rate": float(
                 config["training"]["backbone_learning_rate"]  # type: ignore[index]
@@ -2427,6 +2584,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     output_dir = Path(config["paths"]["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.mode == "train" and distributed.primary:
+        write_json(output_dir / "resolved-config.json", config, allow_nan=False)
 
     if args.mode == "prepare-selection-cache":
         return prepare_training_selection_cache(config, output_dir)
@@ -2650,6 +2809,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             augmentation,
             accumulation_steps,
             ema=ema,
+            pairwise_ranking_loss_weight=float(
+                config["training"].get("pairwise_ranking_loss_weight", 0.0)
+            ),
         )
         evaluation_model = ema.model if ema is not None else model
         (

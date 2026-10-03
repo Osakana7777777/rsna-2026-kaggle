@@ -10,6 +10,7 @@ from rsna2026.cross_validation import (
     bootstrap_macro_auc_interval,
     create_inner_roles,
     create_outer_folds,
+    selected_training_folds,
     weighted_binary_cross_entropy,
 )
 from rsna2026.public_labels import binary_auc
@@ -94,3 +95,20 @@ def test_rejects_non_twenty_percent_inner_validation() -> None:
     design = create_outer_folds(table, public, seed=42)
     with pytest.raises(ValueError, match="20%"):
         create_inner_roles(design.assignments, public, 0, 0.1, 1042)
+
+
+def test_proxy_fold_selection_preserves_the_full_split_design() -> None:
+    table, public = synthetic_tables()
+    design = create_outer_folds(table, public, seed=42)
+    original_hash = design.audit["assignment_sha256"]
+    assert selected_training_folds({"folds": 4}) == (0, 1, 2, 3)
+    assert selected_training_folds({"folds": 4, "run_folds": [0]}) == (0,)
+    assert selected_training_folds({"folds": 4, "run_folds": [2, 0]}) == (0, 2)
+    assert set(design.assignments["outer_fold"]) == {0, 1, 2, 3}
+    assert design.audit["assignment_sha256"] == original_hash
+
+
+@pytest.mark.parametrize("requested", [[], [0, 0], [-1], [4], [True], [0.0], "0"])
+def test_proxy_fold_selection_rejects_invalid_indices(requested) -> None:
+    with pytest.raises(ValueError, match="run_folds"):
+        selected_training_folds({"folds": 4, "run_folds": requested})

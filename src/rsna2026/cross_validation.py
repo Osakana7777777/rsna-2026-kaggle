@@ -17,6 +17,19 @@ from rsna2026.public_labels import report_hash, stable_collection_hash
 SPLIT_FORMAT_VERSION = 1
 
 
+def selected_training_folds(cv_config: Mapping[str, object]) -> tuple[int, ...]:
+    """Select existing folds without changing the complete split design."""
+    fold_count = int(cv_config["folds"])
+    requested = cv_config.get("run_folds", list(range(fold_count)))
+    if not isinstance(requested, list) or not requested:
+        raise ValueError("run_folds must be a non-empty list of fold indices")
+    if any(type(fold) is not int or not 0 <= fold < fold_count for fold in requested):
+        raise ValueError("run_folds contains an invalid fold index")
+    if len(set(requested)) != len(requested):
+        raise ValueError("run_folds must not contain duplicate fold indices")
+    return tuple(sorted(requested))
+
+
 @dataclass(frozen=True)
 class FoldDesign:
     """Outer assignments and their reproducibility audit."""

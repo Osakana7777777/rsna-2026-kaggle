@@ -76,3 +76,52 @@ def test_manifest_rejects_wrong_checkpoint_name(tmp_path):
 
     with pytest.raises(ValueError, match="file name"):
         load_and_verify_manifest(checkpoint, manifest_path)
+
+
+def test_resolve_input_file_distinguishes_four_nested_notebook_shards(tmp_path):
+    mounted = []
+    for shard in range(4):
+        path = (
+            tmp_path / "notebooks" / "osakanateishoku"
+            / f"rsna-2026-preprocess-shard-{shard}"
+            / "outputs" / "image-cache" / "cache-manifest.json"
+        )
+        path.parent.mkdir(parents=True)
+        path.write_text(f"shard-{shard}")
+        mounted.append(path)
+
+    for shard, expected in enumerate(mounted):
+        resolved = resolve_input_file(
+            f"/kaggle/input/rsna-2026-preprocess-shard-{shard}/outputs/"
+            "image-cache/cache-manifest.json",
+            tmp_path,
+        )
+        assert resolved == expected
+
+
+def test_resolve_input_file_preserves_nested_dataset_slug(tmp_path):
+    for slug in ("expected-dataset", "other-dataset"):
+        path = tmp_path / "datasets" / "owner" / slug / "selection.json.xz"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"synthetic selection")
+    assert resolve_input_file(
+        "/kaggle/input/expected-dataset/selection.json.xz", tmp_path
+    ) == tmp_path / "datasets" / "owner" / "expected-dataset" / "selection.json.xz"
+
+
+def test_resolve_input_file_rejects_duplicate_owner_mounts(tmp_path):
+    for owner in ("owner-a", "owner-b"):
+        path = tmp_path / "notebooks" / owner / "same-slug" / "manifest.json"
+        path.parent.mkdir(parents=True)
+        path.write_text("synthetic manifest")
+    with pytest.raises(FileNotFoundError, match="same-slug/manifest.json"):
+        resolve_input_file("/kaggle/input/same-slug/manifest.json", tmp_path)
+
+
+def test_resolve_input_file_rejects_ambiguous_names_without_matching_slug(tmp_path):
+    for shard in range(2):
+        path = tmp_path / "notebooks" / "owner" / f"shard-{shard}" / "manifest.json"
+        path.parent.mkdir(parents=True)
+        path.write_text("synthetic manifest")
+    with pytest.raises(FileNotFoundError, match="Expected one mounted"):
+        resolve_input_file("/kaggle/input/missing-shard/manifest.json", tmp_path)

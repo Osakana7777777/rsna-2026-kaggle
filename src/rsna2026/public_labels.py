@@ -128,12 +128,18 @@ def report_hash(report: str) -> str:
     return hashlib.sha256(normalize_report(report).encode("utf-8")).hexdigest()
 
 
-def confidence_weight(probability: float) -> float:
+def confidence_weight(
+    probability: float, method: str = "legacy-distance"
+) -> float:
     """Weight weak supervision by its distance from the undecided value."""
     value = float(probability)
     if not math.isfinite(value) or not 0.0 <= value <= 1.0:
         raise ValueError(f"Probability outside [0, 1]: {probability!r}")
-    return 0.30 + 3.40 * abs(value - 0.5)
+    if method == "legacy-distance":
+        return 0.30 + 3.40 * abs(value - 0.5)
+    if method == "linear-distance":
+        return 2.0 * abs(value - 0.5)
+    raise ValueError(f"Unsupported confidence weight method: {method}")
 
 
 def stable_sample(values: Iterable[str], count: int, seed: int) -> list[str]:

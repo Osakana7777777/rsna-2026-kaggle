@@ -74,6 +74,7 @@ from rsna2026.model import (
     build_dinov2_model,
     build_radimagenet_resnet50_model,
 )
+from rsna2026.swa import configured_swa
 from rsna2026.orientation import ORIENTATION_NORMALIZATION_METHOD
 from rsna2026.public_labels import (
     confidence_weight,
@@ -698,7 +699,7 @@ def train_epoch(
     model: nn.Module,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None,
     scaler: torch.amp.GradScaler,
     device: torch.device,
     target_weights: torch.Tensor,
@@ -768,7 +769,8 @@ def train_epoch(
             optimizer_ran = scaler.get_scale() >= previous_scale
             if ema is not None and optimizer_ran:
                 ema.update(model)
-            scheduler.step()
+            if scheduler is not None:
+                scheduler.step()
             optimizer.zero_grad(set_to_none=True)
         total_loss += float(loss.detach().cpu())
         total_batches += 1
@@ -1583,6 +1585,7 @@ def train_cv_fold(
         pct_start=float(training_config["one_cycle_warmup_fraction"]),
     )
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+    swa = configured_swa(raw_model, training_config)
     ema = configured_ema(raw_model, training_config)
     target_weights = positive_weights(train_labels, train_weights).to(device)
     if device.type == "cuda":
@@ -1590,6 +1593,7 @@ def train_cv_fold(
     max_runtime_seconds = float(training_config["max_runtime_hours"]) * 3600.0
     best_score = -math.inf
     best_epoch = 0
+    best_swa_snapshots = 0
     best_state: dict[str, torch.Tensor] | None = None
     history = []
     time_limit_reached = False
@@ -1597,12 +1601,16 @@ def train_cv_fold(
     best_inner_predictions: np.ndarray | None = None
     for epoch in range(epochs):
         epoch_started_at = time.monotonic()
+        epoch_scheduler = (
+            swa.begin_epoch(epoch + 1, optimizer, scheduler)
+            if swa is not None else scheduler
+        )
         training_sampler.set_epoch(epoch)
         loss = train_epoch(
             model,
             training_loader,
             optimizer,
-            scheduler,
+            epoch_scheduler,
             scaler,
             device,
             target_weights,
@@ -1614,7 +1622,11 @@ def train_cv_fold(
                 training_config.get("pairwise_ranking_loss_weight", 0.0)
             ),
         )
-        evaluation_model = ema.model if ema is not None else model
+        evaluation_model = (
+            swa.end_epoch(epoch + 1, model) if swa is not None
+            else ema.model if ema is not None else model
+        )
+        swa_snapshots = int(swa.average.n_averaged.item()) if swa is not None else 0
         if distributed.enabled:
             inner_predictions, _, _, _, _ = predict_distributed(
                 evaluation_model,
@@ -1645,6 +1657,7 @@ def train_cv_fold(
             history.append(
                 {
                     "epoch": epoch + 1,
+                    "swa_snapshots": swa_snapshots,
                     "loss": loss,
                     "inner_validation_auc": auc,
                     "inner_validation_auc_by_target": per_target_auc,
@@ -1660,6 +1673,7 @@ def train_cv_fold(
             if best_state is None or auc > best_score:
                 best_score = auc
                 best_epoch = epoch + 1
+                best_swa_snapshots = swa_snapshots
                 best_state = checkpoint_state_dict(evaluation_model)
                 best_inner_predictions = inner_predictions.copy()
             time_limit_reached = (
@@ -1756,6 +1770,7 @@ def train_cv_fold(
                 "attention_weights": "attention-weights.npz",
                 "augmentation": augmentation.metadata(),
                 "ema_decay": ema.decay if ema is not None else None,
+                "swa": swa.metadata(best_swa_snapshots) if swa is not None else None,
             },
         )
         fold_summary = {
@@ -1786,6 +1801,7 @@ def train_cv_fold(
             "attention_weights": "attention-weights.npz",
             "augmentation": augmentation.metadata(),
             "ema_decay": ema.decay if ema is not None else None,
+            "swa": swa.metadata(best_swa_snapshots) if swa is not None else None,
             "distributed": {
                 "backend": distributed.backend,
                 "world_size": distributed.world_size,
@@ -1810,7 +1826,7 @@ def train_cv_fold(
     if distributed.enabled:
         dist.barrier()
     del raw_model
-    del model, optimizer, scheduler, scaler
+    del model, optimizer, scheduler, scaler, swa, ema
     del training_loader, inner_loader, outer_loader
     gc.collect()
     torch.cuda.empty_cache()
@@ -2309,7 +2325,10 @@ def run_cross_validation_training(
             "weight_decay": float(
                 config["training"]["weight_decay"]  # type: ignore[index]
             ),
-            "scheduler": "one-cycle",
+            "scheduler": (
+                "one-cycle-then-swa" if config["training"].get("swa_enabled", False)
+                else "one-cycle"
+            ),
             "one_cycle_warmup_fraction": float(
                 config["training"]["one_cycle_warmup_fraction"]  # type: ignore[index]
             ),
@@ -2322,6 +2341,10 @@ def run_cross_validation_training(
         "augmentation": augmentation.metadata(),
         "elapsed_seconds": elapsed,
         "folds": fold_summaries,
+        "swa_configuration": {
+            key: value for key, value in config["training"].items()
+            if key.startswith("swa_")
+        },
         "cross_validation": cv_summary,
         "ensemble_manifest": "ensemble-manifest.json",
         "fold_audit": "fold-audit.json",
@@ -2783,6 +2806,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     training_config = config["training"]
     if not isinstance(training_config, dict):
         raise TypeError("training configuration must be a table")
+    swa = configured_swa(model, training_config)
     ema = configured_ema(model, training_config)
     target_weights = positive_weights(training_labels, training_weights).to(device)
     if device.type == "cuda":
@@ -2793,16 +2817,21 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     best_score = -math.inf
     best_epoch = 0
+    best_swa_snapshots = 0
     best_state: dict[str, torch.Tensor] | None = None
     history = []
     time_limit_reached = False
     for epoch in range(epochs):
         epoch_started_at = time.monotonic()
+        epoch_scheduler = (
+            swa.begin_epoch(epoch + 1, optimizer, scheduler)
+            if swa is not None else scheduler
+        )
         loss = train_epoch(
             model,
             training_loader,
             optimizer,
-            scheduler,
+            epoch_scheduler,
             scaler,
             device,
             target_weights,
@@ -2813,7 +2842,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 config["training"].get("pairwise_ranking_loss_weight", 0.0)
             ),
         )
-        evaluation_model = ema.model if ema is not None else model
+        evaluation_model = (
+            swa.end_epoch(epoch + 1, model) if swa is not None
+            else ema.model if ema is not None else model
+        )
+        swa_snapshots = int(swa.average.n_averaged.item()) if swa is not None else 0
         (
             validation_predictions,
             validation_labels,
@@ -2828,6 +2861,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         history.append(
             {
                 "epoch": epoch + 1,
+                "swa_snapshots": swa_snapshots,
                 "loss": loss,
                 "validation_auc": auc,
                 "validation_auc_by_target": per_target_auc,
@@ -2842,6 +2876,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if best_state is None or selection_score > best_score:
             best_score = selection_score
             best_epoch = epoch + 1
+            best_swa_snapshots = swa_snapshots
             best_state = checkpoint_state_dict(evaluation_model)
         if time.monotonic() - started_at >= max_runtime_seconds:
             time_limit_reached = True
@@ -2875,6 +2910,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "validation_studies": len(validation_records),
             "augmentation": augmentation.metadata(),
             "ema_decay": ema.decay if ema is not None else None,
+            "swa": swa.metadata(best_swa_snapshots) if swa is not None else None,
         },
     )
     elapsed_seconds = time.monotonic() - started_at
@@ -2924,11 +2960,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "backbone_learning_rate": backbone_learning_rate,
             "head_learning_rate": head_learning_rate,
             "weight_decay": float(config["training"]["weight_decay"]),
-            "scheduler": "one-cycle",
+            "scheduler": (
+                "one-cycle-then-swa" if config["training"].get("swa_enabled", False)
+                else "one-cycle"
+            ),
             "one_cycle_warmup_fraction": float(
                 config["training"]["one_cycle_warmup_fraction"]
             ),
             "ema_decay": ema.decay if ema is not None else None,
+            "swa": swa.metadata(best_swa_snapshots) if swa is not None else None,
         },
         "slice_selection": {
             "selection_method": selection_report["slice_selection_method"],

@@ -4,12 +4,27 @@ set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUN_KIND="${1:-submission}"
+DEFAULT_CONFIG="configs/baseline.toml"
 case "${RUN_KIND}" in
   train)
     METADATA_FILE="${PROJECT_ROOT}/kaggle/train-kernel-metadata.json"
     BUILD_DIR="${PROJECT_ROOT}/.kaggle-build/train"
     OUTPUT_DIR="${PROJECT_ROOT}/outputs/train"
     RUN_MODE="train"
+    ;;
+  radimagenet)
+    METADATA_FILE="${PROJECT_ROOT}/kaggle/radimagenet-kernel-metadata.json"
+    BUILD_DIR="${PROJECT_ROOT}/.kaggle-build/radimagenet"
+    OUTPUT_DIR="${PROJECT_ROOT}/outputs/radimagenet"
+    RUN_MODE="train"
+    DEFAULT_CONFIG="configs/radimagenet-resnet50-public-recipe.toml"
+    ;;
+  radimagenet-submission)
+    METADATA_FILE="${PROJECT_ROOT}/kaggle/radimagenet-submission-kernel-metadata.json"
+    BUILD_DIR="${PROJECT_ROOT}/.kaggle-build/radimagenet-submission"
+    OUTPUT_DIR="${PROJECT_ROOT}/outputs/radimagenet-submission"
+    RUN_MODE="inference"
+    DEFAULT_CONFIG="configs/radimagenet-resnet50-public-recipe.toml"
     ;;
   submission)
     METADATA_FILE="${PROJECT_ROOT}/kaggle/kernel-metadata.json"
@@ -31,7 +46,7 @@ case "${RUN_KIND}" in
     RUN_MODE="preprocess-${shard_index}"
     ;;
   *)
-    echo "Usage: $0 [train|submission|eda|preprocess-{0..3}]" >&2
+    echo "Usage: $0 [train|radimagenet|radimagenet-submission|submission|eda|preprocess-{0..3}]" >&2
     exit 2
     ;;
 esac
@@ -48,7 +63,7 @@ kernel_id() {
 }
 
 require_configured_metadata() {
-  local requested_config="${1:-configs/baseline.toml}"
+  local requested_config="${1:-${DEFAULT_CONFIG}}"
   local config_path
   if [[ "${requested_config}" = /* ]]; then
     config_path="${requested_config}"

@@ -49,6 +49,7 @@ from rsna2026.cross_validation import (
     weighted_binary_cross_entropy,
 )
 from rsna2026.data import competition_input
+from rsna2026.early_stopping import EarlyStopping
 from rsna2026.dataset import (
     PREPROCESSING_VERSION,
     SERIES_SELECTION_METHOD,
@@ -693,6 +694,29 @@ def positive_weights(
         ratio = negatives / max(positives, 1.0)
         weights.append(min(max(ratio, 0.25), 8.0))
     return torch.tensor(weights, dtype=torch.float32)
+
+
+def configured_scheduler(
+    optimizer: torch.optim.Optimizer,
+    training: dict[str, object],
+    steps_per_epoch: int,
+) -> torch.optim.lr_scheduler.LRScheduler | None:
+    """Use fixed learning rates when requested, retaining existing defaults."""
+    kind = str(training.get("scheduler", "one-cycle"))
+    if kind == "constant":
+        if training.get("swa_enabled", False):
+            raise ValueError("Constant learning rates cannot be combined with SWA")
+        return None
+    if kind != "one-cycle":
+        raise ValueError(f"Unsupported learning-rate scheduler: {kind}")
+    return torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=[float(training["backbone_learning_rate"]),
+                float(training["head_learning_rate"])],
+        epochs=int(training["epochs"]),
+        steps_per_epoch=steps_per_epoch,
+        pct_start=float(training["one_cycle_warmup_fraction"]),
+    )
 
 
 def train_epoch(
@@ -1412,6 +1436,8 @@ def supervision_arrays(
     gold_loss_weight: float,
     use_gold: bool,
     confidence_weight_method: str = "legacy-distance",
+    explicit_weights: dict[str, tuple[float, ...]] | None = None,
+    explicit_masks: dict[str, int] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Build aligned targets and cell weights for one CV role."""
     labels = []
@@ -1425,9 +1451,14 @@ def supervision_arrays(
         else:
             values = [float(value) for value in public_rows[uid]]
             labels.append(values)
-            weights.append([
-                confidence_weight(value, confidence_weight_method) for value in values
-            ])
+            if explicit_weights is not None and explicit_masks is not None:
+                weights.append([
+                    value * explicit_masks[uid] for value in explicit_weights[uid]
+                ])
+            else:
+                weights.append([
+                    confidence_weight(value, confidence_weight_method) for value in values
+                ])
     return np.asarray(labels, dtype=np.float32), np.asarray(weights, dtype=np.float32)
 
 
@@ -1449,6 +1480,8 @@ def train_cv_fold(
     device: torch.device,
     distributed: DistributedContext,
     image_cache: ImageCacheReader | None = None,
+    explicit_weights: dict[str, tuple[float, ...]] | None = None,
+    explicit_masks: dict[str, int] | None = None,
 ) -> tuple[dict[str, object] | None, pd.DataFrame | None, bool]:
     """Train one outer fold using only its weak inner validation for selection."""
     fold_started_at = time.monotonic()
@@ -1474,11 +1507,22 @@ def train_cv_fold(
     inner_table = table_by_uid.loc[list(inner_uids)].reset_index(drop=True)
     outer_table = table_by_uid.loc[list(outer_uids)].reset_index(drop=True)
     train_labels, train_weights = supervision_arrays(
-        train_table, public_rows, gold_loss_weight, True, confidence_weight_method
+        train_table, public_rows, gold_loss_weight, True, confidence_weight_method,
+        explicit_weights, explicit_masks,
     )
     inner_labels, inner_weights = supervision_arrays(
-        inner_table, public_rows, gold_loss_weight, False, confidence_weight_method
+        inner_table, public_rows, gold_loss_weight, False, confidence_weight_method,
+        explicit_weights, explicit_masks,
     )
+    if explicit_weights is not None:
+        train_keep = (train_weights > 0).any(axis=1)
+        inner_keep = (inner_weights > 0).any(axis=1)
+        train_table = train_table.loc[train_keep].reset_index(drop=True)
+        inner_table = inner_table.loc[inner_keep].reset_index(drop=True)
+        train_labels, train_weights = train_labels[train_keep], train_weights[train_keep]
+        inner_labels, inner_weights = inner_labels[inner_keep], inner_weights[inner_keep]
+        if train_table.empty or inner_table.empty:
+            raise ValueError("Explicit supervision removed every training or validation study")
     outer_labels = outer_table[TARGETS].to_numpy(dtype=np.float32)
     outer_weights = np.ones_like(outer_labels, dtype=np.float32)
 
@@ -1577,16 +1621,14 @@ def train_cv_fold(
         weight_decay=float(training_config["weight_decay"]),
     )
     epochs = int(training_config["epochs"])
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=[backbone_learning_rate, head_learning_rate],
-        epochs=epochs,
-        steps_per_epoch=math.ceil(len(training_loader) / accumulation_steps),
-        pct_start=float(training_config["one_cycle_warmup_fraction"]),
+    scheduler = configured_scheduler(
+        optimizer, training_config,
+        math.ceil(len(training_loader) / accumulation_steps),
     )
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     swa = configured_swa(raw_model, training_config)
     ema = configured_ema(raw_model, training_config)
+    early_stopping = EarlyStopping.from_config(training_config)
     target_weights = positive_weights(train_labels, train_weights).to(device)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -1670,7 +1712,7 @@ def train_cv_fold(
                 f"inner_auc={auc:.5f}, inner_bce={weighted_bce:.5f}",
                 flush=True,
             )
-            if best_state is None or auc > best_score:
+            if early_stopping.update(auc):
                 best_score = auc
                 best_epoch = epoch + 1
                 best_swa_snapshots = swa_snapshots
@@ -1681,13 +1723,18 @@ def train_cv_fold(
             )
             if time_limit_reached:
                 print(f"Global runtime limit reached in fold {fold}", flush=True)
+            if early_stopping.stopped:
+                print(f"Fold {fold}: early stopping after epoch {epoch + 1}; "
+                      f"best epoch={best_epoch}", flush=True)
         if distributed.enabled:
             stop = torch.tensor(
-                int(time_limit_reached), dtype=torch.int32, device=device
+                [int(time_limit_reached), int(early_stopping.stopped)],
+                dtype=torch.int32, device=device
             )
             dist.broadcast(stop, src=0)
-            time_limit_reached = bool(stop.item())
-        if time_limit_reached:
+            time_limit_reached = bool(stop[0].item())
+            early_stopping.stopped = bool(stop[1].item())
+        if time_limit_reached or early_stopping.stopped:
             break
     if distributed.primary:
         if best_state is None:
@@ -1785,6 +1832,7 @@ def train_cv_fold(
             "best_epoch": best_epoch,
             "best_inner_validation_auc": best_score,
             "completed_epochs": len(history),
+            "early_stopping": early_stopping.metadata(),
             "inner_predictions": "inner-predictions.csv",
             "time_limit_reached": time_limit_reached,
             "elapsed_seconds": time.monotonic() - fold_started_at,
@@ -1846,7 +1894,9 @@ def write_proxy_training_artifacts(
     labels = oof[[f"label_{target}" for target in TARGETS]].to_numpy()
     predictions = oof[[f"prediction_{target}" for target in TARGETS]].to_numpy()
     completed = all(
-        int(summary["completed_epochs"]) == int(config["training"]["epochs"])
+        (int(summary["completed_epochs"]) == int(config["training"]["epochs"])
+         or summary.get("early_stopping", {}).get("stopped", False))
+        and not summary.get("time_limit_reached", False)
         for summary in fold_summaries
     )
     summary = {
@@ -1903,6 +1953,11 @@ def run_cross_validation_training(
         str(pseudo_config["sha256"]),
         int(pseudo_config["expected_rows"]),
     )
+    use_explicit = bool(pseudo_config.get("use_explicit_supervision", False))
+    explicit_weights = getattr(public, "confidence_weights", None) if use_explicit else None
+    explicit_masks = getattr(public, "masks", None) if use_explicit else None
+    if use_explicit and (explicit_weights is None or explicit_masks is None):
+        raise ValueError("Explicit supervision requires CSV confidence weights and masks")
     gold = train_table.loc[train_table[TARGETS].notna().all(axis=1)]
     label_validation = source_validation(
         gold[["StudyInstanceUID", *TARGETS]].to_dict(orient="records"), public.rows
@@ -2162,6 +2217,8 @@ def run_cross_validation_training(
             device,
             fold_context,
             image_cache,
+            explicit_weights,
+            explicit_masks,
         )
         if fold_context.primary:
             if summary is None or oof is None:
@@ -2327,8 +2384,10 @@ def run_cross_validation_training(
             ),
             "scheduler": (
                 "one-cycle-then-swa" if config["training"].get("swa_enabled", False)
-                else "one-cycle"
+                else str(config["training"].get("scheduler", "one-cycle"))
             ),
+            "early_stopping_patience": int(config["training"].get("early_stopping_patience", 0)),
+            "early_stopping_min_delta": float(config["training"].get("early_stopping_min_delta", 0.0)),
             "one_cycle_warmup_fraction": float(
                 config["training"]["one_cycle_warmup_fraction"]  # type: ignore[index]
             ),
@@ -2795,12 +2854,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     epochs = int(config["training"]["epochs"])
     accumulation_steps = int(config["training"]["gradient_accumulation_steps"])
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=[backbone_learning_rate, head_learning_rate],
-        epochs=epochs,
-        steps_per_epoch=math.ceil(len(training_loader) / accumulation_steps),
-        pct_start=float(config["training"]["one_cycle_warmup_fraction"]),
+    scheduler = configured_scheduler(
+        optimizer, config["training"],
+        math.ceil(len(training_loader) / accumulation_steps),
     )
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     training_config = config["training"]
@@ -2808,6 +2864,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise TypeError("training configuration must be a table")
     swa = configured_swa(model, training_config)
     ema = configured_ema(model, training_config)
+    early_stopping = EarlyStopping.from_config(training_config)
     target_weights = positive_weights(training_labels, training_weights).to(device)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -2873,11 +2930,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             flush=True,
         )
         selection_score = auc if math.isfinite(auc) else -loss
-        if best_state is None or selection_score > best_score:
+        if early_stopping.update(selection_score):
             best_score = selection_score
             best_epoch = epoch + 1
             best_swa_snapshots = swa_snapshots
             best_state = checkpoint_state_dict(evaluation_model)
+        if early_stopping.stopped:
+            print(f"Early stopping after epoch {epoch + 1}; best epoch={best_epoch}", flush=True)
+            break
         if time.monotonic() - started_at >= max_runtime_seconds:
             time_limit_reached = True
             print(
@@ -2929,6 +2989,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         "completed_epochs": len(history),
         "best_epoch": best_epoch,
+        "early_stopping": early_stopping.metadata(),
         "time_limit_reached": time_limit_reached,
         "checkpoint": manifest,
         "augmentation": augmentation.metadata(),
@@ -2962,7 +3023,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "weight_decay": float(config["training"]["weight_decay"]),
             "scheduler": (
                 "one-cycle-then-swa" if config["training"].get("swa_enabled", False)
-                else "one-cycle"
+                else str(config["training"].get("scheduler", "one-cycle"))
             ),
             "one_cycle_warmup_fraction": float(
                 config["training"]["one_cycle_warmup_fraction"]

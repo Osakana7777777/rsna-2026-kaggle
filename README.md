@@ -105,6 +105,12 @@ For the RadImageNet ResNet-50 experiment, attach the private
 `ResNet50.pt`, then select `configs/radimagenet-resnet50-224.toml` in the
 same commands. The notebook loads that checkpoint strictly and offline.
 
+公開コードに学習率・実効バッチ・最大世代数・早期終了を合わせた
+ResNet全固定の学習は `./scripts/push.sh radimagenet` で起動する。
+学習完了後の推論は `./scripts/push.sh radimagenet-submission` で起動する。
+入力と集約部は既存のResNet実験を継承する。
+詳細は [`notes/1003-radimagenet-public-recipe.md`](notes/1003-radimagenet-public-recipe.md)。
+
 Omitting the second argument continues to use `configs/baseline.toml`.
 
 ## Run EDA and download its outputs

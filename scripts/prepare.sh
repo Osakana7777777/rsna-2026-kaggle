@@ -2,7 +2,7 @@
 
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh" "${1:-submission}"
-config_path="${2:-configs/baseline.toml}"
+config_path="${2:-${DEFAULT_CONFIG}}"
 
 require_configured_metadata "${config_path}"
 

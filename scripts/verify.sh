@@ -10,6 +10,11 @@ required_files=(
   "configs/coatnet-0-224.toml"
   "configs/radimagenet-resnet50-224.toml"
   "configs/radimagenet-resnet50-224-smoke.toml"
+  "configs/radimagenet-resnet50-public-recipe.toml"
+  "kaggle/radimagenet-kernel-metadata.json"
+  "kaggle/radimagenet-submission-kernel-metadata.json"
+  "src/rsna2026/early_stopping.py"
+  "tests/test_radimagenet_recipe.py"
   "kaggle/kernel-metadata.json"
   "kaggle/train-kernel-metadata.json"
   "kaggle/eda-kernel-metadata.json"
@@ -102,7 +107,7 @@ if command -v uv >/dev/null 2>&1; then
     "${PROJECT_ROOT}/modal_weak_labels.py" \
     "${PROJECT_ROOT}/scripts/build_launcher.py" "${PROJECT_ROOT}/tests"
   "${PROJECT_ROOT}/.venv/bin/python" -c \
-    'import json, pathlib, tomllib; root = pathlib.Path(__import__("sys").argv[1]); files = ["kernel-metadata.json", "train-kernel-metadata.json", "eda-kernel-metadata.json", *[f"preprocess-{index}-kernel-metadata.json" for index in range(4)]]; [json.loads((root / "kaggle" / name).read_text()) for name in files]; [tomllib.loads(path.read_text()) for path in sorted((root / "configs").glob("*.toml"))]' \
+    'import json, pathlib, tomllib; root = pathlib.Path(__import__("sys").argv[1]); files = ["kernel-metadata.json", "train-kernel-metadata.json", "eda-kernel-metadata.json", "radimagenet-kernel-metadata.json", "radimagenet-submission-kernel-metadata.json", *[f"preprocess-{index}-kernel-metadata.json" for index in range(4)]]; [json.loads((root / "kaggle" / name).read_text()) for name in files]; [tomllib.loads(path.read_text()) for path in sorted((root / "configs").glob("*.toml"))]' \
     "${PROJECT_ROOT}"
 else
   echo "uv not installed; skipped Python syntax check." >&2

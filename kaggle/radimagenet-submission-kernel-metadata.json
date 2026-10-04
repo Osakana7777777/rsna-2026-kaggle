@@ -1,0 +1,21 @@
+{
+  "id": "osakanateishoku/rsna-2026-workflow",
+  "title": "RSNA 2026 Workflow",
+  "code_file": "launcher.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": false,
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": [
+    "osakanateishoku/radimagenet-resnet50"
+  ],
+  "competition_sources": [
+    "rsna-knee-abnormality-detection"
+  ],
+  "kernel_sources": [
+    "osakanateishoku/rsna-2026-radimagenet-resnet50"
+  ],
+  "model_sources": []
+}

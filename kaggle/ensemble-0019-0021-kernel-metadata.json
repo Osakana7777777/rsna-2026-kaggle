@@ -1,0 +1,20 @@
+{
+  "id": "osakanateishoku/rsna-2026-workflow",
+  "title": "RSNA 2026 Workflow",
+  "code_file": "ensemble.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": false,
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": [
+    "osakanateishoku/radimagenet-resnet50",
+    "osakanateishoku/rsna-2026-dinov2-ranking-v45/1"
+  ],
+  "competition_sources": ["rsna-knee-abnormality-detection"],
+  "kernel_sources": [
+    "osakanateishoku/rsna-2026-radimagenet-resnet50"
+  ],
+  "model_sources": ["metaresearch/dinov2/PyTorch/small/1"]
+}
